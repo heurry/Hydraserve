@@ -200,7 +200,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="HydraServe: PD Disaggregated Inference Engine"
     )
-    parser.add_argument("--model", type=str, default="/models/Qwen3.5-9B-AWQ",
+    parser.add_argument("--model", type=str, default="/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
                         help="Path to model weights")
     parser.add_argument("--model-name", type=str, default="Qwen3.5-9B",
                         choices=["Qwen3.5-4B", "Qwen3.5-9B", "Qwen3.6-27B"])

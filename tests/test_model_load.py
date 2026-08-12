@@ -20,7 +20,14 @@ def test_load_model():
     print("HydraServe: Qwen3.5-4B Model Load Test")
     print("=" * 60)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    # Check if GPU has enough free memory (>5GB)
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        free_mem = torch.cuda.mem_get_info(0)[0] / 1e9
+        use_cuda = free_mem > 5.0  # Need at least 5GB free
+        if not use_cuda:
+            print(f"  GPU 0 only has {free_mem:.1f}GB free, using CPU fallback")
+    device = torch.device("cuda:0" if use_cuda else "cpu")
     print(f"\nDevice: {device}")
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
@@ -34,11 +41,19 @@ def test_load_model():
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
         print(f"  Tokenizer loaded. Vocab size: {tokenizer.vocab_size}")
 
+        device_map = {"": device} if str(device) != "cpu" else None
+        load_kwargs = {
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+        }
+        if device_map:
+            load_kwargs["device_map"] = device_map
+        else:
+            load_kwargs["device_map"] = "cpu"
+
         model = AutoModelForCausalLM.from_pretrained(
             MODEL_PATH,
-            torch_dtype=torch.bfloat16,
-            device_map="auto",
-            trust_remote_code=True,
+            **load_kwargs,
         )
         model.eval()
         print(f"  Model loaded successfully.")
