@@ -91,48 +91,6 @@ python -m hydraserve.serve.serve \
 # Update the model path in docker-compose.yml, then:
 docker compose up -d
 ```
-
-### Try It
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen3.5-4B",
-    "messages": [{"role": "user", "content": "Hello!"}],
-    "max_tokens": 100
-  }'
-```
-
-### Python Client
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="local")
-
-response = client.chat.completions.create(
-    model="Qwen3.5-9B",
-    messages=[{"role": "user", "content": "Hello!"}],
-    stream=True,
-)
-for chunk in response:
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-```
-
-## API
-
-OpenAI-compatible REST API. See the [OpenAI API docs](https://platform.openai.com/docs/api-reference) for full parameter reference.
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `POST` | `/v1/chat/completions` | Chat completions (streaming & non-streaming) |
-| `POST` | `/v1/completions` | Legacy text completions |
-| `GET` | `/v1/models` | List available models |
-| `GET` | `/health` | Health check |
-| `GET` | `/stats` | Runtime statistics |
-
 ## Benchmarks
 
 ### Serving Configurations
@@ -175,24 +133,6 @@ python -m hydraserve.benchmark.run_benchmark \
 | Qwen3.5-9B | 9B | 32 | GDN + GQA | 128K |
 | Qwen3.6-27B | 27B | 64 | GDN + GQA | 128K |
 
-## CLI Reference
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model` | *(required)* | Path to model weights |
-| `--model-name` | `Qwen3.5-9B` | `Qwen3.5-4B`, `Qwen3.5-9B`, `Qwen3.6-27B` |
-| `--mode` | `pd_disaggregated` | `collocated`, `pd_disaggregated`, `dp` |
-| `--prefill-gpu` | `0` | GPU for prefill engine |
-| `--decode-gpu` | `1` | GPU for decode engine |
-| `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8000` | API port |
-| `--precision` | `int4` | `int4` or `bf16` |
-| `--chunk-size` | `4096` | Tokens per prefill chunk |
-| `--max-seqs` | `256` | Max concurrent sequences |
-
-## Documentation
-
-- [Architecture & Design](docs/architecture.md) — System design, component structure, transfer backends, N-1 truncation
 
 ## Development Status
 
@@ -207,22 +147,6 @@ python -m hydraserve.benchmark.run_benchmark \
 | Benchmarking + comparison experiments | 🚧 |
 | Intra-GPU MPS mode | 🚧 |
 
-### Running Tests
-
-```bash
-python -m pytest tests/ -v
-```
-
-## Contributing
-
-Contributions are welcome! Please open an issue to discuss major changes before submitting a PR.
-
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make changes + run tests (`python -m pytest tests/`)
-4. Commit and push (`git commit -m 'Add amazing feature'`)
-5. Open a Pull Request
-
 ## Citation
 
 ```bibtex
@@ -233,10 +157,6 @@ Contributions are welcome! Please open an issue to discuss major changes before 
   year = {2025},
 }
 ```
-
-## License
-
-MIT — see [LICENSE](LICENSE).
 
 ## Acknowledgments
 
