@@ -201,23 +201,29 @@ class Int4Linear(nn.Module):
                    bias=linear.bias is not None, group_size=group_size)
 
         quantizer = WeightQuantizer(4, group_size)
-        q = quantizer.quantize_weight(linear.weight.data.float())
+        w_cpu = linear.weight.data.detach().cpu().float()
+        q = quantizer.quantize_weight(w_cpu)
 
-        int4.q_weight.data.copy_(q["q_weight"])
-        int4.scales.data.copy_(q["scales"])
+        int4.q_weight.data.copy_(q["q_weight"].to(int4.q_weight.device))
+        int4.scales.data.copy_(q["scales"].to(int4.scales.device))
+
+        # Move parameters to the original device
+        orig_device = linear.weight.device
+        int4.q_weight = nn.Parameter(int4.q_weight.data.to(orig_device), requires_grad=False)
+        int4.scales = nn.Parameter(int4.scales.data.to(orig_device), requires_grad=False)
 
         if linear.bias is not None:
-            int4.bias.data.copy_(linear.bias.data)
+            int4.bias = nn.Parameter(linear.bias.data.clone(), requires_grad=False)
 
         return int4
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with online dequantization."""
-        # Dequantize weights on the fly
+        # Dequantize weights on the fly, match input dtype
         w = self.q_weight.float() * self.scales.float().unsqueeze(-1)
-        w = w.reshape(self.out_features, self.in_features)
+        w = w.reshape(self.out_features, self.in_features).to(x.dtype)
 
-        return torch.nn.functional.linear(x.to(w.dtype), w, self.bias)
+        return torch.nn.functional.linear(x, w, self.bias)
 
 
 def quantize_model_to_int4(

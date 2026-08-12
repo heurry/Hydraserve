@@ -25,15 +25,20 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
 eos = tok.eos_token_id
 
-# Load on GPU0
+# Load on GPU0 - multimodal model: vision forced to CPU
 print("[1] Loading 27B AWQ-INT4 model...")
 t0 = time.perf_counter()
 m0 = AutoModelForCausalLM.from_pretrained(
     MODEL_PATH, torch_dtype=torch.bfloat16,
-    device_map={"": "cuda:0"}, trust_remote_code=True
+    device_map="auto",
+    max_memory={0: "16GiB", "cpu": "80GiB"},  # 留 8GB 给 KV cache
+    trust_remote_code=True
 ).eval()
 load_time = time.perf_counter() - t0
-print(f"  Loaded in {load_time:.1f}s")
+print(f"  Loaded in {load_time:.1f}s (max 16GiB GPU)")
+gpu_modules = sum(1 for v in m0.hf_device_map.values() if v == 0)
+cpu_modules = sum(1 for v in m0.hf_device_map.values() if v == 'cpu')
+print(f"  Device map: {gpu_modules} modules on GPU, {cpu_modules} on CPU")
 
 # Spec
 tc = getattr(m0.config, 'text_config', m0.config)
@@ -52,16 +57,18 @@ print(f"  VRAM used: {torch.cuda.memory_allocated(0)/1e9:.1f}GB")
 # Check quantization status of layers
 print("\n[2] Layer quantization analysis...")
 bf16_linear = 0
-int4_linear = 0
+compressed_linear = 0
+other_linear = 0
 for name, module in m0.named_modules():
     if isinstance(module, torch.nn.Linear):
-        w = module.weight
-        if w.dtype == torch.bfloat16 or w.dtype == torch.float16 or w.dtype == torch.float32:
-            bf16_linear += 1
-        else:
-            int4_linear += 1
-print(f"  BF16 Linear layers: {bf16_linear}")
-print(f"  INT4 (quantized) Linear layers: {int4_linear}")
+        bf16_linear += 1
+    elif module.__class__.__name__ == 'Linear':  # compressed-tensors Linear
+        compressed_linear += 1
+    elif hasattr(module, 'weight') and module.weight is not None:
+        other_linear += 1
+print(f"  nn.Linear (BF16) layers: {bf16_linear}")
+print(f"  Compressed (INT4) Linear layers: {compressed_linear}")
+print(f"  Other weighted layers: {other_linear}")
 
 # Max context sweep
 print("\n[3] Max context sweep...")
