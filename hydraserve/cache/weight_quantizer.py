@@ -78,6 +78,7 @@ class WeightQuantizer:
         self,
         model: nn.Module,
         skip_layers: Optional[List[str]] = None,
+        keep_int4_storage: bool = True,
     ) -> Dict[str, int]:
         """
         Quantize all Linear layers in a model in-place.
@@ -85,6 +86,9 @@ class WeightQuantizer:
         Args:
             model: PyTorch model
             skip_layers: Names of layers to skip (e.g. embedding, norm)
+            keep_int4_storage: If True, replace Linear with Int4Linear
+                (actual VRAM savings). If False, dequantize back in-place
+                (accuracy verification only).
 
         Returns:
             Stats dict: {num_quantized, total_params, quantized_params}
@@ -99,12 +103,20 @@ class WeightQuantizer:
                 if any(s in name for s in skip_layers):
                     continue
 
-                w = module.weight.data
-                quantized = self.quantize_weight(w.float())
-                module.weight.data = self.dequantize_weight(quantized).to(
-                    module.weight.dtype)
+                if keep_int4_storage:
+                    # Replace with Int4Linear for real VRAM savings
+                    parent_name, child_name = name.rsplit('.', 1) if '.' in name else ('', name)
+                    parent = model.get_submodule(parent_name) if parent_name else model
+                    setattr(parent, child_name,
+                            Int4Linear.from_linear(module, self.group_size))
+                else:
+                    # Dequantize back in-place (accuracy check only)
+                    w = module.weight.data
+                    quantized = self.quantize_weight(w.float())
+                    module.weight.data = self.dequantize_weight(quantized).to(
+                        module.weight.dtype)
                 stats["num_quantized"] += 1
-                stats["quantized_params"] += w.numel()
+                stats["quantized_params"] += module.weight.numel()
 
         return stats
 
