@@ -42,7 +42,9 @@ class ContinuousBatchExecutor:
             raise ValueError("recovery chunk size must be positive")
         plan = self.scheduler.resume(request_id)
         input_ids = torch.tensor(
-            [plan.replay_token_ids], device=self.runtime.device, dtype=torch.long
+            [plan.replay_token_ids],
+            device=getattr(self.runtime, "input_device", self.runtime.device),
+            dtype=torch.long,
         )
         try:
             _, state = self.runtime.prefill(
@@ -69,7 +71,7 @@ class ContinuousBatchExecutor:
             states = [self.states[request_id] for request_id in batch.request_ids]
             input_ids = torch.tensor(
                 batch.token_ids,
-                device=self.runtime.device,
+                device=getattr(self.runtime, "input_device", self.runtime.device),
                 dtype=torch.long,
             ).unsqueeze(1)
             logits, _ = self.runtime.decode_batch(

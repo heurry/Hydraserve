@@ -57,7 +57,9 @@ class PrefillWorker:
         ):
             raise RuntimeError("full/quantized transfer requires a prefill Paged KV cache")
         prefix_ids = torch.tensor(
-            [request.token_ids[:split]], device=self.runtime.device, dtype=torch.long
+            [request.token_ids[:split]],
+            device=getattr(self.runtime, "input_device", self.runtime.device),
+            dtype=torch.long,
         )
         with torch.inference_mode():
             logits, state = self.runtime.prefill(
@@ -69,7 +71,9 @@ class PrefillWorker:
         bundle = RuntimeStateCodec.extract(self.runtime.config, state)
         if use_n_minus_one:
             last_id = torch.tensor(
-                [[request.token_ids[-1]]], device=self.runtime.device, dtype=torch.long
+                [[request.token_ids[-1]]],
+                device=getattr(self.runtime, "input_device", self.runtime.device),
+                dtype=torch.long,
             )
             with torch.inference_mode():
                 logits, state = self.runtime.forward(
@@ -140,7 +144,9 @@ class DecodeWorker:
                 )
             descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
             token_ids = torch.tensor(
-                [request.token_ids], device=self.runtime.device, dtype=torch.long
+                [request.token_ids],
+                device=getattr(self.runtime, "input_device", self.runtime.device),
+                dtype=torch.long,
             )
             if descriptor.mode is TransferMode.PARTIAL_TRANSFER:
                 with torch.inference_mode():
@@ -169,7 +175,7 @@ class DecodeWorker:
             if descriptor.state_token_count == descriptor.prompt_length - 1:
                 last_prompt_token = torch.tensor(
                     [[request.token_ids[-1]]],
-                    device=self.runtime.device,
+                    device=getattr(self.runtime, "input_device", self.runtime.device),
                     dtype=torch.long,
                 )
                 with torch.inference_mode():

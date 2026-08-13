@@ -141,6 +141,11 @@ class QwenTextRuntime:
     def dtype(self):
         return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").dtype
 
+    @property
+    def input_device(self):
+        """Device on which token ids should be created before embedding lookup."""
+        return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").device
+
     def forward(
         self,
         input_ids,
@@ -153,13 +158,13 @@ class QwenTextRuntime:
 
         if input_ids.ndim != 2 or input_ids.shape[1] == 0:
             raise ValueError("input_ids must be a non-empty [batch, tokens] tensor")
-        if input_ids.device != self.device:
-            input_ids = input_ids.to(self.device)
         state = state or RuntimeState()
         batch, sequence = input_ids.shape
         start = state.sequence_length
         positions = torch.arange(start, start + sequence, device=self.device)
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        if input_ids.device != embedding.device:
+            input_ids = input_ids.to(embedding.device)
         hidden = self._embedding(input_ids, embedding)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
@@ -221,14 +226,14 @@ class QwenTextRuntime:
         batch = input_ids.shape[0]
         if len(states) != batch or len(request_ids) != batch:
             raise ValueError("states/request_ids must match the decode batch")
-        if input_ids.device != self.device:
-            input_ids = input_ids.to(self.device)
         positions = torch.tensor(
             [[state.sequence_length] for state in states],
             device=self.device,
             dtype=torch.long,
         )
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        if input_ids.device != embedding.device:
+            input_ids = input_ids.to(embedding.device)
         hidden = self._embedding(input_ids, embedding)
         combined = RuntimeState()
         paged_metadata = (
@@ -549,9 +554,10 @@ class QwenTextRuntime:
         return hidden @ weight.transpose(0, 1)
 
     def _embedding(self, input_ids, embedding):
-        if embedding.device == input_ids.device:
-            return embedding[input_ids]
-        return embedding[input_ids.cpu()].to(self.device, non_blocking=True)
+        hidden = embedding[input_ids]
+        if hidden.device == self.device:
+            return hidden
+        return hidden.to(self.device)
 
     def _weight(self, name: str):
         try:

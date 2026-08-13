@@ -150,6 +150,20 @@ Block-scaled 27B FP8 is explicitly rejected until a HydraServe FP8 GEMM exists;
 it is not silently expanded to BF16. The local FP8 language tensors total about
 25.08 GiB and do not fit one 24 GB card regardless.
 
+## 2026-08-14 — CPU-resident embedding input placement
+
+The memory-bound 27B AWQ path previously constructed token IDs on CUDA in every
+backend and immediately copied them back with `input_ids.cpu()` for the
+CPU-resident embedding. Runtime now exposes the embedding's `input_device`, and
+collocated serving, batch recovery, prefill/decode workers, and PD replay create
+IDs there directly. Only selected embedding rows cross to the execution GPU.
+GPU-resident BF16 models retain their original all-CUDA path.
+
+A mixed-device tiny-model test matches an all-GPU embedding baseline, while all
+serving adapters retain compatibility with generic runtimes that only expose
+`device`. The real Qwen3.6-27B AWQ 64-layer prefill plus decode smoke passed with
+CPU token tensors and the existing single-3090 memory bound.
+
 Next implementation slice:
 
 1. broaden B-vs-D across prompt lengths, concurrency, and arrival rates;

@@ -387,7 +387,7 @@ def _decode_worker(
                     )
                     request.transition(RequestState.PREFILL_RUNNING)
                     input_ids = torch.tensor(
-                        [request.token_ids], device=device, dtype=torch.long
+                        [request.token_ids], device=runtime.input_device, dtype=torch.long
                     )
                     with torch.inference_mode():
                         logits, state = runtime.prefill(
@@ -440,7 +440,7 @@ def _decode_worker(
                         token_ids=replay_token_ids,
                     )
                     replay = torch.tensor(
-                        [replay_token_ids], device=device, dtype=torch.long
+                        [replay_token_ids], device=runtime.input_device, dtype=torch.long
                     )
                     with torch.inference_mode():
                         _, state = runtime.prefill(
@@ -468,7 +468,7 @@ def _decode_worker(
                     cache.block_manager.grow_many(request_ids, additional_tokens=1)
                     input_ids = torch.tensor(
                         [requests[request_id].generated_token_ids[-1] for request_id in request_ids],
-                        device=device,
+                        device=runtime.input_device,
                         dtype=torch.long,
                     ).unsqueeze(1)
                     batch_states = [states[request_id] for request_id in request_ids]

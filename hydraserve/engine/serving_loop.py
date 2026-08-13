@@ -1227,7 +1227,9 @@ class RuntimeGenerationBackend:
             return decision
         try:
             input_ids = torch.tensor(
-                [replay_token_ids], device=self.runtime.device, dtype=torch.long
+                [replay_token_ids],
+                device=getattr(self.runtime, "input_device", self.runtime.device),
+                dtype=torch.long,
             )
             with torch.inference_mode():
                 _, state = self.runtime.prefill(
@@ -1258,7 +1260,9 @@ class RuntimeGenerationBackend:
                 raise MemoryError(decision.reason or "request cannot be admitted")
         try:
             input_ids = torch.tensor(
-                [request.token_ids], device=self.runtime.device, dtype=torch.long
+                [request.token_ids],
+                device=getattr(self.runtime, "input_device", self.runtime.device),
+                dtype=torch.long,
             )
             with torch.inference_mode():
                 logits, state = self.runtime.prefill(
@@ -1313,7 +1317,7 @@ class RuntimeGenerationBackend:
             manager.grow_many(request_ids, additional_tokens=1)
             input_ids = torch.tensor(
                 [request_by_id[item].generated_token_ids[-1] for item in request_ids],
-                device=self.runtime.device,
+                device=getattr(self.runtime, "input_device", self.runtime.device),
                 dtype=torch.long,
             ).unsqueeze(1)
             states = [self.states[item] for item in request_ids]

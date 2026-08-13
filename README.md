@@ -85,7 +85,9 @@ FP8 GEMM 尚未实现，loader 会明确拒绝而不是静默转 BF16 或调用�
 27B AWQ 的 checkpoint 保留 GDN 投影为 BF16、量化 MLP/full-attention linear。
 HydraServe 将只做 token lookup 的 embedding 留在 CPU，把独立 lm_head 和执行权重
 放在 GPU，以约 22.02 GiB PyTorch allocation 完成 64 层 forward；INT4 权重在
-GEMM 中即时解包/去零点/缩放，不生成完整反量化矩阵。
+GEMM 中即时解包/去零点/缩放，不生成完整反量化矩阵。runtime 会把 `input_device`
+显式暴露给 serving、PD 和恢复路径：AWQ token id 直接在 CPU 构造并查表，只将选中的
+embedding row 传入 GPU，不再先创建 GPU token tensor、每步同步回 CPU 后再查表。
 
 注意：真实 Qwen GDN recurrent state 按 value heads 保存，conv state 保存完整
 Q/K/V depthwise-conv 通道。因此 FP32 双状态是 4B/9B 约 53.48 MB/请求，27B

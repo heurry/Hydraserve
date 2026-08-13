@@ -35,6 +35,7 @@ def test_real_qwen36_27b_awq_single_token() -> None:
     )
     embedding = runtime.weights[f"{LANGUAGE_PREFIX}.embed_tokens.weight"]
     assert embedding.device.type == "cpu"
+    assert runtime.input_device.type == "cpu"
     assert runtime.weights["lm_head.weight"].device.type == "cuda"
     assert any(isinstance(weight, PackedInt4Weight) for weight in runtime.weights.values())
     cache = PagedKVCache(
@@ -46,7 +47,7 @@ def test_real_qwen36_27b_awq_single_token() -> None:
     cache.allocate(0, 1)
     with torch.inference_mode():
         logits, state = runtime.forward(
-            torch.tensor([[1]], device="cuda:0"),
+            torch.tensor([[1]], device="cpu"),
             paged_cache=cache,
             request_id=0,
         )
@@ -54,9 +55,10 @@ def test_real_qwen36_27b_awq_single_token() -> None:
     assert torch.isfinite(logits).all()
     assert state.sequence_length == 1
     cache.reserve_append(0)
+    next_token = int(logits[:, -1].argmax())
     with torch.inference_mode():
         next_logits, state = runtime.forward(
-            logits[:, -1].argmax(dim=-1, keepdim=True),
+            torch.tensor([[next_token]], device="cpu"),
             state,
             paged_cache=cache,
             request_id=0,

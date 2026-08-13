@@ -226,6 +226,46 @@ def test_tiny_cuda_runtime_matches_cpu(tiny_model) -> None:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_cpu_embedding_accepts_cpu_token_ids_without_gpu_round_trip(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    gpu_weights = {
+        name: tensor.to(
+            device="cuda",
+            dtype=torch.float32
+            if name.endswith((".A_log", ".dt_bias"))
+            else torch.bfloat16,
+        )
+        for name, tensor in weights.items()
+    }
+    embedding_name = "model.language_model.embed_tokens.weight"
+    gpu_weights["lm_head.weight"] = gpu_weights[embedding_name].clone()
+    baseline = QwenTextRuntime(
+        tiny_model,
+        gpu_weights,
+        use_triton=True,
+        use_flash_attention=False,
+        device="cuda",
+    )
+    mixed_weights = dict(gpu_weights)
+    mixed_weights[embedding_name] = weights[embedding_name].to(torch.bfloat16)
+    mixed = QwenTextRuntime(
+        tiny_model,
+        mixed_weights,
+        use_triton=True,
+        use_flash_attention=False,
+        device="cuda",
+    )
+    token_ids = torch.tensor([[1, 9, 4, 3]], device="cpu")
+
+    expected, _ = baseline.forward(token_ids.cuda())
+    actual, _ = mixed.forward(token_ids)
+
+    assert mixed.input_device.type == "cpu"
+    assert actual.device.type == "cuda"
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_heterogeneous_batched_decode_matches_sequential(tiny_model) -> None:
     weights = make_weights(tiny_model, device="cuda", dtype=torch.bfloat16)
     runtime = QwenTextRuntime(
