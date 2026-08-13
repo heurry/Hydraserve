@@ -154,10 +154,18 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
 仍逐请求精确重算。由于后续 GDN 层依赖前层输出，当前实现不宣称跳过整个命中 prefix
 的模型计算；这是显存共享与 worker affinity 基础，不虚报为完整 prefix-compute skip。
 
-路由在 admission 成功时绑定，依据 prompt 长度和统一 KV/GDN 容量快照决策，执行中不
-改变归属。RPC 超时属于结果未知：当前请求失败并隔离 prefill 路径，后续请求安全降级到
-collocated，不对同一请求进行可能重复执行的盲重试。`/health` 暴露容量，`/metrics`
-输出 Prometheus 文本格式的队列、KV、state slot、路由和 worker 健康指标。
+路由在 admission 成功时绑定，执行中不改变归属。默认 SHM/PARTIAL 路由使用二次延迟
+曲线联合估计 collocated 与 PD 成本，加入收益下限和 PD 不确定性惩罚，并按 prompt
+长度桶用真实 prefill 延迟做 EWMA 修正；不再把 8K 等固定阈值当成普遍 crossover。
+RPC 超时属于结果未知：当前请求失败并隔离 prefill 路径，后续请求安全降级到
+collocated，不对同一请求进行可能重复执行的盲重试。`/health` 暴露容量和路由校准状态，
+`/metrics` 输出 Prometheus 文本格式的队列、KV、state slot、路由成本观测和 worker
+健康指标。
+
+可用 `--router-profile configs/router/rtx3090-4b-shm-partial.json` 显式加载 profile。
+JSON 分别提供 `collocated` / `pd_disaggregated` 的 fixed、linear、quadratic、decode-load
+系数，以及最小绝对/相对收益和风险倍率。不同模型、传输后端或硬件应使用各自测量得到
+的 profile；固定 PD 实验仍使用 `--pd`，不会被 adaptive 路由覆盖。
 
 1P+ND 使用一个 prefill worker 和多个各自持有 KV/GDN 容量的 decode worker：
 
@@ -199,8 +207,8 @@ crossover 或吞吐结论。
 runner 支持 `--warmup` 排除首次 kernel 编译，并支持 `burst`、固定速率和 seeded
 Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让 GPU1 继续
 推进已有 decode；GPU1 安装新请求的重算阶段仍需与 decode 串行。
-benchmark 结果会记录每个请求的实际 route、route reason 和 worker binding，并汇总
-route counts。2026-08-14 的短 prompt 矩阵与 9K LongBench 实测见
+benchmark 结果会记录每个请求的实际 route、route reason、worker binding、两条预测
+成本、预计收益和校准置信度，并汇总 route counts。2026-08-14 的短 prompt 矩阵与 9K LongBench 实测见
 [`docs/BENCHMARK_2026-08-14.md`](docs/BENCHMARK_2026-08-14.md)：在本机 SHM
 PARTIAL 模式下，静态 8K 阈值会错误偏向 PD，后续路由必须纳入 KV 重算与传输成本。
 运行时 decode 采用事务式状态检查点：整批失败会先回滚逻辑 KV 长度和 GDN 状态，再

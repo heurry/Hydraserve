@@ -1,4 +1,15 @@
-from hydraserve.router import AdaptiveRouter, Route, RouteReason
+import json
+
+import pytest
+
+from hydraserve.router import (
+    AdaptiveRouter,
+    CostAwareRouter,
+    CostRouterConfig,
+    LatencyCurve,
+    Route,
+    RouteReason,
+)
 
 
 def test_router_thresholds() -> None:
@@ -20,3 +31,71 @@ def test_router_exposes_stable_decision_reason() -> None:
     long = router.decide(9000, 0.2, True)
     assert long.route is Route.PD_DISAGGREGATED
     assert long.reason is RouteReason.LONG_PROMPT_PD
+
+
+def test_partial_transfer_cost_prior_rejects_false_8k_crossover() -> None:
+    router = CostAwareRouter()
+    decision = router.decide(9_000, 0.2, True)
+    assert decision.route is Route.COLLOCATED
+    assert decision.reason is RouteReason.COST_MODEL_COLLOCATED
+    assert decision.collocated_cost_ms < decision.pd_cost_ms
+    assert decision.estimated_savings_ms < 0
+
+
+def test_cost_router_selects_pd_only_after_risk_adjusted_margin() -> None:
+    router = CostAwareRouter(
+        CostRouterConfig(
+            collocated=LatencyCurve(100, 1.0),
+            pd_disaggregated=LatencyCurve(20, 0.4),
+            minimum_pd_prompt_tokens=16,
+            minimum_savings_ms=10,
+            minimum_savings_ratio=0.1,
+            pd_uncertainty_multiplier=1.0,
+        )
+    )
+    decision = router.decide(100, 0.5)
+    assert decision.route is Route.PD_DISAGGREGATED
+    assert decision.reason is RouteReason.COST_MODEL_PD
+    assert decision.estimated_savings_ms == pytest.approx(140)
+
+
+def test_online_observation_can_correct_an_optimistic_pd_prior() -> None:
+    router = CostAwareRouter(
+        CostRouterConfig(
+            collocated=LatencyCurve(100, 0),
+            pd_disaggregated=LatencyCurve(50, 0),
+            minimum_pd_prompt_tokens=1,
+            minimum_savings_ms=1,
+            minimum_savings_ratio=0,
+            pd_uncertainty_multiplier=1,
+            ewma_alpha=1,
+        )
+    )
+    assert router.route(1024, 0) is Route.PD_DISAGGREGATED
+    router.observe(Route.PD_DISAGGREGATED, 1024, 300, 0)
+    corrected = router.decide(1024, 0)
+    assert corrected.route is Route.COLLOCATED
+    assert corrected.pd_cost_ms == pytest.approx(200)  # correction is clipped at 4x
+    assert router.stats().pd_observations == 1
+
+
+def test_router_profile_loads_and_rejects_incomplete_json(tmp_path) -> None:
+    profile = tmp_path / "router.json"
+    profile.write_text(
+        json.dumps(
+            {
+                "collocated": {"fixed_ms": 100, "linear_ms_per_token": 1},
+                "pd_disaggregated": {
+                    "fixed_ms": 10,
+                    "linear_ms_per_token": 0.1,
+                },
+                "minimum_pd_prompt_tokens": 8,
+                "pd_uncertainty_multiplier": 1,
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert CostAwareRouter.from_json(profile).route(32, 0) is Route.PD_DISAGGREGATED
+    profile.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="missing"):
+        CostAwareRouter.from_json(profile)

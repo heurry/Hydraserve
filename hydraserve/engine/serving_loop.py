@@ -114,6 +114,10 @@ class ServingRequest:
     cancelled: Event = field(default_factory=Event)
     route: str | None = None
     route_reason: str | None = None
+    route_collocated_cost_ms: float | None = None
+    route_pd_cost_ms: float | None = None
+    route_estimated_savings_ms: float | None = None
+    route_cost_confidence: float | None = None
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0

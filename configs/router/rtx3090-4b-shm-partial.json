@@ -1,0 +1,19 @@
+{
+  "collocated": {
+    "fixed_ms": 30.0,
+    "linear_ms_per_token": 0.3,
+    "quadratic_ms_per_token2": 0.00032,
+    "decode_load_scale": 0.25
+  },
+  "pd_disaggregated": {
+    "fixed_ms": 250.0,
+    "linear_ms_per_token": 0.68,
+    "quadratic_ms_per_token2": 0.00045,
+    "decode_load_scale": 0.25
+  },
+  "minimum_pd_prompt_tokens": 256,
+  "minimum_savings_ms": 5.0,
+  "minimum_savings_ratio": 0.05,
+  "pd_uncertainty_multiplier": 1.1,
+  "ewma_alpha": 0.2
+}

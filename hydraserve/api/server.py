@@ -59,6 +59,18 @@ class _Handler(BaseHTTPRequestHandler):
                 }
                 if recovery.healthy_workers < recovery.total_workers:
                     payload["status"] = "degraded"
+            routing_cost_stats = getattr(
+                self.hydra.generation_loop.backend, "routing_cost_stats", None
+            )
+            if routing_cost_stats is not None:
+                costs = routing_cost_stats()
+                if costs is not None:
+                    payload["routing_cost_model"] = {
+                        "collocated_observations": costs.collocated_observations,
+                        "pd_observations": costs.pd_observations,
+                        "collocated_correction": costs.collocated_correction,
+                        "pd_correction": costs.pd_correction,
+                    }
             self._json(200, payload)
             return
         if self.path == "/metrics":
@@ -505,6 +517,24 @@ class _Handler(BaseHTTPRequestHandler):
                     f"hydraserve_prefill_worker_healthy {1 if stats.prefill_healthy else 0}",
                 ]
             )
+        routing_cost_stats = getattr(backend, "routing_cost_stats", None)
+        if routing_cost_stats is not None:
+            stats = routing_cost_stats()
+            if stats is not None:
+                lines.extend(
+                    [
+                        "# TYPE hydraserve_route_cost_observations_total counter",
+                        'hydraserve_route_cost_observations_total{route="collocated"} '
+                        f"{stats.collocated_observations}",
+                        'hydraserve_route_cost_observations_total{route="pd_disaggregated"} '
+                        f"{stats.pd_observations}",
+                        "# TYPE hydraserve_route_cost_correction_ratio gauge",
+                        'hydraserve_route_cost_correction_ratio{route="collocated"} '
+                        f"{stats.collocated_correction}",
+                        'hydraserve_route_cost_correction_ratio{route="pd_disaggregated"} '
+                        f"{stats.pd_correction}",
+                    ]
+                )
         recovery_stats = getattr(backend, "recovery_stats", None)
         if recovery_stats is not None:
             stats = recovery_stats()

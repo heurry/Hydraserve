@@ -8,7 +8,7 @@ from hydraserve.engine import (
     BackendCapacity,
     ServingRequest,
 )
-from hydraserve.router import AdaptiveRouter, Route
+from hydraserve.router import AdaptiveRouter, CostAwareRouter, Route, RouteReason
 
 
 class FakeAdaptiveBackend(AdaptiveGenerationBackend):
@@ -84,3 +84,19 @@ def test_ambiguous_pd_timeout_quarantines_route_for_later_requests() -> None:
     backend.timeout_pd = False
     assert backend.prefill(later) == 11
     assert backend.route_for(10).route is Route.COLLOCATED
+
+
+def test_cost_route_is_bound_observed_and_exposed_on_request() -> None:
+    backend = FakeAdaptiveBackend()
+    backend.router = CostAwareRouter()
+    request = ServingRequest(12, tuple(range(9_000)), 4)
+    assert backend.prefill(request) == 11
+    assert request.route == Route.COLLOCATED.value
+    assert request.route_reason == RouteReason.COST_MODEL_COLLOCATED.value
+    assert request.worker_id == 0
+    assert request.route_collocated_cost_ms is not None
+    assert request.route_pd_cost_ms > request.route_collocated_cost_ms
+    assert request.route_estimated_savings_ms < 0
+    stats = backend.routing_cost_stats()
+    assert stats.collocated_observations == 1
+    assert stats.pd_observations == 0

@@ -7,6 +7,7 @@ import multiprocessing as mp
 from pathlib import Path
 from queue import Empty
 from threading import Lock, RLock
+from time import monotonic
 from uuid import uuid4
 
 from hydraserve.engine.serving_loop import (
@@ -15,7 +16,13 @@ from hydraserve.engine.serving_loop import (
     ServingRequest,
 )
 from hydraserve.engine.sampling import SamplingParams, TokenSample, sample_logits
-from hydraserve.router import AdaptiveRouter, Route, RouteDecision, RouteReason
+from hydraserve.router import (
+    AdaptiveRouter,
+    CostAwareRouter,
+    Route,
+    RouteDecision,
+    RouteReason,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -733,7 +740,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
     ) -> None:
-        self.router = router or AdaptiveRouter()
+        self.router = router or CostAwareRouter()
         self._route_decisions: dict[int, RouteDecision] = {}
         self._route_lock = RLock()
         self._collocated_count = 0
@@ -773,6 +780,11 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 bound = self._route_decisions.setdefault(request.request_id, decision)
                 request.route = bound.route.value
                 request.route_reason = bound.reason.value
+                request.worker_id = 0
+                request.route_collocated_cost_ms = bound.collocated_cost_ms
+                request.route_pd_cost_ms = bound.pd_cost_ms
+                request.route_estimated_savings_ms = bound.estimated_savings_ms
+                request.route_cost_confidence = bound.cost_model_confidence
         return admitted
 
     def prefill(self, request: ServingRequest) -> int | TokenSample:
@@ -780,8 +792,10 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
         if not admitted.admitted:
             raise MemoryError(admitted.reason or "request cannot be admitted")
         decision = self.route_for(request.request_id)
+        started = monotonic()
         if decision.route is Route.COLLOCATED:
             token_id = self._prefill_collocated(request)
+            self._observe_route_cost(decision, started)
             with self._route_lock:
                 self._collocated_count += 1
             return token_id
@@ -792,9 +806,20 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 self._pd_failures += 1
                 self._prefill_healthy = False
             raise
+        self._observe_route_cost(decision, started)
         with self._route_lock:
             self._pd_count += 1
         return token_id
+
+    def _observe_route_cost(self, decision: RouteDecision, started: float) -> None:
+        observe = getattr(self.router, "observe", None)
+        if observe is not None:
+            observe(
+                decision.route,
+                decision.prompt_tokens,
+                (monotonic() - started) * 1000.0,
+                decision.decode_load,
+            )
 
     def route_for(self, request_id: int) -> RouteDecision:
         with self._route_lock:
@@ -818,3 +843,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 pd_failures=self._pd_failures,
                 prefill_healthy=self._prefill_healthy,
             )
+
+    def routing_cost_stats(self):
+        stats = getattr(self.router, "stats", None)
+        return None if stats is None else stats()

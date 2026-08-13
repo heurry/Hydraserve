@@ -39,6 +39,7 @@ def main() -> int:
     serve_mode = serve_parser.add_mutually_exclusive_group()
     serve_mode.add_argument("--pd", action="store_true")
     serve_mode.add_argument("--adaptive", action="store_true")
+    serve_parser.add_argument("--router-profile", type=Path)
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
@@ -71,6 +72,7 @@ def main() -> int:
     benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
     benchmark_mode.add_argument("--pd", action="store_true")
     benchmark_mode.add_argument("--adaptive", action="store_true")
+    benchmark_parser.add_argument("--router-profile", type=Path)
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
@@ -91,6 +93,7 @@ def main() -> int:
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
+        from hydraserve.router import CostAwareRouter
 
         if min(
             args.cache_tokens,
@@ -106,6 +109,16 @@ def main() -> int:
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
+        if args.router_profile and not args.adaptive:
+            parser.error("--router-profile requires --adaptive")
+        try:
+            router = (
+                CostAwareRouter.from_json(args.router_profile)
+                if args.router_profile
+                else None
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot load router profile: {exc}")
         if args.adaptive and args.decode_devices:
             backend = MultiWorkerGenerationBackend(
                 PDClusterConfig(
@@ -119,28 +132,27 @@ def main() -> int:
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
-                )
+                ),
+                router=router,
             )
             model_name = backend.model_name
         elif args.pd or args.adaptive:
-            backend_type = (
-                AdaptiveGenerationBackend
-                if args.adaptive
-                else DisaggregatedGenerationBackend
+            worker_config = PDWorkerConfig(
+                str(args.model),
+                prefill_device=args.device,
+                decode_device=args.decode_device,
+                cache_tokens=args.cache_tokens,
+                block_size=args.block_size,
+                use_flash_attention=not args.no_flash_attention,
+                prefill_chunk_size=args.prefill_chunk_size,
+                max_state_slots=args.max_batch_size,
+                prefix_cache_blocks=args.prefix_cache_blocks,
+                prefix_cache_min_frequency=args.prefix_cache_min_frequency,
             )
-            backend = backend_type(
-                PDWorkerConfig(
-                    str(args.model),
-                    prefill_device=args.device,
-                    decode_device=args.decode_device,
-                    cache_tokens=args.cache_tokens,
-                    block_size=args.block_size,
-                    use_flash_attention=not args.no_flash_attention,
-                    prefill_chunk_size=args.prefill_chunk_size,
-                    max_state_slots=args.max_batch_size,
-                    prefix_cache_blocks=args.prefix_cache_blocks,
-                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
-                )
+            backend = (
+                AdaptiveGenerationBackend(worker_config, router=router)
+                if args.adaptive
+                else DisaggregatedGenerationBackend(worker_config)
             )
             model_name = backend.model_name
         else:
@@ -235,6 +247,7 @@ def main() -> int:
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
+        from hydraserve.router import CostAwareRouter
 
         if min(
             args.cache_tokens,
@@ -247,6 +260,16 @@ def main() -> int:
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
+        if args.router_profile and not args.adaptive:
+            parser.error("--router-profile requires --adaptive")
+        try:
+            router = (
+                CostAwareRouter.from_json(args.router_profile)
+                if args.router_profile
+                else None
+            )
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot load router profile: {exc}")
         if args.adaptive and args.decode_devices:
             backend = MultiWorkerGenerationBackend(
                 PDClusterConfig(
@@ -260,27 +283,26 @@ def main() -> int:
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
-                )
+                ),
+                router=router,
             )
         elif args.pd or args.adaptive:
-            backend_type = (
-                AdaptiveGenerationBackend
-                if args.adaptive
-                else DisaggregatedGenerationBackend
+            worker_config = PDWorkerConfig(
+                str(args.model),
+                prefill_device=args.device,
+                decode_device=args.decode_device,
+                cache_tokens=args.cache_tokens,
+                block_size=args.block_size,
+                use_flash_attention=not args.no_flash_attention,
+                prefill_chunk_size=args.prefill_chunk_size,
+                max_state_slots=args.concurrency,
+                prefix_cache_blocks=args.prefix_cache_blocks,
+                prefix_cache_min_frequency=args.prefix_cache_min_frequency,
             )
-            backend = backend_type(
-                PDWorkerConfig(
-                    str(args.model),
-                    prefill_device=args.device,
-                    decode_device=args.decode_device,
-                    cache_tokens=args.cache_tokens,
-                    block_size=args.block_size,
-                    use_flash_attention=not args.no_flash_attention,
-                    prefill_chunk_size=args.prefill_chunk_size,
-                    max_state_slots=args.concurrency,
-                    prefix_cache_blocks=args.prefix_cache_blocks,
-                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
-                )
+            backend = (
+                AdaptiveGenerationBackend(worker_config, router=router)
+                if args.adaptive
+                else DisaggregatedGenerationBackend(worker_config)
             )
         else:
             import torch

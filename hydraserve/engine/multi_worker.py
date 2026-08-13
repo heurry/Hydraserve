@@ -26,6 +26,7 @@ from hydraserve.engine.serving_loop import (
 from hydraserve.engine.sampling import TokenSample
 from hydraserve.router import (
     AdaptiveRouter,
+    CostAwareRouter,
     DecodeWorkerRegistry,
     DecodeWorkerSnapshot,
     Route,
@@ -120,7 +121,7 @@ class MultiWorkerGenerationBackend:
         if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
             raise ValueError("invalid decode worker recovery policy")
         self.config = config
-        self.router = router or AdaptiveRouter()
+        self.router = router or CostAwareRouter()
         self.prefix_affinity = prefix_affinity
         self.operation_timeout = operation_timeout
         self.startup_timeout = startup_timeout
@@ -263,6 +264,10 @@ class MultiWorkerGenerationBackend:
                 self._route_decisions[request.request_id] = decision
                 request.route = decision.route.value
                 request.route_reason = decision.reason.value
+                request.route_collocated_cost_ms = decision.collocated_cost_ms
+                request.route_pd_cost_ms = decision.pd_cost_ms
+                request.route_estimated_savings_ms = decision.estimated_savings_ms
+                request.route_cost_confidence = decision.cost_model_confidence
             return AdmissionDecision.accept()
         return AdmissionDecision.defer(
             last_retryable or "all decode workers rejected the reservation"
@@ -274,8 +279,10 @@ class MultiWorkerGenerationBackend:
             raise MemoryError(admitted.reason or "request cannot be admitted")
         worker_id = self.registry.worker_for(request.request_id)
         decision = self.route_for(request.request_id)
+        started = monotonic()
         if decision.route is Route.COLLOCATED:
             token_id = self._collocated_prefill(worker_id, request)
+            self._observe_route_cost(decision, started)
             with self._state_lock:
                 self._collocated_count += 1
             return token_id
@@ -307,10 +314,21 @@ class MultiWorkerGenerationBackend:
         if not prepared.get("replay_consistent", True):
             with self._state_lock:
                 self._replay_mismatches += 1
+        self._observe_route_cost(decision, started)
         with self._state_lock:
             self._pd_count += 1
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
+
+    def _observe_route_cost(self, decision: RouteDecision, started: float) -> None:
+        observe = getattr(self.router, "observe", None)
+        if observe is not None:
+            observe(
+                decision.route,
+                decision.prompt_tokens,
+                (monotonic() - started) * 1000.0,
+                decision.decode_load,
+            )
 
     def decode(
         self, requests: tuple[ServingRequest, ...]
@@ -406,6 +424,10 @@ class MultiWorkerGenerationBackend:
                 self._pd_failures,
                 self._prefill_healthy,
             )
+
+    def routing_cost_stats(self):
+        stats = getattr(self.router, "stats", None)
+        return None if stats is None else stats()
 
     def recovery_stats(self) -> WorkerRecoveryStats:
         snapshots = self.registry.snapshots()

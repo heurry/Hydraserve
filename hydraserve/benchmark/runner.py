@@ -25,6 +25,10 @@ class RequestMetrics:
     route: str | None = None
     route_reason: str | None = None
     worker_id: int | None = None
+    route_collocated_cost_ms: float | None = None
+    route_pd_cost_ms: float | None = None
+    route_estimated_savings_ms: float | None = None
+    route_cost_confidence: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +172,10 @@ def run_benchmark(
             None if handle is None else (handle.request.route or "collocated"),
             None if handle is None else handle.request.route_reason,
             None if handle is None else handle.request.worker_id,
+            None if handle is None else handle.request.route_collocated_cost_ms,
+            None if handle is None else handle.request.route_pd_cost_ms,
+            None if handle is None else handle.request.route_estimated_savings_ms,
+            None if handle is None else handle.request.route_cost_confidence,
         )
 
     offsets: list[float] = []

@@ -211,3 +211,28 @@ Next implementation slice:
 2. add online latency observations and conservative fallback when calibration is
    unavailable;
 3. validate route decisions under mixed prompt lengths and decode pressure.
+
+## 2026-08-14 — calibrated cost-aware routing
+
+Implemented and tested:
+
+- risk-adjusted quadratic latency curves for collocated and PD prefill;
+- minimum absolute and relative savings gates, plus a conservative minimum
+  prompt gate;
+- prompt-length-bucketed EWMA corrections from real route latency observations;
+- JSON route profiles for model/transport/hardware-specific calibration;
+- immutable request decisions carrying both predicted costs, estimated savings,
+  confidence, route reason, and decode worker binding;
+- route-calibration health output and Prometheus observation/correction metrics.
+
+The threshold router remains available as an explicit policy object for tests
+and controlled experiments. Production `--adaptive` defaults to the calibrated
+SHM/PARTIAL cost profile. A real cold 9K adaptive gate selected collocated with
+predicted costs 28.65 s vs risk-adjusted 47.10 s PD and completed successfully;
+this is the intended correction to the earlier static-threshold decision.
+
+Next implementation slice:
+
+1. automate multi-length/multi-concurrency calibration traces and curve fitting;
+2. separate mean service cost from SLO-tail externality under active decode load;
+3. add route-decision hysteresis and profile drift alarms.

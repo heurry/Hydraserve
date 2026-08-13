@@ -49,6 +49,13 @@ this transport mode: partial PD TTFT is about 49% higher than collocated TTFT.
 The next routing milestone must therefore use measured transfer/recompute cost,
 not prompt length alone.
 
+After the cost router was installed, a cold one-request 9K gate selected
+`collocated` with `route_reason=cost_model_collocated`. The profile predicted
+28.65 s collocated versus 47.10 s risk-adjusted partial PD (−18.45 s estimated
+savings); the request completed successfully and its cold TTFT was 38.51 s.
+The observation is retained by the online length-bucket calibration while the
+service remains resident.
+
 ## OOM found and fixed
 
 The first 9K adaptive run failed 0/2 on the decode worker with an attempted

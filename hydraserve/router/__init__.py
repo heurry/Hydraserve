@@ -1,6 +1,10 @@
 from hydraserve.router.adaptive_router import (
     AdaptiveRouter,
+    CostAwareRouter,
+    CostRouterConfig,
+    LatencyCurve,
     Route,
+    RouteCostStats,
     RouteDecision,
     RouteReason,
     RouterConfig,
@@ -15,9 +19,13 @@ from hydraserve.router.worker_registry import (
 
 __all__ = [
     "AdaptiveRouter",
+    "CostAwareRouter",
+    "CostRouterConfig",
     "DecodeWorkerRegistry",
     "DecodeWorkerSnapshot",
+    "LatencyCurve",
     "Route",
+    "RouteCostStats",
     "RouteDecision",
     "RouteReason",
     "RouterConfig",
