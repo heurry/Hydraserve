@@ -14,8 +14,10 @@ from itertools import count
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Protocol
+from secrets import randbits
 
 from hydraserve.engine.fair_scheduler import FairDecodeScheduler
+from hydraserve.engine.sampling import SamplingParams, TokenSample
 
 
 class OverloadedError(RuntimeError):
@@ -25,13 +27,21 @@ class OverloadedError(RuntimeError):
 class PartialDecodeError(RuntimeError):
     """A decode iteration succeeded for some requests and failed for others."""
 
-    def __init__(self, token_ids: dict[int, int], errors: dict[int, BaseException]) -> None:
+    def __init__(
+        self,
+        token_ids: dict[int, int | TokenSample],
+        errors: dict[int, BaseException],
+    ) -> None:
         overlap = set(token_ids) & set(errors)
         if overlap:
             raise ValueError(f"partial decode outcomes overlap for requests {sorted(overlap)}")
         if not errors:
             raise ValueError("partial decode error requires at least one failed request")
-        self.token_ids = {int(key): int(value) for key, value in token_ids.items()}
+        self.samples = {
+            int(key): value if isinstance(value, TokenSample) else TokenSample(int(value))
+            for key, value in token_ids.items()
+        }
+        self.token_ids = {key: sample.token_id for key, sample in self.samples.items()}
         self.errors = {int(key): value for key, value in errors.items()}
         failed = ", ".join(str(request_id) for request_id in sorted(self.errors))
         super().__init__(f"decode failed for request(s): {failed}")
@@ -107,6 +117,7 @@ class ServingRequest:
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0
+    sampling_params: SamplingParams = SamplingParams()
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,12 +127,16 @@ class GenerationEvent:
     finished: bool = False
     finish_reason: str | None = None
     error: str | None = None
+    logprob: float | None = None
+    top_logprobs: tuple[tuple[int, float], ...] = ()
 
 
 class GenerationBackend(Protocol):
-    def prefill(self, request: ServingRequest) -> int: ...
+    def prefill(self, request: ServingRequest) -> int | TokenSample: ...
 
-    def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]: ...
+    def decode(
+        self, requests: tuple[ServingRequest, ...]
+    ) -> tuple[int | TokenSample, ...]: ...
 
     def release(self, request_id: int) -> None: ...
 
@@ -213,6 +228,7 @@ class ContinuousGenerationLoop:
         max_new_tokens: int,
         *,
         priority: int = 0,
+        sampling_params: SamplingParams | None = None,
     ) -> GenerationHandle:
         if not token_ids or max_new_tokens <= 0:
             raise ValueError("request needs a prompt and positive max_new_tokens")
@@ -222,8 +238,15 @@ class ContinuousGenerationLoop:
             raise ValueError(
                 f"priority must be in [0, {self._decode_scheduler.config.max_priority}]"
             )
+        sampling = sampling_params or SamplingParams()
+        if sampling.seed is None:
+            sampling = sampling.with_seed(randbits(63))
         request = ServingRequest(
-            next(self._ids), tuple(token_ids), max_new_tokens, priority=priority
+            next(self._ids),
+            tuple(token_ids),
+            max_new_tokens,
+            priority=priority,
+            sampling_params=sampling,
         )
         handle = GenerationHandle(request, self._wake)
         demand = len(request.token_ids) + request.max_new_tokens
@@ -349,13 +372,13 @@ class ContinuousGenerationLoop:
         for request_id in completed:
             request, future = pending.pop(request_id)
             try:
-                token_id = int(future.result())
+                sample = self._normalize_sample(future.result())
                 if request.cancelled.is_set() or self._stop.is_set():
                     self._finish(request, "cancelled", active=active, release=True)
                     continue
-                request.generated_token_ids.append(token_id)
-                self._emit(request, token_id)
-                reason = self._finish_reason(request, token_id)
+                request.generated_token_ids.append(sample.token_id)
+                self._emit(request, sample)
+                reason = self._finish_reason(request, sample.token_id)
                 if reason is not None:
                     self._finish(request, reason, active=active, release=True)
                 else:
@@ -397,13 +420,13 @@ class ContinuousGenerationLoop:
             available_slots -= 1
             did_work = True
             try:
-                token_id = int(self.backend.prefill(request))
+                sample = self._normalize_sample(self.backend.prefill(request))
             except Exception as exc:
                 self._fail(request, exc, active=active, release=True)
                 continue
-            request.generated_token_ids.append(token_id)
-            self._emit(request, token_id)
-            reason = self._finish_reason(request, token_id)
+            request.generated_token_ids.append(sample.token_id)
+            self._emit(request, sample)
+            reason = self._finish_reason(request, sample.token_id)
             if reason is not None:
                 self._finish(request, reason, active=active, release=True)
             else:
@@ -431,8 +454,8 @@ class ContinuousGenerationLoop:
                 if error is not None:
                     self._fail(request, error, active=active, release=True)
                 else:
-                    self._accept_decode_token(
-                        request, exc.token_ids[request.request_id], active
+                    self._accept_decode_sample(
+                        request, exc.samples[request.request_id], active
                     )
             return
         except Exception as exc:
@@ -440,18 +463,18 @@ class ContinuousGenerationLoop:
                 self._fail(request, exc, active=active, release=True)
             return
         for request, token_id in zip(batch, token_ids, strict=True):
-            self._accept_decode_token(request, token_id, active)
+            self._accept_decode_sample(request, token_id, active)
 
-    def _accept_decode_token(
+    def _accept_decode_sample(
         self,
         request: ServingRequest,
-        token_id: int,
+        value: int | TokenSample,
         active: OrderedDict[int, ServingRequest],
     ) -> None:
-        token_id = int(token_id)
-        request.generated_token_ids.append(token_id)
-        self._emit(request, token_id)
-        reason = self._finish_reason(request, token_id)
+        sample = self._normalize_sample(value)
+        request.generated_token_ids.append(sample.token_id)
+        self._emit(request, sample)
+        reason = self._finish_reason(request, sample.token_id)
         if reason is not None:
             self._finish(request, reason, active=active, release=True)
 
@@ -464,14 +487,30 @@ class ContinuousGenerationLoop:
     def _finish_reason(self, request: ServingRequest, token_id: int) -> str | None:
         if self.eos_token_id is not None and token_id == self.eos_token_id:
             return "stop"
+        generated = request.generated_token_ids
+        if any(
+            len(generated) >= len(sequence)
+            and tuple(generated[-len(sequence) :]) == sequence
+            for sequence in request.sampling_params.stop_token_sequences
+        ):
+            return "stop"
         if len(request.generated_token_ids) >= request.max_new_tokens:
             return "length"
         return None
 
-    def _emit(self, request: ServingRequest, token_id: int) -> None:
+    def _emit(self, request: ServingRequest, sample: TokenSample) -> None:
         self._handle(request.request_id)._put(
-            GenerationEvent(request.request_id, token_id=token_id)
+            GenerationEvent(
+                request.request_id,
+                token_id=sample.token_id,
+                logprob=sample.logprob,
+                top_logprobs=sample.top_logprobs,
+            )
         )
+
+    @staticmethod
+    def _normalize_sample(value: int | TokenSample) -> TokenSample:
+        return value if isinstance(value, TokenSample) else TokenSample(int(value))
 
     def _finish(
         self,
@@ -686,7 +725,7 @@ class RuntimeGenerationBackend:
                 raise
             return AdmissionDecision.accept()
 
-    def prefill(self, request: ServingRequest) -> int:
+    def prefill(self, request: ServingRequest) -> TokenSample:
         import torch
 
         try:
@@ -708,12 +747,19 @@ class RuntimeGenerationBackend:
                 )
             self.paged_cache.publish_prefix(request.request_id, request.token_ids)
             self.states[request.request_id] = state
-            return int(logits[0, -1].argmax())
+            from hydraserve.engine.sampling import sample_logits
+
+            return sample_logits(
+                logits[:, -1],
+                (request.token_ids,),
+                (request.sampling_params,),
+                steps=(0,),
+            )[0]
         except Exception:
             self.release(request.request_id)
             raise
 
-    def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
+    def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[TokenSample, ...]:
         """Decode transactionally, bisecting a failed batch to isolate requests."""
         import torch
 
@@ -739,7 +785,7 @@ class RuntimeGenerationBackend:
                     checkpoints[request_id]
                 )
 
-        def attempt(request_ids: tuple[int, ...]) -> tuple[int, ...]:
+        def attempt(request_ids: tuple[int, ...]) -> tuple[TokenSample, ...]:
             manager.grow_many(request_ids, additional_tokens=1)
             input_ids = torch.tensor(
                 [request_by_id[item].generated_token_ids[-1] for item in request_ids],
@@ -755,8 +801,20 @@ class RuntimeGenerationBackend:
                         self.paged_cache,
                         request_ids,
                     )
-                token_ids = tuple(
-                    int(token) for token in logits[:, -1].argmax(dim=-1).tolist()
+                from hydraserve.engine.sampling import sample_logits
+
+                token_ids = sample_logits(
+                    logits[:, -1],
+                    (
+                        request_by_id[item].token_ids
+                        + tuple(request_by_id[item].generated_token_ids)
+                        for item in request_ids
+                    ),
+                    (request_by_id[item].sampling_params for item in request_ids),
+                    steps=(
+                        len(request_by_id[item].generated_token_ids)
+                        for item in request_ids
+                    ),
                 )
                 if len(token_ids) != len(request_ids):
                     raise RuntimeError(
@@ -773,7 +831,7 @@ class RuntimeGenerationBackend:
         except Exception:
             pass
 
-        successes: dict[int, int] = {}
+        successes: dict[int, TokenSample] = {}
         failures: dict[int, Exception] = {}
 
         def isolate(request_ids: tuple[int, ...]) -> None:

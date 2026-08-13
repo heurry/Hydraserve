@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from hydraserve.engine.scheduler import Request, RequestState
+from hydraserve.engine.sampling import TokenSample, sample_logits
 from hydraserve.model.runtime import RuntimeState
 from hydraserve.transfer.pipeline import TransferPipeline
 from hydraserve.transfer.runtime_codec import RuntimeStateCodec
@@ -14,6 +15,7 @@ class PrefillResult:
     first_token_id: int
     state: RuntimeState
     state_token_count: int
+    sample: TokenSample | None = None
 
 
 @dataclass(slots=True)
@@ -79,7 +81,13 @@ class PrefillWorker:
             bundle.kv_cache = RuntimeStateCodec.extract_kv(
                 self.runtime.config, self.paged_cache, request.request_id
             )
-        first_token = int(logits[0, -1].argmax())
+        sample = sample_logits(
+            logits[:, -1],
+            (request.token_ids,),
+            (request.sampling_params,),
+            steps=(0,),
+        )[0]
+        first_token = sample.token_id
         request.transition(RequestState.TRANSFER_PENDING)
         self.pipeline.send(
             request.request_id,
@@ -89,7 +97,7 @@ class PrefillWorker:
             first_token_id=first_token,
             state_token_count=split,
         )
-        return PrefillResult(first_token, state, split)
+        return PrefillResult(first_token, state, split, sample)
 
 
 class DecodeWorker:
@@ -165,7 +173,12 @@ class DecodeWorker:
                         paged_cache=self.paged_cache,
                         request_id=request.request_id,
                     )
-                replay_token = int(replay_logits[0, -1].argmax())
+                replay_token = sample_logits(
+                    replay_logits[:, -1],
+                    (request.token_ids,),
+                    (request.sampling_params,),
+                    steps=(0,),
+                )[0].token_id
                 if descriptor.first_token_id is not None and replay_token != descriptor.first_token_id:
                     raise RuntimeError(
                         f"N-1 replay token mismatch: prefill={descriptor.first_token_id}, "

@@ -6,6 +6,7 @@ from itertools import count
 from threading import RLock
 
 from hydraserve.router.adaptive_router import AdaptiveRouter, Route
+from hydraserve.engine.sampling import SamplingParams
 
 
 class RequestState(str, Enum):
@@ -53,6 +54,7 @@ class Request:
     route: Route
     state: RequestState = RequestState.WAITING
     generated_token_ids: list[int] = field(default_factory=list)
+    sampling_params: SamplingParams = SamplingParams()
 
     def transition(self, target: RequestState) -> None:
         if target not in _TRANSITIONS[self.state]:
@@ -73,6 +75,7 @@ class CentralScheduler:
         max_new_tokens: int,
         decode_load: float = 0.0,
         decode_has_slot: bool = True,
+        sampling_params: SamplingParams | None = None,
     ) -> Request:
         if not token_ids or max_new_tokens <= 0:
             raise ValueError("request needs a prompt and positive max_new_tokens")
@@ -83,6 +86,7 @@ class CentralScheduler:
                 tuple(token_ids),
                 max_new_tokens,
                 self.router.route(len(token_ids), decode_load, decode_has_slot),
+                sampling_params=sampling_params or SamplingParams(),
             )
             self._requests[request_id] = request
             return request

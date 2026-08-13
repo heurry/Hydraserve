@@ -23,6 +23,7 @@ from hydraserve.engine.serving_loop import (
     PartialDecodeError,
     ServingRequest,
 )
+from hydraserve.engine.sampling import TokenSample
 from hydraserve.router import (
     AdaptiveRouter,
     DecodeWorkerRegistry,
@@ -266,7 +267,7 @@ class MultiWorkerGenerationBackend:
             last_retryable or "all decode workers rejected the reservation"
         )
 
-    def prefill(self, request: ServingRequest) -> int:
+    def prefill(self, request: ServingRequest) -> int | TokenSample:
         admitted = self.admit(request)
         if not admitted.admitted:
             raise MemoryError(admitted.reason or "request cannot be admitted")
@@ -304,16 +305,19 @@ class MultiWorkerGenerationBackend:
             raise RuntimeError("prefill/decode first-token mismatch")
         with self._state_lock:
             self._pd_count += 1
-        return int(prepared["token_id"])
+        sample = result.get("sample")
+        return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
 
-    def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
+    def decode(
+        self, requests: tuple[ServingRequest, ...]
+    ) -> tuple[int | TokenSample, ...]:
         if not requests:
             return ()
         groups: dict[int, list[tuple[int, ServingRequest]]] = {}
         for position, request in enumerate(requests):
             worker_id = self.registry.worker_for(request.request_id)
             groups.setdefault(worker_id, []).append((position, request))
-        output = [0] * len(requests)
+        output: list[int | TokenSample] = [0] * len(requests)
 
         def execute(worker_id, indexed_requests):
             request_ids = tuple(item.request_id for _, item in indexed_requests)
@@ -324,10 +328,13 @@ class MultiWorkerGenerationBackend:
             )
             if tuple(result["request_ids"]) != request_ids:
                 raise RuntimeError("decode worker returned a different request batch")
+            samples = result.get("samples")
+            if samples is not None:
+                return indexed_requests, tuple(samples)
             return indexed_requests, tuple(int(token) for token in result["token_ids"])
 
         failures: dict[int, BaseException] = {}
-        successes: dict[int, int] = {}
+        successes: dict[int, int | TokenSample] = {}
         with ThreadPoolExecutor(max_workers=len(groups)) as executor:
             futures = {
                 executor.submit(execute, worker_id, tuple(indexed)): tuple(indexed)
@@ -455,14 +462,17 @@ class MultiWorkerGenerationBackend:
             result.get("reason", "request exceeds decode worker capacity")
         )
 
-    def _collocated_prefill(self, worker_id: int, request: ServingRequest) -> int:
+    def _collocated_prefill(
+        self, worker_id: int, request: ServingRequest
+    ) -> int | TokenSample:
         result = self._decode_rpc(
             worker_id,
             self._request_command("collocated_prepare", request),
             "collocated_prepare",
             request.request_id,
         )
-        return int(result["token_id"])
+        sample = result.get("sample")
+        return sample if isinstance(sample, TokenSample) else int(result["token_id"])
 
     def _decode_rpc(
         self,
@@ -629,6 +639,7 @@ class MultiWorkerGenerationBackend:
             "request_id": request.request_id,
             "token_ids": request.token_ids,
             "max_new_tokens": request.max_new_tokens,
+            "sampling_params": request.sampling_params,
         }
 
     @staticmethod

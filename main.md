@@ -200,7 +200,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 策略与真实 Paged KV 页生命周期、worker affinity 探测完成；GDN 不缓存 |
 | Adaptive Router | CPU | Collocated vs PD 路由 | 逐请求执行、1P+ND registry、容量/缓存亲和/拓扑评分、跨 worker 并行 decode、worker 自动摘流/重启/握手完成；N>1 实机待验证 |
 | ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
-| API Server | CPU | OpenAI-compatible | completions/chat/SSE + collocated/PD 常驻模式完成 |
+| API Server | CPU | OpenAI-compatible | completions/chat/SSE、完整单 choice 采样参数、stop 隐藏、logprobs、流式 usage + collocated/PD 常驻模式完成；tools/多 choice 未实现并显式拒绝 |
 
 ---
 
@@ -538,11 +538,11 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
-| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享/回收/真实 affinity；P5 抢占重算与故障隔离；P6 公平调度与 worker 自动恢复完成 |
+| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享/回收/真实 affinity；P5 抢占重算与故障隔离；P6 公平调度/worker 恢复；P7 采样/stop/logprobs API 完成 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 实现完整采样、停止条件、logprobs 与 API 生产语义
+1. 优化 GPU 异步传输流水、decode kernel 与连续 GPU state pool
 2. 在 4+ GPU 环境验证 1P+ND 与拓扑路由，再跑正式 B vs D 性能矩阵
 3. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER

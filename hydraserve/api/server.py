@@ -9,6 +9,7 @@ from typing import Any
 from uuid import uuid4
 
 from hydraserve.engine.serving_loop import OverloadedError
+from hydraserve.engine.sampling import SamplingParams
 from hydraserve.model.tokenizer import IncrementalTextDecoder
 
 
@@ -98,16 +99,70 @@ class _Handler(BaseHTTPRequestHandler):
                 self._error(404, "not_found", f"unknown endpoint: {self.path}")
                 return
             self._validate_model(payload)
-            max_tokens = payload.get("max_tokens", 16)
+            n = payload.get("n", 1)
+            best_of = payload.get("best_of", 1)
+            if any(
+                not isinstance(value, int) or isinstance(value, bool)
+                for value in (n, best_of)
+            ):
+                raise ValueError("n and best_of must be integers")
+            if n != 1 or best_of != 1:
+                raise ValueError("this runtime currently supports exactly one choice")
+            unsupported = set(payload) & {
+                "tools",
+                "tool_choice",
+                "functions",
+                "parallel_tool_calls",
+                "suffix",
+                "echo",
+                "logit_bias",
+            }
+            if unsupported:
+                raise ValueError(
+                    f"unsupported request field(s): {', '.join(sorted(unsupported))}"
+                )
+            max_tokens = payload.get(
+                "max_tokens", payload.get("max_completion_tokens", 16)
+            )
             if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
                 raise ValueError("max_tokens must be a positive integer")
-            temperature = payload.get("temperature", 0)
-            if temperature not in (0, 0.0, None):
-                raise ValueError("this runtime currently supports greedy temperature=0 only")
             prompt_ids = self.hydra.tokenizer.encode(prompt)
-            handle = self.hydra.generation_loop.submit(prompt_ids, max_tokens)
-            if payload.get("stream", False):
-                self._stream(handle, prompt_ids, chat=chat)
+            context_limit = getattr(self.hydra.tokenizer, "model_max_length", None)
+            if context_limit and len(prompt_ids) + max_tokens > context_limit:
+                raise ValueError(
+                    f"prompt plus max_tokens exceeds context limit {context_limit}"
+                )
+            sampling = self._sampling_params(payload, chat=chat)
+            priority = payload.get("priority", 0)
+            if not isinstance(priority, int) or isinstance(priority, bool):
+                raise ValueError("priority must be an integer")
+            stream = payload.get("stream", False)
+            if not isinstance(stream, bool):
+                raise ValueError("stream must be a boolean")
+            stream_options = payload.get("stream_options")
+            include_usage = False
+            if stream_options is not None:
+                if not stream or not isinstance(stream_options, dict):
+                    raise ValueError("stream_options requires stream=true and an object")
+                unknown = set(stream_options) - {"include_usage"}
+                if unknown:
+                    raise ValueError("unsupported stream_options field")
+                include_usage = stream_options.get("include_usage", False)
+                if not isinstance(include_usage, bool):
+                    raise ValueError("stream_options.include_usage must be a boolean")
+            handle = self.hydra.generation_loop.submit(
+                prompt_ids,
+                max_tokens,
+                priority=priority,
+                sampling_params=sampling,
+            )
+            if stream:
+                self._stream(
+                    handle,
+                    prompt_ids,
+                    chat=chat,
+                    include_usage=include_usage,
+                )
             else:
                 self._complete(handle, prompt_ids, chat=chat)
         except (ValueError, json.JSONDecodeError) as exc:
@@ -122,16 +177,85 @@ class _Handler(BaseHTTPRequestHandler):
         if requested != self.hydra.model_name:
             raise ValueError(f"unknown model {requested!r}")
 
+    def _sampling_params(self, payload: dict[str, Any], *, chat: bool) -> SamplingParams:
+        stop = payload.get("stop")
+        if isinstance(stop, str):
+            stop = (stop,)
+        elif isinstance(stop, list) and all(isinstance(item, str) for item in stop):
+            stop = tuple(stop)
+        elif stop is None:
+            stop = ()
+        else:
+            raise ValueError("stop must be a string or a list of strings")
+        if len(stop) > 4 or any(not item for item in stop):
+            raise ValueError("stop supports one to four non-empty strings")
+        stop_sequences = tuple(tuple(self.hydra.tokenizer.encode(item)) for item in stop)
+
+        if chat:
+            requested = payload.get("logprobs", False)
+            if not isinstance(requested, bool):
+                raise ValueError("chat logprobs must be a boolean")
+            top_logprobs = payload.get("top_logprobs", 0)
+            if not isinstance(top_logprobs, int) or isinstance(top_logprobs, bool):
+                raise ValueError("top_logprobs must be an integer")
+            if top_logprobs and not requested:
+                raise ValueError("top_logprobs requires logprobs=true")
+            logprobs = top_logprobs if requested else None
+        else:
+            if "top_logprobs" in payload:
+                raise ValueError("top_logprobs is only valid for chat completions")
+            logprobs = payload.get("logprobs")
+            if logprobs is not None and (
+                not isinstance(logprobs, int) or isinstance(logprobs, bool)
+            ):
+                raise ValueError("completion logprobs must be an integer")
+
+        return SamplingParams(
+            temperature=self._number(payload, "temperature", 1.0),
+            top_p=self._number(payload, "top_p", 1.0),
+            top_k=self._integer(payload, "top_k", 0),
+            min_p=self._number(payload, "min_p", 0.0),
+            repetition_penalty=self._number(payload, "repetition_penalty", 1.0),
+            presence_penalty=self._number(payload, "presence_penalty", 0.0),
+            frequency_penalty=self._number(payload, "frequency_penalty", 0.0),
+            seed=self._optional_integer(payload, "seed"),
+            logprobs=logprobs,
+            stop_token_sequences=stop_sequences,
+        )
+
+    @staticmethod
+    def _integer(payload: dict[str, Any], name: str, default: int) -> int:
+        value = payload.get(name, default)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise ValueError(f"{name} must be an integer")
+        return value
+
+    @staticmethod
+    def _number(payload: dict[str, Any], name: str, default: float) -> float:
+        value = payload.get(name, default)
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            raise ValueError(f"{name} must be a number")
+        return float(value)
+
+    @classmethod
+    def _optional_integer(cls, payload: dict[str, Any], name: str) -> int | None:
+        value = payload.get(name)
+        return None if value is None else cls._integer(payload, name, 0)
+
     def _complete(self, handle, prompt_ids, *, chat: bool) -> None:
         decoder = IncrementalTextDecoder(self.hydra.tokenizer)
         finish_reason = None
+        token_events = []
         for event in handle:
             if event.error:
                 raise RuntimeError(event.error)
             if event.token_id is not None:
-                decoder.push(event.token_id)
+                token_events.append(event)
             if event.finished:
                 finish_reason = event.finish_reason
+        visible = self._visible_events(handle, token_events, finish_reason)
+        for event in visible:
+            decoder.push(event.token_id)
         choice: dict[str, Any] = {"index": 0, "finish_reason": finish_reason}
         if chat:
             choice["message"] = {"role": "assistant", "content": decoder.text}
@@ -139,6 +263,8 @@ class _Handler(BaseHTTPRequestHandler):
         else:
             choice["text"] = decoder.text
             object_name = "text_completion"
+        if handle.request.sampling_params.logprobs is not None:
+            choice["logprobs"] = self._format_logprobs(visible, chat=chat)
         self._json(
             200,
             {
@@ -149,16 +275,24 @@ class _Handler(BaseHTTPRequestHandler):
                 "choices": [choice],
                 "usage": {
                     "prompt_tokens": len(prompt_ids),
-                    "completion_tokens": len(decoder.token_ids),
-                    "total_tokens": len(prompt_ids) + len(decoder.token_ids),
+                    "completion_tokens": len(token_events),
+                    "total_tokens": len(prompt_ids) + len(token_events),
                 },
             },
         )
 
-    def _stream(self, handle, prompt_ids, *, chat: bool) -> None:
+    def _stream(self, handle, prompt_ids, *, chat: bool, include_usage: bool) -> None:
         response_id = f"cmpl-{uuid4().hex}"
         created = int(time())
         decoder = IncrementalTextDecoder(self.hydra.tokenizer)
+        pending = []
+        generated_count = 0
+        max_hold = max(
+            (len(sequence) for sequence in handle.request.sampling_params.stop_token_sequences),
+            default=0,
+        )
+        if self.hydra.generation_loop.eos_token_id is not None:
+            max_hold = max(1, max_hold)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
@@ -170,24 +304,19 @@ class _Handler(BaseHTTPRequestHandler):
                     self._sse({"error": {"message": event.error, "type": "server_error"}})
                     break
                 if event.token_id is not None:
-                    delta = decoder.push(event.token_id)
-                    choice: dict[str, Any] = {"index": 0, "finish_reason": None}
-                    if chat:
-                        choice["delta"] = {"content": delta}
-                        object_name = "chat.completion.chunk"
-                    else:
-                        choice["text"] = delta
-                        object_name = "text_completion"
-                    self._sse(
-                        {
-                            "id": response_id,
-                            "object": object_name,
-                            "created": created,
-                            "model": self.hydra.model_name,
-                            "choices": [choice],
-                        }
-                    )
+                    generated_count += 1
+                    pending.append(event)
+                    while len(pending) > max_hold:
+                        self._stream_token(
+                            pending.pop(0), decoder, response_id, created, chat
+                        )
                 if event.finished:
+                    visible = self._visible_events(handle, pending, event.finish_reason)
+                    for pending_event in visible:
+                        self._stream_token(
+                            pending_event, decoder, response_id, created, chat
+                        )
+                    pending.clear()
                     tail = decoder.finish()
                     if tail:
                         choice = {"index": 0, "finish_reason": None}
@@ -215,12 +344,107 @@ class _Handler(BaseHTTPRequestHandler):
                             "choices": [choice],
                         }
                     )
+            if include_usage:
+                self._sse(
+                    {
+                        "id": response_id,
+                        "object": (
+                            "chat.completion.chunk" if chat else "text_completion"
+                        ),
+                        "created": created,
+                        "model": self.hydra.model_name,
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": len(prompt_ids),
+                            "completion_tokens": generated_count,
+                            "total_tokens": len(prompt_ids) + generated_count,
+                        },
+                    }
+                )
             self.wfile.write(b"data: [DONE]\n\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             handle.cancel()
         finally:
             self.close_connection = True
+
+    def _stream_token(self, event, decoder, response_id, created, chat) -> None:
+        delta = decoder.push(event.token_id)
+        choice: dict[str, Any] = {"index": 0, "finish_reason": None}
+        if chat:
+            choice["delta"] = {"content": delta}
+            object_name = "chat.completion.chunk"
+        else:
+            choice["text"] = delta
+            object_name = "text_completion"
+        if event.logprob is not None:
+            choice["logprobs"] = self._format_logprobs((event,), chat=chat)
+        self._sse(
+            {
+                "id": response_id,
+                "object": object_name,
+                "created": created,
+                "model": self.hydra.model_name,
+                "choices": [choice],
+            }
+        )
+
+    def _visible_events(self, handle, events, finish_reason):
+        visible = list(events)
+        if finish_reason != "stop" or not visible:
+            return visible
+        token_ids = tuple(event.token_id for event in visible)
+        matches = [
+            len(sequence)
+            for sequence in handle.request.sampling_params.stop_token_sequences
+            if len(token_ids) >= len(sequence) and token_ids[-len(sequence) :] == sequence
+        ]
+        eos = self.hydra.generation_loop.eos_token_id
+        if eos is not None and token_ids[-1] == eos:
+            matches.append(1)
+        trim = max(matches, default=0)
+        return visible[:-trim] if trim else visible
+
+    def _format_logprobs(self, events, *, chat: bool):
+        if chat:
+            return {
+                "content": [
+                    {
+                        **self._chat_logprob(event.token_id, event.logprob),
+                        "top_logprobs": [
+                            self._chat_logprob(token_id, logprob)
+                            for token_id, logprob in event.top_logprobs
+                        ],
+                    }
+                    for event in events
+                ]
+            }
+        tokens = [self.hydra.tokenizer.decode((event.token_id,)) for event in events]
+        offsets = []
+        cursor = 0
+        for token in tokens:
+            offsets.append(cursor)
+            cursor += len(token)
+        return {
+            "tokens": tokens,
+            "token_logprobs": [event.logprob for event in events],
+            "top_logprobs": [
+                {
+                    self.hydra.tokenizer.decode((token_id,)): logprob
+                    for token_id, logprob in event.top_logprobs
+                }
+                for event in events
+            ],
+            "text_offset": offsets,
+        }
+
+    def _chat_logprob(self, token_id: int, logprob: float | None) -> dict[str, Any]:
+        token = self.hydra.tokenizer.decode((token_id,))
+        return {
+            "token": token,
+            "logprob": logprob,
+            "bytes": list(token.encode("utf-8")),
+        }
 
     def _read_json(self) -> dict[str, Any]:
         content_length = self.headers.get("Content-Length")

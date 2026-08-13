@@ -7,6 +7,7 @@ from hydraserve.engine.continuous_batching import (
 )
 from hydraserve.engine.batch_executor import ContinuousBatchExecutor
 from hydraserve.engine.fair_scheduler import FairDecodeScheduler, FairSchedulingConfig
+from hydraserve.engine.sampling import SamplingParams, TokenSample, sample_logits
 from hydraserve.engine.prefill_engine import PrefillEngine, PrefillOutput
 from hydraserve.engine.pd_worker import (
     DecodePrepared,
@@ -61,6 +62,9 @@ __all__ = [
     "Request",
     "RecoveryPlan",
     "RequestState",
+    "SamplingParams",
+    "TokenSample",
+    "sample_logits",
     "ContinuousGenerationLoop",
     "GenerationEvent",
     "GenerationHandle",

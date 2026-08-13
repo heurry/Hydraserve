@@ -8,7 +8,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from hydraserve.api import create_server
-from hydraserve.engine import ContinuousGenerationLoop
+from hydraserve.engine import ContinuousGenerationLoop, TokenSample
 from hydraserve.engine import OverloadedError
 
 
@@ -91,14 +91,23 @@ def test_completion_chat_and_sse_protocol() -> None:
         headers, body = _post(
             base,
             "/v1/completions",
-            {"model": "tiny", "prompt": "x", "max_tokens": 2, "stream": True},
+            {
+                "model": "tiny",
+                "prompt": "x",
+                "max_tokens": 2,
+                "stream": True,
+                "stream_options": {"include_usage": True},
+            },
         )
         assert headers.get_content_type() == "text/event-stream"
         lines = [line for line in body.decode().splitlines() if line.startswith("data: ")]
         assert lines[-1] == "data: [DONE]"
         chunks = [json.loads(line[6:]) for line in lines[:-1]]
-        assert "".join(chunk["choices"][0]["text"] for chunk in chunks) == "AB"
-        assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+        content_chunks = [chunk for chunk in chunks if chunk["choices"]]
+        assert "".join(chunk["choices"][0]["text"] for chunk in content_chunks) == "AB"
+        assert content_chunks[-1]["choices"][0]["finish_reason"] == "length"
+        assert chunks[-1]["choices"] == []
+        assert chunks[-1]["usage"]["completion_tokens"] == 2
     finally:
         server.shutdown()
         server.server_close()
@@ -108,7 +117,7 @@ def test_completion_chat_and_sse_protocol() -> None:
 
 def test_overload_returns_http_429() -> None:
     class FullLoop:
-        def submit(self, token_ids, max_tokens):
+        def submit(self, token_ids, max_tokens, **kwargs):
             raise OverloadedError("admission queue request limit reached")
 
     try:
@@ -176,6 +185,100 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert "hydraserve_admission_pending_requests 0" in metrics
         assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
         assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+        loop.close()
+
+
+def test_sampling_logprobs_and_stop_strings_follow_openai_shapes() -> None:
+    class SamplingBackend(FakeBackend):
+        def prefill(self, request):
+            self.live.add(request.request_id)
+            return TokenSample(ord("A"), -0.1, ((ord("A"), -0.1), (ord("Z"), -2.0)))
+
+        def decode(self, requests):
+            return tuple(
+                TokenSample(
+                    request.generated_token_ids[-1] + 1,
+                    -0.2,
+                    ((request.generated_token_ids[-1] + 1, -0.2),),
+                )
+                for request in requests
+            )
+
+    loop = ContinuousGenerationLoop(SamplingBackend())
+    try:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            generation_loop=loop,
+            tokenizer=FakeTokenizer(),
+            model_name="tiny",
+        )
+    except PermissionError:
+        pytest.skip("sandbox forbids loopback sockets")
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        _, body = _post(
+            base,
+            "/v1/completions",
+            {
+                "model": "tiny",
+                "prompt": "x",
+                "max_tokens": 5,
+                "temperature": 0,
+                "stop": "BC",
+                "logprobs": 2,
+                "seed": 7,
+            },
+        )
+        response = json.loads(body)
+        choice = response["choices"][0]
+        assert choice["text"] == "A"
+        assert choice["finish_reason"] == "stop"
+        assert choice["logprobs"]["tokens"] == ["A"]
+        assert choice["logprobs"]["token_logprobs"] == [-0.1]
+        assert response["usage"]["completion_tokens"] == 3
+
+        _, body = _post(
+            base,
+            "/v1/chat/completions",
+            {
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "x"}],
+                "max_tokens": 1,
+                "logprobs": True,
+                "top_logprobs": 2,
+            },
+        )
+        chat_choice = json.loads(body)["choices"][0]
+        content = chat_choice["logprobs"]["content"]
+        assert content[0]["token"] == "A"
+        assert content[0]["bytes"] == [65]
+        assert len(content[0]["top_logprobs"]) == 2
+
+        headers, body = _post(
+            base,
+            "/v1/completions",
+            {
+                "model": "tiny",
+                "prompt": "x",
+                "max_tokens": 5,
+                "stream": True,
+                "stop": ["BC"],
+                "logprobs": 1,
+            },
+        )
+        assert headers.get_content_type() == "text/event-stream"
+        lines = [line for line in body.decode().splitlines() if line.startswith("data: ")]
+        chunks = [json.loads(line[6:]) for line in lines[:-1]]
+        assert "".join(chunk["choices"][0]["text"] for chunk in chunks) == "A"
+        assert chunks[0]["choices"][0]["logprobs"]["tokens"] == ["A"]
+        assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     finally:
         server.shutdown()
         server.server_close()

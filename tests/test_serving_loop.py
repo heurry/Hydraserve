@@ -10,6 +10,7 @@ from hydraserve.engine import (
     ContinuousGenerationLoop,
     OverloadedError,
     PartialDecodeError,
+    SamplingParams,
     RuntimeGenerationBackend,
     ServingRequest,
 )
@@ -73,6 +74,20 @@ def test_eos_stops_without_extra_decode() -> None:
     assert [event.token_id for event in events[:-1]] == [3]
     assert events[-1].finish_reason == "stop"
     assert backend.decode_batches == []
+
+
+def test_multi_token_stop_sequence_finishes_at_exact_suffix() -> None:
+    backend = FakeBackend()
+    loop = ContinuousGenerationLoop(backend)
+    handle = loop.submit(
+        [63],
+        max_new_tokens=10,
+        sampling_params=SamplingParams(stop_token_sequences=((65, 66),)),
+    )
+    events = _collect(handle)
+    loop.close()
+    assert [event.token_id for event in events[:-1]] == [64, 65, 66]
+    assert events[-1].finish_reason == "stop"
 
 
 def test_cancel_active_request_releases_backend() -> None:

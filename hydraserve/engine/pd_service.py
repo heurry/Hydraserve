@@ -14,6 +14,7 @@ from hydraserve.engine.serving_loop import (
     BackendCapacity,
     ServingRequest,
 )
+from hydraserve.engine.sampling import SamplingParams, TokenSample, sample_logits
 from hydraserve.router import AdaptiveRouter, Route, RouteDecision, RouteReason
 
 
@@ -38,6 +39,7 @@ def _request(
     *,
     transferred: bool,
     route: Route = Route.PD_DISAGGREGATED,
+    sampling_params: SamplingParams | None = None,
 ):
     from hydraserve.engine.scheduler import Request, RequestState
     request = Request(
@@ -45,6 +47,7 @@ def _request(
         tuple(token_ids),
         max_new_tokens,
         route,
+        sampling_params=sampling_params or SamplingParams(),
     )
     if transferred:
         request.transition(RequestState.PREFILL_RUNNING)
@@ -106,6 +109,7 @@ def _prefill_worker(
                     command["token_ids"],
                     command["max_new_tokens"],
                     transferred=False,
+                    sampling_params=command.get("sampling_params"),
                 )
                 result = workers[worker_index].process(
                     request,
@@ -118,6 +122,7 @@ def _prefill_worker(
                         "request_id": request_id,
                         "worker_index": worker_index,
                         "token_id": result.first_token_id,
+                        "sample": result.sample,
                     }
                 )
             except Exception as exc:
@@ -302,6 +307,7 @@ def _decode_worker(
                         command["token_ids"],
                         command["max_new_tokens"],
                         transferred=True,
+                        sampling_params=command.get("sampling_params"),
                     )
                     prepared = worker.receive_and_prepare(
                         request,
@@ -327,6 +333,7 @@ def _decode_worker(
                         command["max_new_tokens"],
                         transferred=False,
                         route=Route.COLLOCATED,
+                        sampling_params=command.get("sampling_params"),
                     )
                     request.transition(RequestState.PREFILL_RUNNING)
                     input_ids = torch.tensor(
@@ -340,7 +347,13 @@ def _decode_worker(
                             request_id=request_id,
                         )
                     cache.publish_prefix(request_id, request.token_ids)
-                    token_id = int(logits[0, -1].argmax())
+                    sample = sample_logits(
+                        logits[:, -1],
+                        (request.token_ids,),
+                        (request.sampling_params,),
+                        steps=(0,),
+                    )[0]
+                    token_id = sample.token_id
                     request.generated_token_ids.append(token_id)
                     requests[request_id] = request
                     states[request_id] = state
@@ -349,6 +362,7 @@ def _decode_worker(
                             "op": "collocated_prepare",
                             "request_id": request_id,
                             "token_id": token_id,
+                            "sample": sample,
                         }
                     )
                 elif operation == "decode":
@@ -364,13 +378,29 @@ def _decode_worker(
                         logits, _ = runtime.decode_batch(
                             input_ids, batch_states, cache, request_ids
                         )
-                    token_ids = tuple(
-                        int(token) for token in logits[:, -1].argmax(dim=-1).tolist()
+                    samples = sample_logits(
+                        logits[:, -1],
+                        (
+                            requests[request_id].token_ids
+                            + tuple(requests[request_id].generated_token_ids)
+                            for request_id in request_ids
+                        ),
+                        (requests[request_id].sampling_params for request_id in request_ids),
+                        steps=(
+                            len(requests[request_id].generated_token_ids)
+                            for request_id in request_ids
+                        ),
                     )
+                    token_ids = tuple(sample.token_id for sample in samples)
                     for request_id, token_id in zip(request_ids, token_ids, strict=True):
                         requests[request_id].generated_token_ids.append(token_id)
                     responses.put(
-                        {"op": "decode", "request_ids": request_ids, "token_ids": token_ids}
+                        {
+                            "op": "decode",
+                            "request_ids": request_ids,
+                            "token_ids": token_ids,
+                            "samples": samples,
+                        }
                     )
                 elif operation == "release":
                     request_id = command["request_id"]
@@ -486,6 +516,7 @@ class DisaggregatedGenerationBackend:
             "request_id": request.request_id,
             "token_ids": request.token_ids,
             "max_new_tokens": request.max_new_tokens,
+            "sampling_params": request.sampling_params,
         }
         with self._decode_lock:
             if request.request_id in self._admitted_requests and not force_rpc:
@@ -506,18 +537,19 @@ class DisaggregatedGenerationBackend:
                 result.get("reason", "request exceeds decode worker capacity")
             )
 
-    def prefill(self, request: ServingRequest) -> int:
+    def prefill(self, request: ServingRequest) -> int | TokenSample:
         decision = self.admit(request)
         if not decision.admitted:
             raise MemoryError(decision.reason or "request cannot be admitted")
         return self._prefill_pd(request)
 
-    def _prefill_pd(self, request: ServingRequest) -> int:
+    def _prefill_pd(self, request: ServingRequest) -> int | TokenSample:
         command = {
             "op": "prefill",
             "request_id": request.request_id,
             "token_ids": request.token_ids,
             "max_new_tokens": request.max_new_tokens,
+            "sampling_params": request.sampling_params,
         }
         self._prefill_commands.put(command)
         result = self._get(self._prefill_responses, self.operation_timeout)
@@ -534,22 +566,27 @@ class DisaggregatedGenerationBackend:
         self._check(prepared, "prepare", request.request_id)
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
-        return int(prepared["token_id"])
+        sample = result.get("sample")
+        return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
 
-    def _prefill_collocated(self, request: ServingRequest) -> int:
+    def _prefill_collocated(self, request: ServingRequest) -> int | TokenSample:
         command = {
             "op": "collocated_prepare",
             "request_id": request.request_id,
             "token_ids": request.token_ids,
             "max_new_tokens": request.max_new_tokens,
+            "sampling_params": request.sampling_params,
         }
         with self._decode_lock:
             self._decode_commands.put(command)
             result = self._get(self._decode_responses, self.operation_timeout)
         self._check(result, "collocated_prepare", request.request_id)
-        return int(result["token_id"])
+        sample = result.get("sample")
+        return sample if isinstance(sample, TokenSample) else int(result["token_id"])
 
-    def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
+    def decode(
+        self, requests: tuple[ServingRequest, ...]
+    ) -> tuple[int | TokenSample, ...]:
         request_ids = tuple(request.request_id for request in requests)
         with self._decode_lock:
             self._decode_commands.put({"op": "decode", "request_ids": request_ids})
@@ -557,6 +594,9 @@ class DisaggregatedGenerationBackend:
         self._check(result, "decode")
         if tuple(result["request_ids"]) != request_ids:
             raise RuntimeError("decode worker returned a different request batch")
+        samples = result.get("samples")
+        if samples is not None:
+            return tuple(samples)
         return tuple(int(token) for token in result["token_ids"])
 
     def release(self, request_id: int) -> None:
@@ -713,7 +753,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 request.route_reason = bound.reason.value
         return admitted
 
-    def prefill(self, request: ServingRequest) -> int:
+    def prefill(self, request: ServingRequest) -> int | TokenSample:
         admitted = self.admit(request)
         if not admitted.admitted:
             raise MemoryError(admitted.reason or "request cannot be admitted")

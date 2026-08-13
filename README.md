@@ -177,7 +177,11 @@ decode batch 跨多个 worker 时，各 GPU RPC 并行发起，结果按原请�
 长度只推进到当前已写入 token，不会读取未来未初始化页。最后一个单 token chunk 与
 多 token chunk 共用同一套 Paged 历史语义。
 
-当前采样器只支持 greedy `temperature=0`，API 只处理文本。运行本机 benchmark：
+采样状态贯穿 collocated、PD 与 1P+ND worker，支持 `temperature`、`top_p`、`top_k`、
+`min_p`、repetition/presence/frequency penalty、逐请求 `seed`、最多 20 个
+`logprobs` 以及最多四个文本 stop 序列。stop token 会参与 usage 计数但不会泄漏到普通
+响应或 SSE 文本；流式接口支持 `stream_options.include_usage`。当前 API 只处理文本，
+且明确拒绝多 choice、tools、logit bias 等尚未实现的字段。运行本机 benchmark：
 
 ```bash
 python -m hydraserve benchmark \

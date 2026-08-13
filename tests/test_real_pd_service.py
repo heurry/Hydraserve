@@ -13,6 +13,7 @@ from hydraserve.engine import (
     MultiWorkerGenerationBackend,
     PDClusterConfig,
     PDWorkerConfig,
+    SamplingParams,
 )
 from hydraserve.router import AdaptiveRouter, Route, RouterConfig
 
@@ -47,6 +48,41 @@ def test_persistent_real_two_gpu_pd_generation() -> None:
     assert [event.token_id for event in second_events[:-1]]
     assert first_events[-1].finish_reason == "length"
     assert second_events[-1].finish_reason == "length"
+
+
+def test_real_pd_seeded_sampling_and_logprobs_are_reproducible() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = DisaggregatedGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            use_flash_attention=False,
+        )
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    sampling = SamplingParams(
+        temperature=0.8,
+        top_k=16,
+        seed=12345,
+        logprobs=3,
+    )
+    try:
+        first = list(
+            loop.submit([1, 42, 17, 9], max_new_tokens=3, sampling_params=sampling)
+        )
+        second = list(
+            loop.submit([1, 42, 17, 9], max_new_tokens=3, sampling_params=sampling)
+        )
+        first_tokens = [event.token_id for event in first if event.token_id is not None]
+        second_tokens = [event.token_id for event in second if event.token_id is not None]
+        assert first_tokens == second_tokens
+        assert len(first_tokens) == 3
+        for event in first[:-1]:
+            assert event.logprob is not None
+            assert len(event.top_logprobs) == 3
+    finally:
+        loop.close()
 
 
 def test_real_adaptive_service_executes_both_routes() -> None:
