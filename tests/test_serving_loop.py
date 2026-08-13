@@ -439,3 +439,74 @@ def test_prefill_queue_prediction_uses_running_future_remaining_work() -> None:
         {99: (request, RunningFuture())}
     )
     assert 40.0 <= predicted <= 70.0
+
+
+def test_request_deadline_expires_while_waiting_for_admission() -> None:
+    class NeverAdmit(FakeBackend):
+        def admit(self, request):
+            return AdmissionDecision.defer("full")
+
+    loop = ContinuousGenerationLoop(NeverAdmit(), idle_wait_s=0.001)
+    handle = loop.submit([1], max_new_tokens=1, timeout_ms=10)
+    terminal = handle.get(timeout=1)
+    loop.close()
+    assert terminal.finished
+    assert terminal.finish_reason == "error"
+    assert "deadline expired before admission" in terminal.error
+
+
+def test_deadline_does_not_emit_decode_token_completed_after_expiry() -> None:
+    from time import sleep
+
+    class SlowDecode(FakeBackend):
+        def decode(self, requests):
+            sleep(0.03)
+            return super().decode(requests)
+
+    loop = ContinuousGenerationLoop(SlowDecode(), max_batch_size=1)
+    handle = loop.submit([1], max_new_tokens=2, timeout_ms=15)
+    events = list(handle)
+    loop.close()
+    assert [event.token_id for event in events if event.token_id is not None] == [2]
+    assert "deadline expired during decode" in events[-1].error
+
+
+def test_active_limit_can_exceed_decode_batch_and_is_observable() -> None:
+    first_prefill_entered = Event()
+    release_first_prefill = Event()
+    decode_entered = Event()
+    release_decode = Event()
+
+    class BlockingDecode(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        def prefill(self, request):
+            if request.request_id == 0:
+                first_prefill_entered.set()
+                assert release_first_prefill.wait(2)
+            return super().prefill(request)
+
+        def decode(self, requests):
+            self.calls += 1
+            if self.calls == 2:
+                decode_entered.set()
+                assert release_decode.wait(2)
+            return super().decode(requests)
+
+    loop = ContinuousGenerationLoop(
+        BlockingDecode(), max_batch_size=2, max_active_requests=4
+    )
+    handles = [loop.submit([1], max_new_tokens=3)]
+    assert first_prefill_entered.wait(1)
+    handles.extend(
+        loop.submit([index + 1], max_new_tokens=3) for index in range(1, 4)
+    )
+    release_first_prefill.set()
+    assert decode_entered.wait(1)
+    assert loop.active_count == 4
+    release_decode.set()
+    assert all(list(handle)[-1].finish_reason == "length" for handle in handles)
+    loop.close()
+    assert loop.active_count == 0

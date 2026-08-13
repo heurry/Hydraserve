@@ -127,6 +127,7 @@ class ServingRequest:
     admitted_at: float | None = None
     admission_wait_ms: float | None = None
     observed_prefill_queue_wait_ms: float | None = None
+    deadline_at: float | None = None
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0
@@ -218,6 +219,9 @@ class ContinuousGenerationLoop:
         self._pending_count = 0
         self._pending_tokens = 0
         self._pending_lock = Lock()
+        self._stats_lock = Lock()
+        self._active_count = 0
+        self._prefill_pending_count = 0
         self._handles: dict[int, GenerationHandle] = {}
         self._handles_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -242,11 +246,14 @@ class ContinuousGenerationLoop:
         *,
         priority: int = 0,
         sampling_params: SamplingParams | None = None,
+        timeout_ms: float | None = None,
     ) -> GenerationHandle:
         if not token_ids or max_new_tokens <= 0:
             raise ValueError("request needs a prompt and positive max_new_tokens")
         if self._stop.is_set():
             raise RuntimeError("serving loop is stopping")
+        if timeout_ms is not None and timeout_ms <= 0:
+            raise ValueError("timeout_ms must be positive")
         if not 0 <= priority <= self._decode_scheduler.config.max_priority:
             raise ValueError(
                 f"priority must be in [0, {self._decode_scheduler.config.max_priority}]"
@@ -260,6 +267,9 @@ class ContinuousGenerationLoop:
             max_new_tokens,
             priority=priority,
             sampling_params=sampling,
+            deadline_at=(
+                None if timeout_ms is None else monotonic() + timeout_ms / 1000.0
+            ),
         )
         handle = GenerationHandle(request, self._wake)
         demand = len(request.token_ids) + request.max_new_tokens
@@ -304,7 +314,8 @@ class ContinuousGenerationLoop:
             else:
                 while not self._stop.is_set():
                     did_work = self._admit(active)
-                    did_work = self._remove_cancelled(active) or did_work
+                    did_work = self._remove_cancelled_or_expired(active) or did_work
+                    self._publish_scheduler_depth(len(active), 0)
                     if active:
                         self._decode_once(active)
                         did_work = True
@@ -315,6 +326,7 @@ class ContinuousGenerationLoop:
             self._cancel_incoming()
             for request in tuple(active.values()):
                 self._finish(request, "cancelled", active=active, release=True)
+            self._publish_scheduler_depth(0, 0)
 
     def _run_disaggregated(
         self, active: OrderedDict[int, ServingRequest]
@@ -324,7 +336,8 @@ class ContinuousGenerationLoop:
             while not self._stop.is_set():
                 did_work = self._submit_async_prefill(active, pending, executor)
                 did_work = self._collect_async_prefill(active, pending) or did_work
-                did_work = self._remove_cancelled(active) or did_work
+                did_work = self._remove_cancelled_or_expired(active) or did_work
+                self._publish_scheduler_depth(len(active), len(pending))
                 if active:
                     self._decode_once(active)
                     did_work = True
@@ -348,6 +361,16 @@ class ContinuousGenerationLoop:
             if request.cancelled.is_set():
                 self._pending_done(request)
                 self._finish(request, "cancelled", active=active, release=False)
+                did_work = True
+                continue
+            if self._deadline_expired(request):
+                self._pending_done(request)
+                self._fail(
+                    request,
+                    TimeoutError("request deadline expired before admission"),
+                    active=active,
+                    release=False,
+                )
                 did_work = True
                 continue
             request.route_prefill_queue_ahead_ms = self._prefill_queue_ahead_ms(
@@ -433,6 +456,14 @@ class ContinuousGenerationLoop:
                 if request.cancelled.is_set() or self._stop.is_set():
                     self._finish(request, "cancelled", active=active, release=True)
                     continue
+                if self._deadline_expired(request):
+                    self._fail(
+                        request,
+                        TimeoutError("request deadline expired during prefill"),
+                        active=active,
+                        release=True,
+                    )
+                    continue
                 request.generated_token_ids.append(sample.token_id)
                 self._emit(request, sample)
                 reason = self._finish_reason(request, sample.token_id)
@@ -458,6 +489,16 @@ class ContinuousGenerationLoop:
                 self._finish(request, "cancelled", active=active, release=False)
                 did_work = True
                 continue
+            if self._deadline_expired(request):
+                self._pending_done(request)
+                self._fail(
+                    request,
+                    TimeoutError("request deadline expired before admission"),
+                    active=active,
+                    release=False,
+                )
+                did_work = True
+                continue
             decision = self._admission_decision(request)
             if not decision.admitted:
                 if decision.retryable:
@@ -481,6 +522,14 @@ class ContinuousGenerationLoop:
                 sample = self._normalize_sample(self.backend.prefill(request))
             except Exception as exc:
                 self._fail(request, exc, active=active, release=True)
+                continue
+            if self._deadline_expired(request):
+                self._fail(
+                    request,
+                    TimeoutError("request deadline expired during prefill"),
+                    active=active,
+                    release=True,
+                )
                 continue
             request.generated_token_ids.append(sample.token_id)
             self._emit(request, sample)
@@ -529,6 +578,14 @@ class ContinuousGenerationLoop:
         value: int | TokenSample,
         active: OrderedDict[int, ServingRequest],
     ) -> None:
+        if self._deadline_expired(request):
+            self._fail(
+                request,
+                TimeoutError("request deadline expired during decode"),
+                active=active,
+                release=True,
+            )
+            return
         sample = self._normalize_sample(value)
         request.generated_token_ids.append(sample.token_id)
         self._emit(request, sample)
@@ -536,11 +593,29 @@ class ContinuousGenerationLoop:
         if reason is not None:
             self._finish(request, reason, active=active, release=True)
 
-    def _remove_cancelled(self, active: OrderedDict[int, ServingRequest]) -> bool:
+    def _remove_cancelled_or_expired(
+        self, active: OrderedDict[int, ServingRequest]
+    ) -> bool:
         cancelled = [request for request in active.values() if request.cancelled.is_set()]
         for request in cancelled:
             self._finish(request, "cancelled", active=active, release=True)
-        return bool(cancelled)
+        expired = [
+            request
+            for request in active.values()
+            if self._deadline_expired(request)
+        ]
+        for request in expired:
+            self._fail(
+                request,
+                TimeoutError("request deadline expired during decode"),
+                active=active,
+                release=True,
+            )
+        return bool(cancelled or expired)
+
+    @staticmethod
+    def _deadline_expired(request: ServingRequest) -> bool:
+        return request.deadline_at is not None and monotonic() >= request.deadline_at
 
     def _finish_reason(self, request: ServingRequest, token_id: int) -> str | None:
         if self.eos_token_id is not None and token_id == self.eos_token_id:
@@ -693,6 +768,21 @@ class ContinuousGenerationLoop:
     def pending_tokens(self) -> int:
         with self._pending_lock:
             return self._pending_tokens
+
+    @property
+    def active_count(self) -> int:
+        with self._stats_lock:
+            return self._active_count
+
+    @property
+    def prefill_pending_count(self) -> int:
+        with self._stats_lock:
+            return self._prefill_pending_count
+
+    def _publish_scheduler_depth(self, active: int, prefill_pending: int) -> None:
+        with self._stats_lock:
+            self._active_count = active
+            self._prefill_pending_count = prefill_pending
 
     def _handle(self, request_id: int) -> GenerationHandle:
         with self._handles_lock:

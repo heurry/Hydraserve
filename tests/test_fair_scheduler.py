@@ -1,4 +1,5 @@
 import pytest
+from time import monotonic
 
 from hydraserve.engine import FairDecodeScheduler, ServingRequest
 
@@ -24,3 +25,13 @@ def test_scheduler_prunes_finished_accounts_and_rejects_bad_priority() -> None:
     bad = _request(2, scheduler.config.max_priority + 1)
     with pytest.raises(ValueError, match="priority"):
         scheduler.select((bad,), 1)
+
+
+def test_imminent_deadline_gets_service_without_disabling_fairness() -> None:
+    scheduler = FairDecodeScheduler()
+    normal = _request(1, 3)
+    urgent = _request(2, 0)
+    urgent.deadline_at = monotonic() + 0.01
+    assert scheduler.select((normal, urgent), 1)[0] is urgent
+    # Deadline urgency does not mutate the configured request priority.
+    assert urgent.priority == 0

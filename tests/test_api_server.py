@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from threading import Thread
+from time import sleep
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -181,6 +182,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         with urlopen(base + "/health", timeout=3) as response:
             health = json.loads(response.read())
         assert health["capacity"]["kv_free_blocks"] == 7
+        assert health["scheduler"]["max_active_requests"] == 64
         assert health["status"] == "degraded"
         assert health["decode_workers"]["recovering"] == [1]
         assert health["routing_cost_model"]["pd_observations"] == 3
@@ -189,6 +191,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             metrics = response.read().decode()
         assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
         assert "hydraserve_admission_pending_requests 0" in metrics
+        assert 'hydraserve_scheduler_requests{state="active"} 0' in metrics
         assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
         assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
         assert (
@@ -200,6 +203,51 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             in metrics
         )
         assert 'hydraserve_route_cost_profile_drift{route="collocated"} 1' in metrics
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+        loop.close()
+
+
+def test_request_timeout_returns_http_408_and_releases_backend() -> None:
+    class SlowPrefill(FakeBackend):
+        def prefill(self, request):
+            self.live.add(request.request_id)
+            sleep(0.02)
+            return ord("A")
+
+    backend = SlowPrefill()
+    loop = ContinuousGenerationLoop(backend)
+    try:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            generation_loop=loop,
+            tokenizer=FakeTokenizer(),
+            model_name="tiny",
+        )
+    except PermissionError:
+        pytest.skip("sandbox forbids loopback sockets")
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with pytest.raises(HTTPError) as raised:
+            _post(
+                base,
+                "/v1/completions",
+                {
+                    "model": "tiny",
+                    "prompt": "x",
+                    "max_tokens": 1,
+                    "timeout_ms": 1,
+                },
+            )
+        assert raised.value.code == 408
+        payload = json.loads(raised.value.read())
+        assert payload["error"]["type"] == "timeout_error"
+        assert backend.live == set()
     finally:
         server.shutdown()
         server.server_close()

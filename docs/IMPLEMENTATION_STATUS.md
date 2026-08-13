@@ -297,3 +297,24 @@ direct-service profile uses 17 collocated and 18 PD samples over 26–9,000
 tokens; RMSE is 22.37 ms collocated and 64.15 ms PD. Admission wait and event-
 loop/decode interference remain separately visible instead of contaminating
 the service curve.
+
+## 2026-08-14 — active-set and deadline scheduling
+
+Implemented and tested:
+
+- independent `max_active_requests` and decode `max_batch_size` configuration,
+  with state-pool capacity sized for the active limit and validation that the
+  active limit cannot be smaller than one batch;
+- deadline-aware weighted-fair decode selection while retaining priority and
+  aging-based starvation prevention;
+- deadline expiration before admission, after prefill, and at decode result
+  boundaries, with transactional backend resource release;
+- no token emission when a decode call returns after the request deadline;
+- HydraServe `timeout_ms`, HTTP 408 for non-streaming requests, and structured
+  timeout events after SSE headers have been committed;
+- scheduler gauges for admission pending, prefill pending, and active requests.
+
+Deadlines are cooperative at GPU kernel boundaries because an in-flight CUDA
+kernel is not safely cancellable. Unit tests cover waiting-admission expiry,
+decode-result expiry, urgency ordering, and four active requests scheduled with
+a decode batch size of two.

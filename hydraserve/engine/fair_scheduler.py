@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from time import monotonic
 
 
 @dataclass(frozen=True, slots=True)
@@ -8,11 +9,18 @@ class FairSchedulingConfig:
     max_priority: int = 7
     priority_bias: float = 1.0
     aging_weight: float = 0.25
+    deadline_bias: float = 8.0
+    deadline_urgency_window_s: float = 1.0
 
     def __post_init__(self) -> None:
         if self.max_priority < 0:
             raise ValueError("max priority cannot be negative")
-        if self.priority_bias < 0 or self.aging_weight <= 0:
+        if (
+            self.priority_bias < 0
+            or self.aging_weight <= 0
+            or self.deadline_bias < 0
+            or self.deadline_urgency_window_s <= 0
+        ):
             raise ValueError("invalid fairness weights")
 
 
@@ -54,10 +62,18 @@ class FairDecodeScheduler:
             )
             weight = request.priority + 1
             waiting_rounds = self._round - account.last_served_round
+            deadline_urgency = 0.0
+            if request.deadline_at is not None:
+                remaining = request.deadline_at - monotonic()
+                deadline_urgency = max(
+                    0.0,
+                    1.0 - remaining / self.config.deadline_urgency_window_s,
+                )
             return (
                 account.service_tokens / weight
                 - self.config.priority_bias * request.priority
-                - self.config.aging_weight * waiting_rounds,
+                - self.config.aging_weight * waiting_rounds
+                - self.config.deadline_bias * deadline_urgency,
                 request.request_id,
             )
 
@@ -70,4 +86,3 @@ class FairDecodeScheduler:
 
     def forget(self, request_id: int) -> None:
         self._accounts.pop(request_id, None)
-

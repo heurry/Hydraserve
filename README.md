@@ -118,7 +118,8 @@ python -m hydraserve inspect-datasets /mnt/nvme-data/datasets/benchmark --limit 
 ```bash
 python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
   --device cuda:0 --port 8000 \
-  --max-batch-size 64 --max-queue-size 1024 --max-queue-tokens 1048576
+  --max-batch-size 64 --max-active-requests 256 \
+  --max-queue-size 1024 --max-queue-tokens 1048576
 
 curl http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
@@ -245,6 +246,15 @@ PARTIAL 模式下，静态 8K 阈值会错误偏向 PD，后续路由必须纳�
 不会阻塞后续可准入请求。decode 子进程退出或 RPC 超时后会先从路由摘除，重建进程与
 IPC 队列，并在模型名和容量握手通过后重新加入。`/health` 和 `/metrics` 暴露 worker
 健康数、恢复中列表及重启计数。
+
+`--max-active-requests` 控制已准入并持有 KV/GDN 容量的请求数，必须不小于
+`--max-batch-size`；后者只控制单步真正进入 decode kernel 的数量。两者分离后，调度器
+可以在一个 batch 之外保留等待 decode 的活跃请求，并做 priority-weighted fairness、
+老化防饿死和 deadline urgency。API 的 HydraServe 扩展字段 `timeout_ms` 是从 submit
+开始计算的硬 deadline；在 admission/prefill/decode 边界过期会释放资源，非流式返回
+HTTP 408，SSE 返回 `timeout_error` event。GPU kernel 不可中断，因此 deadline 是 kernel
+边界协作式而非微秒级抢占。`/health` 与 `/metrics` 分别暴露 admission、prefill 和 active
+三层请求深度。
 
 当前 PCIe fallback 使用不经 pickle 的 typed ndarray 单-envelope SHM，header 在内容写完后
 才发布；GDN 状态通过 pinned host staging 搬运。decode worker 按实时剩余显存计算可保证

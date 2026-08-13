@@ -66,6 +66,7 @@ def main() -> int:
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
+    serve_parser.add_argument("--max-active-requests", type=int)
     serve_parser.add_argument("--max-queue-size", type=int, default=1024)
     serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
@@ -163,6 +164,9 @@ def main() -> int:
             args.prefix_cache_min_frequency,
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
+        max_active_requests = args.max_active_requests or args.max_batch_size
+        if max_active_requests < args.max_batch_size:
+            parser.error("--max-active-requests cannot be below --max-batch-size")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
         tokenizer = QwenTokenizer(args.model)
@@ -186,7 +190,7 @@ def main() -> int:
                     prefill_device=args.device,
                     cache_tokens_per_worker=args.cache_tokens,
                     block_size=args.block_size,
-                    max_state_slots_per_worker=args.max_batch_size,
+                    max_state_slots_per_worker=max_active_requests,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
@@ -204,7 +208,7 @@ def main() -> int:
                 block_size=args.block_size,
                 use_flash_attention=not args.no_flash_attention,
                 prefill_chunk_size=args.prefill_chunk_size,
-                max_state_slots=args.max_batch_size,
+                max_state_slots=max_active_requests,
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
             )
@@ -261,12 +265,13 @@ def main() -> int:
                 runtime,
                 cache,
                 prefill_chunk_size=args.prefill_chunk_size,
-                max_state_slots=args.max_batch_size,
+                max_state_slots=max_active_requests,
             )
             model_name = runtime.config.name
         loop = ContinuousGenerationLoop(
             backend,
             max_batch_size=args.max_batch_size,
+            max_active_requests=max_active_requests,
             max_queue_size=args.max_queue_size,
             max_queue_tokens=args.max_queue_tokens,
             eos_token_id=tokenizer.eos_token_id,

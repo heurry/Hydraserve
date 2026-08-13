@@ -189,7 +189,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 
 | 组件 | GPU | 职责 | 代码状态 |
 |------|-----|------|---------|
-| CentralScheduler | CPU | 请求路由、传输协调 | 状态机、无队首阻塞资源准入、带老化加权公平 decode、逐请求混合执行路由与 route binding 完成 |
+| CentralScheduler | CPU | 请求路由、传输协调 | 状态机、active/batch 独立上限、无队首阻塞资源准入、priority/老化/deadline 加权公平 decode、deadline 资源回收、逐请求混合执行路由与 route binding 完成 |
 | Chunked Prefill | GPU 0 | 长 prompt 分块 | 分块调度、Paged 历史与 causal offset 完成 |
 | State Extractor | GPU 0 | 提取 KV + 循环状态 | N−1 GDN 状态、pinned host staging 与 typed SHM 传输已接入；逐层 P2P overlap 待验证 |
 | TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM/P2P 实现；本机 P2P 不可用，未实测 |

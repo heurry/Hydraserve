@@ -33,7 +33,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            payload: dict[str, Any] = {"status": "ok"}
+            loop = self.hydra.generation_loop
+            payload: dict[str, Any] = {
+                "status": "ok",
+                "scheduler": {
+                    "max_batch_size": loop.max_batch_size,
+                    "max_active_requests": loop.max_active_requests,
+                    "active_requests": loop.active_count,
+                    "prefill_pending_requests": loop.prefill_pending_count,
+                    "admission_pending_requests": loop.pending_count,
+                },
+            }
             capacity = getattr(self.hydra.generation_loop.backend, "capacity", None)
             if capacity is not None:
                 snapshot = capacity()
@@ -157,6 +167,13 @@ class _Handler(BaseHTTPRequestHandler):
             priority = payload.get("priority", 0)
             if not isinstance(priority, int) or isinstance(priority, bool):
                 raise ValueError("priority must be an integer")
+            timeout_ms = payload.get("timeout_ms")
+            if timeout_ms is not None and (
+                not isinstance(timeout_ms, (int, float))
+                or isinstance(timeout_ms, bool)
+                or timeout_ms <= 0
+            ):
+                raise ValueError("timeout_ms must be a positive number")
             stream = payload.get("stream", False)
             if not isinstance(stream, bool):
                 raise ValueError("stream must be a boolean")
@@ -176,6 +193,7 @@ class _Handler(BaseHTTPRequestHandler):
                 max_tokens,
                 priority=priority,
                 sampling_params=sampling,
+                timeout_ms=timeout_ms,
             )
             if stream:
                 self._stream(
@@ -190,6 +208,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(400, "invalid_request_error", str(exc))
         except OverloadedError as exc:
             self._error(429, "overloaded_error", str(exc))
+        except RuntimeError as exc:
+            if "deadline expired" in str(exc):
+                self._error(408, "timeout_error", str(exc))
+            else:
+                self._error(500, "server_error", str(exc))
         except Exception as exc:
             self._error(500, "server_error", str(exc))
 
@@ -322,7 +345,14 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             for event in handle:
                 if event.error:
-                    self._sse({"error": {"message": event.error, "type": "server_error"}})
+                    error_type = (
+                        "timeout_error"
+                        if "deadline expired" in event.error
+                        else "server_error"
+                    )
+                    self._sse(
+                        {"error": {"message": event.error, "type": error_type}}
+                    )
                     break
                 if event.token_id is not None:
                     generated_count += 1
@@ -496,6 +526,10 @@ class _Handler(BaseHTTPRequestHandler):
             f"hydraserve_admission_pending_requests {loop.pending_count}",
             "# TYPE hydraserve_admission_pending_tokens gauge",
             f"hydraserve_admission_pending_tokens {loop.pending_tokens}",
+            "# TYPE hydraserve_scheduler_requests gauge",
+            f'hydraserve_scheduler_requests{{state="active"}} {loop.active_count}',
+            f'hydraserve_scheduler_requests{{state="prefill_pending"}} {loop.prefill_pending_count}',
+            f'hydraserve_scheduler_requests{{state="admission_pending"}} {loop.pending_count}',
         ]
         capacity = getattr(backend, "capacity", None)
         if capacity is not None:
