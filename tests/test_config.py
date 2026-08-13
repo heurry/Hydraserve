@@ -12,7 +12,7 @@ def test_presets_have_architecture_driven_state_sizes() -> None:
     assert model.num_linear_layers == 24
     assert model.num_full_attention_layers == 8
     assert model.kv_bytes_per_token_bf16 == 32 * 1024
-    assert 25_000_000 < model.recurrent_state_bytes < 27_000_000
+    assert 53_000_000 < model.recurrent_state_bytes < 54_000_000
 
 
 def test_loads_arbitrary_size_from_nested_hf_config(tmp_path) -> None:
@@ -47,7 +47,8 @@ def test_loads_arbitrary_size_from_nested_hf_config(tmp_path) -> None:
     assert model.num_hidden_layers == 48
     assert model.num_kv_heads == 6
     assert model.layer_types[-1] is LayerKind.FULL_ATTENTION
-    assert model.ssm_state_shape == (47, 18, 96, 96)
+    assert model.ssm_state_shape == (47, 36, 96, 96)
+    assert model.conv_state_shape == (47, 6912, 4)
 
 
 def test_rejects_unknown_architecture(tmp_path) -> None:

@@ -38,7 +38,7 @@ PD 分离把干扰归零。但 PD 是"用传输开销换干扰消除"——不�
 | 状态类型 | 大小 (32K, 9B) | 特性 | 迁移策略 |
 |---------|-------------------|------|----------|
 | Full Attn KV Cache | 1 GB (BF16) / 345 MB (INT4) | 线性增长，可量化 | INT4 压缩 |
-| Linear Attn 循环状态 | 25 MB (FP32) | 固定大小，不可量化 | 整体传输 |
+| Linear Attn 循环状态 | 53.48 MB (9B) / 158.86 MB (27B), FP32 | 固定大小，不可量化 | 整体传输 |
 
 循环状态不可量化：FP32 递推误差累积发散。双状态传输是本项目的技术贡献点。
 
@@ -108,7 +108,7 @@ BulletServe 在单卡场景下严格优于 inter-GPU PD 分离。实测验证：
 |------|------|---------|-------------|---------|
 | NVLink (有 bridge) | 112 GB/s | 全量 BF16 KV + 状态 | 9ms | 完全可行 |
 | PCIe P2P (双 x16) | ~12-16 GB/s | INT4 KV (345MB) + 状态 | 29ms | 可行 |
-| PCIe SHM (x16+x4) | 4.58 GB/s (实测) | 仅状态 (25MB) + KV 重算 | 5ms + 25ms 重算 | 部分 PD |
+| PCIe SHM (x16+x4) | 4.58 GB/s (实测) | 仅状态 (53.48MB for 9B) + KV 重算 | ~12ms + KV 重算 | 部分 PD |
 | gRPC (跨节点) | 3-10 GB/s | INT4 KV + 状态 | 35-115ms | 长上下文可隐藏 |
 
 当前双卡环境 P2P 不可用、SHM 4.58 GB/s，只能跑 PARTIAL_TRANSFER。四卡全 x16 P2P 如果可用，可跑完整 QUANTIZED_TRANSFER。
@@ -189,18 +189,18 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 
 | 组件 | GPU | 职责 | 代码状态 |
 |------|-----|------|---------|
-| CentralScheduler | CPU | 请求路由、传输协调 | 代码完成，未端到端 |
-| Chunked Prefill | GPU 0 | 长 prompt 分块 | 代码完成 |
-| State Extractor | GPU 0 | 逐层提取 KV + 循环状态 | 代码完成 |
-| TransferBackend | GPU0->1..N | 传输后端抽象 | 抽象层完成，NVLink/P2P 为桩文件 |
-| TransferPipeline | GPU0->1..N | 层级别异步流水线 | 代码完成，未端到端 |
-| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | 代码完成 |
-| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 代码完成 |
-| Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | 代码完成 |
-| Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 代码完成 |
-| Adaptive Router | CPU | Collocated vs PD 路由 | 代码完成 |
-| ModelAdapter | both | 多模型适配 | 4B/9B 完成，27B 桩文件 |
-| API Server | CPU | OpenAI-compatible | 代码完成 |
+| CentralScheduler | CPU | 请求路由、传输协调 | 状态机与路由完成，PD worker 待接入 |
+| Chunked Prefill | GPU 0 | 长 prompt 分块 | 分块调度完成，历史 chunk attention 待接入 |
+| State Extractor | GPU 0 | 逐层提取 KV + 循环状态 | runtime state 已暴露，传输绑定待接入 |
+| TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM 完成，NVLink/P2P 待实现 |
+| TransferPipeline | GPU0->1..N | 层级别异步流水线 | 双状态协议完成，GPU 异步流水待实现 |
+| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | 调度与 batched runtime executor 完成 |
+| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 物理页、Triton scatter、block table 完成 |
+| Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | CPU pool 完成，GPU worker 绑定待接入 |
+| Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 待实现 |
+| Adaptive Router | CPU | Collocated vs PD 路由 | 完成 |
+| ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
+| API Server | CPU | OpenAI-compatible | 待实现 |
 
 ---
 
@@ -220,17 +220,18 @@ flash_attn 不支持 paged KV。自实现 Triton kernel：
 3. online softmax（流式）
 4. 累加 V 加权和
 
-约 150-200 行 Triton 代码。代码完成（10KB），正确性未压测。
+Triton online-softmax kernel 已完成，并在 RTX 3090 上与 reference Paged Attention 对照通过。
 
 #### 5.1.3 Linear Attention (GDN)：Triton Fused Delta Rule
 
-    # delta rule (每步):
-    #   decay = 1 - beta_t * alpha_t
-    #   S_t = S_{t-1} * decay + beta_t * v_t @ k_t^T
-    #   out_t = gate_t * (S_t @ q_t)
+    # gated delta rule (每步):
+    #   S <- exp(g_t) * S
+    #   delta <- beta_t * (v_t - k_t^T S)
+    #   S <- S + k_t @ delta
+    #   out_t <- RMSNorm(S^T q_t) * SiLU(z_t)
 
 不 fuse：每步回 HBM 读写 state（1MB/16 heads），32K = 32GB 读写量。
-Fused：state 留 SRAM，整个 prefill 只读写一次。代码完成（16KB），无现成实现。
+Fused recurrent kernel：按 value-dimension tile 保持 state，RTX 3090 上已与逐步 FP32 reference 对照通过。
 
 ### 5.2 双状态内存管理
 
@@ -387,13 +388,13 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 
 ### 6.2 多目标传输调度
 
-3 张 decode 卡，每请求传 INT4 KV（345MB for 32K）+ 状态（25MB）：
+3 张 decode 卡，每请求传 INT4 KV（345MB for 32K）+ 9B 状态（53.48MB）：
 
 | 传输策略 | 总时间 | 说明 |
 |----------|--------|------|
-| 串行（GPU0->1->2->3） | 3x31ms = 93ms | 超 prefill，部分暴露 |
-| 并行（同时传 3 路） | 370MB / 4.7GB/s = 79ms | 带宽 3 路均分 |
-| 层级别交错流水线 | ~31ms | 每路独占带宽传该层 |
+| 串行（GPU0->1->2->3） | 约 3x33ms = 99ms | 超 prefill，部分暴露 |
+| 并行（同时传 3 路） | 398.5MB / 4.7GB/s ≈ 85ms | 带宽 3 路均分 |
+| 层级别交错流水线 | ~33ms | 每路独占带宽传该层 |
 
 层级别交错：Layer 0 传给 GPU1，Layer 1 传给 GPU2，Layer 2 传给 GPU3，每路独占带宽。
 
@@ -491,9 +492,9 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 
 "Prefill 和 decode 在同一 GPU 上会互相干扰。3090 上实测：4K prefill 导致 decode 减速 6.4 倍，持续 1.8 秒。"
 
-"混合注意力的难点是双状态：KV Cache 可以量化压缩，但循环状态是 FP32 的 25MB 矩阵，量化导致递推误差发散。我做了层级别异步流水线——每层计算完立即传该层状态。还有 N-1 truncation：循环状态编码 0..N-1，decode 端必须重算第 N 个 token。用 first-token seeding 跳过。"
+"混合注意力的难点是双状态：KV Cache 可以量化压缩，但循环状态必须保持 FP32。按真实 Qwen GDN value heads 和完整 conv channels 计算，9B 是 53.48MB，27B 是 158.86MB。我用层级别异步流水线逐层传输状态。还有 N-1 truncation：循环状态编码 0..N-1，decode 端必须重算第 N 个 token。用 first-token seeding 跳过。"
 
-"框架通过 TransferBackend 抽象层隔离传输介质。当前双卡 3090（x16+x4，无 P2P，SHM 4.58 GB/s）只能跑 PARTIAL_TRANSFER——传 25MB 状态，KV 本地重算。四卡全 x16 P2P 可以跑完整 QUANTIZED_TRANSFER（INT4 KV 345MB，29ms）。"
+"框架通过 TransferBackend 抽象层隔离传输介质。当前双卡 3090（x16+x4，无 P2P，SHM 4.58 GB/s）只能跑 PARTIAL_TRANSFER——9B 传 53.48MB 状态，KV 本地重算。四卡全 x16 P2P 可以跑完整 QUANTIZED_TRANSFER。"
 
 **诚实定位**：
 
@@ -506,7 +507,7 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 为什么不用 vLLM？ | vLLM #41869/#46807 已合并 GDN PD 分离，但依赖 NIXL/Mooncake + RDMA。我是从零实现的独立引擎，面向消费级 GPU |
 | 和 BulletServe 区别？ | BulletServe 是 intra-GPU（SM masking）。HydraServe 做 inter-GPU。实测 MPS decode 2.5x 减速 |
 | 为什么不用 TP？ | TP 解决"放不下"，PD 解决"干扰"。9B INT4 单卡放得下，TP 没必要 |
-| 循环状态不量化？ | FP32 递推误差累积发散。25MB 风险高 |
+| 循环状态不量化？ | FP32 递推误差累积发散；9B 真实状态 53.48MB，不能按旧版 25MB 估算 |
 | 有无 NVLink 区别？ | 无 NVLink（SHM 4.58 GB/s）只能 PARTIAL。有 NVLink 9ms 传 1GB。四卡 P2P + INT4 KV 也可行 |
 | 双卡为什么不做 DP？ | 双卡是开发环境不是部署目标。PD 在大规模才显著优于 DP。四卡 1P+3D 是最小自然 PD 配置 |
 | 能扩展多节点？ | TransferBackend 设计支持 gRPC 或 RDMA。上层协议介质无关 |
@@ -523,14 +524,14 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | Phase | 内容 | 时间 | 状态 |
 |-------|------|------|------|
 | 0 | 环境搭建 + 模型加载 + 硬件实测 | 1 周 | 完成 |
-| 1 | 推理引擎 + Triton kernels (4B/9B) | 2.5 周 | 代码完成，正确性未压测 |
-| 2 | 双状态内存管理 + ModelAdapter | 2 周 | 代码完成 |
-| 3 | 传输层 + 双状态序列化 | 2 周 | 抽象层完成，NVLink/P2P 为桩文件 |
-| 4 | PD 分离核心 + N-1 truncation | 2 周 | 代码完成，未端到端 |
-| 5 | Continuous batching + chunked prefill | 2 周 | 代码完成 |
-| 6 | 自适应路由 + 27B 适配 | 1.5 周 | 路由完成，27B 为桩文件 |
-| 7 | Benchmark + 对比实验 | 2 周 | 部分实测（HF transformers），未用自己引擎 |
-| 8 | 端到端打通 + SHM Partial 实测 | 1 周 | 待做 |
+| 1 | 推理引擎 + Triton kernels | 2.5 周 | 4B 真实 GPU smoke + kernel 对照完成；9B/27B 待实跑 |
+| 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、协议完成；GPU state pool 待接入 worker |
+| 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM 完成，NVLink/P2P 待实现 |
+| 4 | PD 分离核心 + N-1 truncation | 2 周 | 协议纵切片完成，真实 GPU 双进程待接入 |
+| 5 | Continuous batching + chunked prefill | 2 周 | batched decode 完成；历史 chunk attention 待接入 |
+| 6 | 自适应路由 + 多模型适配 | 1.5 周 | 路由和动态 config 完成；9B/27B runtime 待实跑 |
+| 7 | Benchmark + 对比实验 | 2 周 | 待使用新引擎重测 |
+| 8 | API + PD worker + SHM Partial 实测 | 1 周 | 待做 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
@@ -651,7 +652,7 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | Decode (batch 128) | 191 tok/s | - | - | 实测 |
 | 权重 INT4 | ~2 GB | ~4.5 GB | ~13.5 GB | AWQ |
 | KV/token | 32 KB | 32 KB | 64 KB | config.json |
-| 状态/请求 | 25 MB | 25 MB | 50 MB | config.json |
+| 状态/请求 (FP32 recurrent+conv) | 53.48 MB | 53.48 MB | 158.86 MB | config.json + runtime shape |
 | SHM 带宽 | 4.58 GB/s | 4.58 GB/s | - | 实测 |
 | 干扰 (1K) | 2.5x | - | - | 实测 |
 | 干扰 (4K) | 6.4x | - | - | 实测 |

@@ -26,5 +26,7 @@ def tiny_model() -> ModelConfig:
             "linear_num_value_heads": 2,
             "linear_value_head_dim": 4,
             "linear_conv_kernel_dim": 3,
+            "intermediate_size": 64,
+            "vocab_size": 64,
         }
     )

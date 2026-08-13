@@ -56,6 +56,13 @@ class ModelConfig:
     linear_num_value_heads: int
     linear_value_head_dim: int
     linear_conv_kernel_dim: int
+    intermediate_size: int
+    vocab_size: int = 248_320
+    rms_norm_eps: float = 1e-6
+    hidden_act: str = "silu"
+    rope_theta: float = 10_000_000.0
+    partial_rotary_factor: float = 0.25
+    mrope_section: tuple[int, int, int] = (11, 11, 10)
     max_position_embeddings: int = 262_144
     recurrent_dtype: str = "float32"
 
@@ -71,6 +78,8 @@ class ModelConfig:
             "linear_num_value_heads": self.linear_num_value_heads,
             "linear_value_head_dim": self.linear_value_head_dim,
             "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
+            "intermediate_size": self.intermediate_size,
+            "vocab_size": self.vocab_size,
         }
         invalid = [name for name, value in positive.items() if value <= 0]
         if invalid:
@@ -86,6 +95,10 @@ class ModelConfig:
             raise ValueError("a hybrid model must contain at least one linear-attention layer")
         if self.recurrent_dtype != "float32":
             raise ValueError("recurrent state must use float32")
+        if self.hidden_act != "silu":
+            raise ValueError(f"unsupported activation {self.hidden_act!r}")
+        if not 0 < self.partial_rotary_factor <= 1:
+            raise ValueError("partial_rotary_factor must be in (0, 1]")
 
     @property
     def linear_layer_indices(self) -> tuple[int, ...]:
@@ -111,18 +124,29 @@ class ModelConfig:
     def ssm_state_shape(self) -> tuple[int, int, int, int]:
         return (
             self.num_linear_layers,
-            self.linear_num_key_heads,
+            self.linear_num_value_heads,
             self.linear_key_head_dim,
             self.linear_value_head_dim,
         )
 
     @property
-    def conv_state_shape(self) -> tuple[int, int, int, int]:
+    def linear_key_width(self) -> int:
+        return self.linear_num_key_heads * self.linear_key_head_dim
+
+    @property
+    def linear_value_width(self) -> int:
+        return self.linear_num_value_heads * self.linear_value_head_dim
+
+    @property
+    def linear_conv_width(self) -> int:
+        return self.linear_key_width * 2 + self.linear_value_width
+
+    @property
+    def conv_state_shape(self) -> tuple[int, int, int]:
         return (
             self.num_linear_layers,
-            self.linear_num_key_heads,
+            self.linear_conv_width,
             self.linear_conv_kernel_dim,
-            self.linear_key_head_dim,
         )
 
     @property
@@ -154,6 +178,9 @@ class ModelConfig:
         attention_heads = int(_required(data, "num_attention_heads", "n_head"))
         head_dim = int(_optional(data, hidden_size // attention_heads, "head_dim"))
         linear_key_dim = int(_optional(data, 128, "linear_key_head_dim"))
+        rope = _optional(data, {}, "rope_parameters", "rope_scaling")
+        if not isinstance(rope, Mapping):
+            rope = {}
         return cls(
             name=name or str(_optional(data, "custom-hybrid-model", "name", "_name_or_path")),
             hidden_size=hidden_size,
@@ -173,6 +200,15 @@ class ModelConfig:
             linear_conv_kernel_dim=int(
                 _optional(data, 4, "linear_conv_kernel_dim", "conv_kernel")
             ),
+            intermediate_size=int(_optional(data, hidden_size * 4, "intermediate_size")),
+            vocab_size=int(_optional(data, 248_320, "vocab_size")),
+            rms_norm_eps=float(_optional(data, 1e-6, "rms_norm_eps")),
+            hidden_act=str(_optional(data, "silu", "hidden_act")),
+            rope_theta=float(rope.get("rope_theta", _optional(data, 10_000_000.0, "rope_theta"))),
+            partial_rotary_factor=float(
+                rope.get("partial_rotary_factor", _optional(data, 0.25, "partial_rotary_factor"))
+            ),
+            mrope_section=tuple(rope.get("mrope_section", (11, 11, 10))),
             max_position_embeddings=int(
                 _optional(data, 262_144, "max_position_embeddings", "max_sequence_length")
             ),
@@ -187,7 +223,14 @@ def _product(shape: tuple[int, ...]) -> int:
     return result
 
 
-def _preset(name: str, hidden: int, layers: int, heads: int, value_heads: int) -> ModelConfig:
+def _preset(
+    name: str,
+    hidden: int,
+    intermediate: int,
+    layers: int,
+    heads: int,
+    value_heads: int,
+) -> ModelConfig:
     return ModelConfig.from_mapping(
         {
             "name": name,
@@ -202,14 +245,15 @@ def _preset(name: str, hidden: int, layers: int, heads: int, value_heads: int) -
             "linear_num_value_heads": value_heads,
             "linear_value_head_dim": 128,
             "linear_conv_kernel_dim": 4,
+            "intermediate_size": intermediate,
         }
     )
 
 
 MODEL_REGISTRY: dict[str, ModelConfig] = {
-    "qwen3.5-4b": _preset("Qwen3.5-4B", 2560, 32, 16, 32),
-    "qwen3.5-9b": _preset("Qwen3.5-9B", 4096, 32, 16, 32),
-    "qwen3.6-27b": _preset("Qwen3.6-27B", 5120, 64, 24, 48),
+    "qwen3.5-4b": _preset("Qwen3.5-4B", 2560, 9216, 32, 16, 32),
+    "qwen3.5-9b": _preset("Qwen3.5-9B", 4096, 12288, 32, 16, 32),
+    "qwen3.6-27b": _preset("Qwen3.6-27B", 5120, 17408, 64, 24, 48),
 }
 
 
