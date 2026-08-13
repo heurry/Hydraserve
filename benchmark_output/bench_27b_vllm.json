@@ -1,0 +1,92 @@
+{
+  "model": "/models/Qwen3.6-27B-FP8",
+  "serving": "vLLM v0.19.1, TP=2, max-model-len 32768, enforce-eager",
+  "context_sweep": [
+    {
+      "ctx": 512,
+      "prefill_ms": 0.0,
+      "total_ms": 627.0,
+      "tokens_per_s": 512000000.0
+    },
+    {
+      "ctx": 1024,
+      "prefill_ms": 0.0,
+      "total_ms": 1277.0,
+      "tokens_per_s": 1024000000.0
+    },
+    {
+      "ctx": 2048,
+      "prefill_ms": 0.0,
+      "total_ms": 2662.0,
+      "tokens_per_s": 2048000000.0
+    },
+    {
+      "ctx": 4096,
+      "prefill_ms": 0.0,
+      "total_ms": 4478.0,
+      "tokens_per_s": 4096000000.0
+    },
+    {
+      "ctx": 8192,
+      "prefill_ms": 0.0,
+      "total_ms": 9088.0,
+      "tokens_per_s": 8192000000.0
+    },
+    {
+      "ctx": 16384,
+      "prefill_ms": 0.0,
+      "total_ms": 18242.0,
+      "tokens_per_s": 16384000000.0
+    }
+  ],
+  "generation": [
+    {
+      "label": "short",
+      "prompt_tokens": 17,
+      "completion_tokens": 200,
+      "total_ms": 8142.071625916287,
+      "tpot_ms": 40.7,
+      "tok_per_s": 24.6,
+      "text": "Here's a thinking process:\n\n1.  **Understand User Request:** The user asks \"Explain what machine learning is:\" - a straightforward, open-ended request"
+    },
+    {
+      "label": "medium",
+      "prompt_tokens": 18,
+      "completion_tokens": 200,
+      "total_ms": 8196.340425056405,
+      "tpot_ms": 41.0,
+      "tok_per_s": 24.4,
+      "text": "Here's a thinking process:\n\n1.  **Understand User Request:**\n   - **Topic:** Quantum Computing\n   - **Requirement:** Detailed explanation\n   - **Goal:"
+    }
+  ],
+  "concurrency": [
+    {
+      "concurrency": 1,
+      "wall_ms": 4410.0,
+      "total_tokens": 100,
+      "throughput_tok_s": 22.7,
+      "avg_tpot_ms": 44.1
+    },
+    {
+      "concurrency": 2,
+      "wall_ms": 5490.0,
+      "total_tokens": 200,
+      "throughput_tok_s": 36.4,
+      "avg_tpot_ms": 54.5
+    },
+    {
+      "concurrency": 4,
+      "wall_ms": 5216.0,
+      "total_tokens": 400,
+      "throughput_tok_s": 76.7,
+      "avg_tpot_ms": 51.9
+    },
+    {
+      "concurrency": 8,
+      "wall_ms": 11904.0,
+      "total_tokens": 800,
+      "throughput_tok_s": 67.2,
+      "avg_tpot_ms": 118.7
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "hardware": {
+    "gpu0": "NVIDIA GeForce RTX 3090",
+    "gpu1": "NVIDIA GeForce RTX 3090",
+    "pcie": "GPU0 x16, GPU1 x4, no P2P, NODE topology",
+    "shm_bandwidth_gb_s": 4.58,
+    "model": "Qwen3.5-4B BF16",
+    "params": "4.21B",
+    "weights_vram_gb": 8.4
+  },
+  "limits": {
+    "max_context_tokens": 7283,
+    "max_decode_batch_single_gpu": 128,
+    "max_sustained_throughput_tok_s": 166.0,
+    "gpu0_util_at_max": 41,
+    "gpu1_util_at_max": 100,
+    "vram_at_max_gb": 18.2
+  },
+  "shm_transfer": [
+    {
+      "size_mb": 1,
+      "time_ms": 0.2,
+      "bw_gb_s": 4.45
+    },
+    {
+      "size_mb": 5,
+      "time_ms": 1.1,
+      "bw_gb_s": 4.35
+    },
+    {
+      "size_mb": 25,
+      "time_ms": 5.3,
+      "bw_gb_s": 4.6
+    },
+    {
+      "size_mb": 50,
+      "time_ms": 10.7,
+      "bw_gb_s": 4.55
+    },
+    {
+      "size_mb": 100,
+      "time_ms": 21.2,
+      "bw_gb_s": 4.61
+    },
+    {
+      "size_mb": 250,
+      "time_ms": 53.5,
+      "bw_gb_s": 4.57
+    },
+    {
+      "size_mb": 500,
+      "time_ms": 106.6,
+      "bw_gb_s": 4.58
+    }
+  ],
+  "sustained_throughput": {
+    "batch_per_gpu": 64,
+    "total_batch": 128,
+    "tok_per_s": 166.0,
+    "duration_s": 30.0,
+    "steps": 39
+  }
+}

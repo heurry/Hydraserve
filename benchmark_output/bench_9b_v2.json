@@ -1,0 +1,244 @@
+{
+  "spec": {
+    "hidden": 4096,
+    "layers": 32,
+    "max_pos": 262144,
+    "full_attn_layers": 8,
+    "linear_layers": 24,
+    "kv_bytes_per_token": 32768,
+    "ssm_state_bytes": 25165824
+  },
+  "bf16_vram_per_gpu": 17.9,
+  "max_context_bf16": {
+    "tokens": 3642,
+    "data": [
+      {
+        "tokens": 455,
+        "ms": 244.9,
+        "tok_s": 1858,
+        "vram": 18.2
+      },
+      {
+        "tokens": 911,
+        "ms": 467.8,
+        "tok_s": 1947,
+        "vram": 18.5
+      },
+      {
+        "tokens": 1821,
+        "ms": 813.2,
+        "tok_s": 2239,
+        "vram": 19.0
+      },
+      {
+        "tokens": 3642,
+        "ms": 1595.7,
+        "tok_s": 2282,
+        "vram": 19.9
+      }
+    ]
+  },
+  "max_batch_bf16": {
+    "batch": 32,
+    "data": [
+      {
+        "batch": 1,
+        "ms": 70.5,
+        "tok_s": 14,
+        "ms_per_tok": 70.5
+      },
+      {
+        "batch": 2,
+        "ms": 68.9,
+        "tok_s": 29,
+        "ms_per_tok": 34.4
+      },
+      {
+        "batch": 4,
+        "ms": 73.4,
+        "tok_s": 54,
+        "ms_per_tok": 18.4
+      },
+      {
+        "batch": 8,
+        "ms": 93.2,
+        "tok_s": 86,
+        "ms_per_tok": 11.7
+      },
+      {
+        "batch": 16,
+        "ms": 133.7,
+        "tok_s": 120,
+        "ms_per_tok": 8.4
+      },
+      {
+        "batch": 32,
+        "ms": 214.6,
+        "tok_s": 149,
+        "ms_per_tok": 6.7
+      }
+    ]
+  },
+  "dp": [
+    {
+      "batch_per_gpu": 8,
+      "total_batch": 16,
+      "ms": 195.8,
+      "total_tok_s": 82,
+      "gpu0_util": 94,
+      "gpu1_util": 92
+    },
+    {
+      "batch_per_gpu": 16,
+      "total_batch": 32,
+      "ms": 282.6,
+      "total_tok_s": 113,
+      "gpu0_util": 17,
+      "gpu1_util": 61
+    },
+    {
+      "batch_per_gpu": 32,
+      "total_batch": 64,
+      "ms": 457.0,
+      "total_tok_s": 140,
+      "gpu0_util": 4,
+      "gpu1_util": 100
+    }
+  ],
+  "collocated": [
+    {
+      "ctx": 512,
+      "prefill_ms": 202.7,
+      "decode5_ms": 673.6,
+      "combined_ms": 865.2,
+      "delay_ms": -11.1,
+      "slowdown": 0.99
+    },
+    {
+      "ctx": 1024,
+      "prefill_ms": 291.6,
+      "decode5_ms": 674.8,
+      "combined_ms": 952.0,
+      "delay_ms": -14.4,
+      "slowdown": 0.99
+    },
+    {
+      "ctx": 2048,
+      "prefill_ms": 536.1,
+      "decode5_ms": 675.1,
+      "combined_ms": 1201.2,
+      "delay_ms": -10.1,
+      "slowdown": 0.99
+    }
+  ],
+  "shm": [
+    {
+      "size_mb": 5,
+      "ms": 1.0,
+      "bw_gb_s": 4.76
+    },
+    {
+      "size_mb": 25,
+      "ms": 5.3,
+      "bw_gb_s": 4.61
+    },
+    {
+      "size_mb": 50,
+      "ms": 10.6,
+      "bw_gb_s": 4.59
+    },
+    {
+      "size_mb": 100,
+      "ms": 21.3,
+      "bw_gb_s": 4.59
+    },
+    {
+      "size_mb": 250,
+      "ms": 52.8,
+      "bw_gb_s": 4.62
+    },
+    {
+      "size_mb": 500,
+      "ms": 105.8,
+      "bw_gb_s": 4.62
+    }
+  ],
+  "pd_partial": {
+    "shm_bw": 4.62,
+    "state_mb": 25.2,
+    "transfer_ms": 5.3,
+    "data": [
+      {
+        "ctx": 455,
+        "prefill_ms": 244.9,
+        "transfer_ms": 5.3,
+        "kv_recompute_ms": 61.2,
+        "pd_total_ms": 311.4
+      },
+      {
+        "ctx": 911,
+        "prefill_ms": 467.8,
+        "transfer_ms": 5.3,
+        "kv_recompute_ms": 117.0,
+        "pd_total_ms": 590.1
+      },
+      {
+        "ctx": 1821,
+        "prefill_ms": 813.2,
+        "transfer_ms": 5.3,
+        "kv_recompute_ms": 203.3,
+        "pd_total_ms": 1021.8
+      },
+      {
+        "ctx": 3642,
+        "prefill_ms": 1595.7,
+        "transfer_ms": 5.3,
+        "kv_recompute_ms": 398.9,
+        "pd_total_ms": 1999.9
+      }
+    ]
+  },
+  "generation": [
+    {
+      "label": "math",
+      "in": 15,
+      "out": 30,
+      "ms": 991.0,
+      "tok_s": 30,
+      "text": " 1081\nExplanation:\n23 * 47 = 23 * (50 - 3)\n= "
+    },
+    {
+      "label": "code",
+      "in": 17,
+      "out": 80,
+      "ms": 2591.0,
+      "tok_s": 31,
+      "text": " # Check for numbers less than 2\n    if n < 2:\n        return False\n    # Check for divisibility by 2\n    if n == 2:\n        return True\n    if n % 2 == 0:\n        return False\n    # Check for divisibility by odd numbers up to sqrt(n)\n    for i in ra"
+    },
+    {
+      "label": "reasoning",
+      "in": 25,
+      "out": 60,
+      "ms": 1948.0,
+      "tok_s": 31,
+      "text": "\n**Step\u2011by\u2011step solution**\n\n1. **Find the speed in km/h**  \n   \\[\n   v_{\\text{km/h}} = \\frac{\\text{distance}}{\\text{time}} = \\frac{120\\ \\text{km}}"
+    }
+  ],
+  "int4_estimate": {
+    "bf16_gb": 15.871246336,
+    "int4_gb": 4.007489699839989,
+    "savings_gb": 11.86375663616001,
+    "ratio": 3.960396039603971
+  },
+  "int4_quantized": {
+    "layers": 248,
+    "time_s": 0.4,
+    "logits_mean": -2.7188,
+    "logits_std": 2.3906
+  },
+  "max_context_int4": {
+    "tokens": 0,
+    "data": []
+  },
+  "int4_context_gain": 0.0
+}
