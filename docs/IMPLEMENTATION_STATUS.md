@@ -75,7 +75,23 @@ cold-start samples validate integration and are not performance claims.
 
 Next implementation slice:
 
-1. connect the tested two-process PD workers to the persistent API coordinator;
-2. chunked-prefill history integration;
-3. full B-vs-D dataset experiments with warmup and controlled arrival traces;
-4. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.
+## 2026-08-13 — persistent PD orchestration slice
+
+Implemented and real-GPU validated:
+
+- long-lived GPU0 prefill and GPU1 decode processes;
+- request RPC, startup/error handling, shutdown, and decode-side resource cleanup;
+- SHM PARTIAL state handoff followed by decode-side Paged KV recomputation;
+- multiple admitted requests combined into GPU1 batched decode;
+- `serve --pd` and `benchmark --pd` using the same API and metric definitions as
+  collocated mode.
+
+The persistent two-request Qwen3.5-4B PD test passed. A two-request GSM8K PD CLI
+smoke also completed 2/2 requests. Its cold, short-prompt numbers are integration
+evidence only and correctly show no PD benefit at this scale.
+
+Next implementation slice:
+
+1. chunked-prefill history integration;
+2. full B-vs-D dataset experiments with warmup and controlled arrival traces;
+3. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.

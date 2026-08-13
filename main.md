@@ -200,7 +200,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 待实现 |
 | Adaptive Router | CPU | Collocated vs PD 路由 | 完成 |
 | ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
-| API Server | CPU | OpenAI-compatible | completions/chat/SSE 完成；长期 PD 编排待接入 |
+| API Server | CPU | OpenAI-compatible | completions/chat/SSE + collocated/PD 常驻模式完成 |
 
 ---
 
@@ -536,11 +536,11 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 5 | Continuous batching + chunked prefill | 2 周 | batched decode 完成；历史 chunk attention 待接入 |
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 路由和动态 config 完成；9B/27B runtime 待实跑 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
-| 8 | API + PD worker + SHM Partial 实测 | 1 周 | API 与 PD worker 分别完成；长期多进程编排待接通 |
+| 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 将双进程 PD worker 接入 persistent API coordinator
+1. 接通 chunked-prefill 的跨 chunk full-attention 历史
 2. 用本机数据集实测 B vs D crossover point
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
 

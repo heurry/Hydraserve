@@ -33,8 +33,8 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
 
 当前还包括驻留式 Continuous Batching 生成循环、直接读取 `tokenizer.json` 的文本
 tokenizer、OpenAI-compatible completions/chat/SSE API，以及 TTFT/TPOT/P50/P95/P99
-benchmark runner。HTTP CLI 当前接单 GPU runtime；已实测的双进程双 GPU PD worker
-尚待接入长期驻留 API 编排。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
+benchmark runner。HTTP 和 benchmark CLI 可在单 GPU collocated 与双进程双 GPU
+PARTIAL PD 间切换。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
 真实 P2P 实测；层级流水线也只完成协议和单测，不宣称已在 NVLink/P2P 上验证。
 
 ## 模型兼容性
@@ -94,6 +94,16 @@ curl http://127.0.0.1:8000/v1/completions \
   -d '{"model":"Qwen3.5-4B","prompt":"The capital of France is","max_tokens":8,"temperature":0}'
 ```
 
+双 GPU PARTIAL PD 服务使用同一 API：
+
+```bash
+python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  --pd --device cuda:0 --decode-device cuda:1 --port 8000
+```
+
+此模式中两个模型进程长期驻留：GPU0 做 prefill 并通过 SHM 传输 FP32 GDN 状态，
+GPU1 重算 full-attention KV 后进入 Continuous Batching decode。
+
 当前采样器只支持 greedy `temperature=0`，API 只处理文本。运行本机 benchmark：
 
 ```bash
@@ -103,6 +113,10 @@ python -m hydraserve benchmark \
   --dataset gsm8k --limit 100 --concurrency 8 \
   --output benchmark_output/gsm8k.json
 ```
+
+在相同命令后增加 `--pd --decode-device cuda:1` 即可按同一指标口径跑 PD。两请求
+冷启动烟测已打通 collocated 与 PD；这种短 prompt 小样本中 PD 更慢，不能作为
+crossover 或吞吐结论。
 
 ## 代码结构
 

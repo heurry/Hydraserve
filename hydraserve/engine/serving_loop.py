@@ -137,6 +137,9 @@ class ContinuousGenerationLoop:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise TimeoutError("generation loop did not stop")
+        close_backend = getattr(self.backend, "close", None)
+        if close_backend is not None:
+            close_backend()
 
     def _run(self) -> None:
         active: OrderedDict[int, ServingRequest] = OrderedDict()

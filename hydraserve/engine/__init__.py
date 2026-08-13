@@ -20,6 +20,7 @@ from hydraserve.engine.serving_loop import (
     RuntimeGenerationBackend,
     ServingRequest,
 )
+from hydraserve.engine.pd_service import DisaggregatedGenerationBackend, PDWorkerConfig
 
 __all__ = [
     "CentralScheduler",
@@ -42,4 +43,6 @@ __all__ = [
     "GenerationHandle",
     "RuntimeGenerationBackend",
     "ServingRequest",
+    "DisaggregatedGenerationBackend",
+    "PDWorkerConfig",
 ]

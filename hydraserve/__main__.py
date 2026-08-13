@@ -34,6 +34,8 @@ def main() -> int:
     serve_parser.add_argument("--host", default="127.0.0.1")
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--device", default="cuda:0")
+    serve_parser.add_argument("--decode-device", default="cuda:1")
+    serve_parser.add_argument("--pd", action="store_true")
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
@@ -50,6 +52,8 @@ def main() -> int:
     benchmark_parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
     benchmark_parser.add_argument("--device", default="cuda:0")
+    benchmark_parser.add_argument("--decode-device", default="cuda:1")
+    benchmark_parser.add_argument("--pd", action="store_true")
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
@@ -57,32 +61,54 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == "serve":
-        import torch
-
         from hydraserve.api import create_server
-        from hydraserve.cache import KVBlockManager, PagedKVCache
-        from hydraserve.engine import ContinuousGenerationLoop, RuntimeGenerationBackend
-        from hydraserve.model import QwenTextRuntime, QwenTokenizer
+        from hydraserve.engine import (
+            ContinuousGenerationLoop,
+            DisaggregatedGenerationBackend,
+            PDWorkerConfig,
+        )
+        from hydraserve.model import QwenTokenizer
 
         if args.cache_tokens <= 0 or args.block_size <= 0:
             parser.error("cache limits must be positive")
-        runtime = QwenTextRuntime.from_checkpoint(
-            args.model,
-            device=args.device,
-            dtype=torch.bfloat16,
-            use_triton=True,
-            use_flash_attention=not args.no_flash_attention,
-        )
-        blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
-        cache = PagedKVCache(
-            runtime.config,
-            KVBlockManager(blocks, block_size=args.block_size),
-            device=args.device,
-            dtype=torch.bfloat16,
-        )
         tokenizer = QwenTokenizer(args.model)
+        if args.pd:
+            backend = DisaggregatedGenerationBackend(
+                PDWorkerConfig(
+                    str(args.model),
+                    prefill_device=args.device,
+                    decode_device=args.decode_device,
+                    cache_tokens=args.cache_tokens,
+                    block_size=args.block_size,
+                    use_flash_attention=not args.no_flash_attention,
+                )
+            )
+            model_name = backend.model_name
+        else:
+            import torch
+
+            from hydraserve.cache import KVBlockManager, PagedKVCache
+            from hydraserve.engine import RuntimeGenerationBackend
+            from hydraserve.model import QwenTextRuntime
+
+            runtime = QwenTextRuntime.from_checkpoint(
+                args.model,
+                device=args.device,
+                dtype=torch.bfloat16,
+                use_triton=True,
+                use_flash_attention=not args.no_flash_attention,
+            )
+            blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+            cache = PagedKVCache(
+                runtime.config,
+                KVBlockManager(blocks, block_size=args.block_size),
+                device=args.device,
+                dtype=torch.bfloat16,
+            )
+            backend = RuntimeGenerationBackend(runtime, cache)
+            model_name = runtime.config.name
         loop = ContinuousGenerationLoop(
-            RuntimeGenerationBackend(runtime, cache),
+            backend,
             max_batch_size=args.max_batch_size,
             eos_token_id=tokenizer.eos_token_id,
         )
@@ -91,10 +117,10 @@ def main() -> int:
             args.port,
             generation_loop=loop,
             tokenizer=tokenizer,
-            model_name=runtime.config.name,
+            model_name=model_name,
         )
         print(
-            f"HydraServe model={runtime.config.name} listening on "
+            f"HydraServe model={model_name} mode={'pd' if args.pd else 'collocated'} listening on "
             f"http://{args.host}:{args.port}"
         )
         try:
@@ -108,32 +134,53 @@ def main() -> int:
 
     if args.command == "benchmark":
         import json
-        import torch
 
         from hydraserve.benchmark import iter_dataset, run_benchmark
-        from hydraserve.cache import KVBlockManager, PagedKVCache
-        from hydraserve.engine import ContinuousGenerationLoop, RuntimeGenerationBackend
-        from hydraserve.model import QwenTextRuntime, QwenTokenizer
+        from hydraserve.engine import (
+            ContinuousGenerationLoop,
+            DisaggregatedGenerationBackend,
+            PDWorkerConfig,
+        )
+        from hydraserve.model import QwenTokenizer
 
         if args.cache_tokens <= 0 or args.block_size <= 0:
             parser.error("cache limits must be positive")
-        runtime = QwenTextRuntime.from_checkpoint(
-            args.model,
-            device=args.device,
-            dtype=torch.bfloat16,
-            use_triton=True,
-            use_flash_attention=not args.no_flash_attention,
-        )
-        blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
-        cache = PagedKVCache(
-            runtime.config,
-            KVBlockManager(blocks, block_size=args.block_size),
-            device=args.device,
-            dtype=torch.bfloat16,
-        )
         tokenizer = QwenTokenizer(args.model)
+        if args.pd:
+            backend = DisaggregatedGenerationBackend(
+                PDWorkerConfig(
+                    str(args.model),
+                    prefill_device=args.device,
+                    decode_device=args.decode_device,
+                    cache_tokens=args.cache_tokens,
+                    block_size=args.block_size,
+                    use_flash_attention=not args.no_flash_attention,
+                )
+            )
+        else:
+            import torch
+
+            from hydraserve.cache import KVBlockManager, PagedKVCache
+            from hydraserve.engine import RuntimeGenerationBackend
+            from hydraserve.model import QwenTextRuntime
+
+            runtime = QwenTextRuntime.from_checkpoint(
+                args.model,
+                device=args.device,
+                dtype=torch.bfloat16,
+                use_triton=True,
+                use_flash_attention=not args.no_flash_attention,
+            )
+            blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+            cache = PagedKVCache(
+                runtime.config,
+                KVBlockManager(blocks, block_size=args.block_size),
+                device=args.device,
+                dtype=torch.bfloat16,
+            )
+            backend = RuntimeGenerationBackend(runtime, cache)
         loop = ContinuousGenerationLoop(
-            RuntimeGenerationBackend(runtime, cache),
+            backend,
             max_batch_size=args.concurrency,
             eos_token_id=tokenizer.eos_token_id,
         )
