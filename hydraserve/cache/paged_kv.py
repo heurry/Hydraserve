@@ -397,10 +397,6 @@ class PagedKVCache:
         if not allocations:
             raise ValueError("cannot build empty KV batch metadata")
         width = max(len(allocation.block_ids) for allocation in allocations)
-        table = torch.full(
-            (len(allocations), width), -1, device=self.device, dtype=torch.int32
-        )
-        lengths = torch.empty(len(allocations), device=self.device, dtype=torch.int32)
         lengths_override = (
             [allocation.num_tokens for allocation in allocations]
             if logical_lengths is None
@@ -408,15 +404,22 @@ class PagedKVCache:
         )
         if len(lengths_override) != len(allocations):
             raise ValueError("logical lengths must match request ids")
-        for row, (allocation, logical_length) in enumerate(
-            zip(allocations, lengths_override, strict=True)
+        rows = []
+        for allocation, logical_length in zip(
+            allocations, lengths_override, strict=True
         ):
             if not 0 <= logical_length <= allocation.num_tokens:
                 raise ValueError("logical length exceeds the request allocation")
-            table[row, : len(allocation.block_ids)] = torch.tensor(
-                allocation.block_ids, device=self.device, dtype=torch.int32
+            rows.append(
+                list(allocation.block_ids)
+                + [-1] * (width - len(allocation.block_ids))
             )
-            lengths[row] = logical_length
+        # Pack metadata on the host and perform two contiguous transfers. The old
+        # row/scalar assignment path issued O(batch) tiny CUDA updates per step.
+        table = torch.tensor(rows, device=self.device, dtype=torch.int32)
+        lengths = torch.tensor(
+            lengths_override, device=self.device, dtype=torch.int32
+        )
         return table, lengths
 
     def _layer_slot(self, layer_index: int) -> int:

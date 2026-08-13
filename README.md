@@ -292,9 +292,11 @@ capacity、manual 淘汰，以及 frequency/capacity/size/length 拒绝；`/heal
 当前 PCIe fallback 使用不经 pickle 的 typed ndarray 单-envelope SHM，header 在内容写完后
 才发布；GDN 状态通过 pinned host staging 搬运。decode worker 按实时剩余显存计算可保证
 的 FP32 state slot 数，并预分配 layer-major 连续 GPU pool。每轮 decode 只构造一次
-Paged KV metadata，full-attention 层使用单次 batched Triton KV scatter；Paged Attention
-按 16-token tile 做 online softmax。RTX 3090 微基准中 batched scatter 相比逐请求 launch
-在 batch 1/8/32 分别为 1.15×/10.25×/42.79×；这些是 kernel 微基准，不代表端到端吞吐。
+Paged KV metadata；页表和长度先在 host 打包，再以两个连续 tensor 上传，避免随 batch
+线性增长的小 CUDA update。full-attention 层使用单次 batched Triton KV scatter；Paged
+Attention 按 16-token tile 做 online softmax。RTX 3090 微基准中 batched scatter 相比逐请求
+launch 在 batch 1/8/32 分别为 1.15×/10.25×/42.79×；连续 metadata 构造相比旧逐行更新
+在 batch 1/8/32/64 分别为 1.52×/10.55×/19.00×/34.50×。这些是微基准，不代表端到端吞吐。
 N−1 replay 使用 prefill 端已传输的首 token 作为权威输出；跨 GPU 浮点 argmax 漂移不会
 错误终止请求，但会计入 `hydraserve_pd_replay_mismatches_total` 供诊断。
 

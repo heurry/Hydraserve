@@ -47,6 +47,44 @@ def test_paged_kv_write_and_batch_metadata(tiny_model, device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_batch_metadata_uses_constant_contiguous_device_builds(
+    tiny_model, device: str, monkeypatch
+) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    manager = KVBlockManager(256, block_size=4)
+    cache = PagedKVCache(tiny_model, manager, device=device, dtype=torch.float32)
+    expected_lengths = []
+    expected_rows = []
+    for request_id in range(1, 65):
+        length = 1 + request_id % 13
+        expected_lengths.append(length)
+        allocation = cache.allocate(request_id, length)
+        expected_rows.append(allocation.block_ids)
+
+    original_tensor = torch.tensor
+    device_builds = []
+
+    def counted_tensor(*args, **kwargs):
+        if torch.device(kwargs.get("device", "cpu")) == cache.device:
+            device_builds.append(args[0])
+        return original_tensor(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "tensor", counted_tensor)
+    table, lengths = cache.batch_metadata(range(1, 65))
+
+    assert len(device_builds) == 2
+    assert table.is_contiguous()
+    assert lengths.is_contiguous()
+    assert lengths.tolist() == expected_lengths
+    for row, block_ids in enumerate(expected_rows):
+        assert table[row, : len(block_ids)].tolist() == list(block_ids)
+        assert table[row, len(block_ids) :].tolist() == [-1] * (
+            table.shape[1] - len(block_ids)
+        )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_paged_kv_batched_decode_scatter(tiny_model, device: str) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is required")

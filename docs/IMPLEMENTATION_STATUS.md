@@ -187,6 +187,8 @@ Implemented and regression tested:
   recurrent-state commits;
 - one metadata build per decode iteration, one batched Triton KV scatter per
   full-attention layer, and 16-token tiled Triton Paged Attention.
+- Paged KV block tables and logical lengths packed on the host and uploaded as
+  two contiguous tensors, eliminating O(batch) row/scalar CUDA updates.
 
 The transferred prefill token is authoritative for N-1 execution. A replay
 argmax difference caused by cross-GPU floating-point ties is counted in
@@ -200,6 +202,13 @@ KV scatter measured 1.15x/10.25x/42.79x over per-request launches at batch
 128/512/2048 at B=4, QH=16, D=128. These are kernel microbenchmarks, not
 end-to-end service claims. N>1 decode workers and CUDA P2P remain unvalidated on
 this two-GPU, no-peer-access host.
+
+On the same RTX 3090, contiguous Paged KV metadata construction measured
+0.0168/0.0199/0.0381/0.0439 ms at batch 1/8/32/64, versus
+0.0255/0.2101/0.7250/1.5161 ms for the previous per-row update path
+(1.52x/10.55x/19.00x/34.50x). The regression test also asserts that metadata
+construction performs exactly two contiguous device tensor builds independent
+of batch size.
 
 ## 2026-08-14 — long-context and serving stress validation
 
