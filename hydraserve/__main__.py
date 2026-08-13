@@ -27,6 +27,22 @@ def main() -> int:
     )
     dataset_parser.add_argument("path", type=Path)
     dataset_parser.add_argument("--limit", type=int, default=1)
+    fit_router_parser = subparsers.add_parser(
+        "fit-router-profile",
+        help="fit a cost-aware route profile from warmed concurrency-1 benchmarks",
+    )
+    fit_router_parser.add_argument("--collocated", type=Path, nargs="+", required=True)
+    fit_router_parser.add_argument(
+        "--pd-disaggregated", type=Path, nargs="+", required=True
+    )
+    fit_router_parser.add_argument("--minimum-pd-prompt-tokens", type=int, default=256)
+    fit_router_parser.add_argument("--minimum-savings-ms", type=float, default=5.0)
+    fit_router_parser.add_argument("--minimum-savings-ratio", type=float, default=0.05)
+    fit_router_parser.add_argument(
+        "--pd-uncertainty-multiplier", type=float, default=1.10
+    )
+    fit_router_parser.add_argument("--ewma-alpha", type=float, default=0.2)
+    fit_router_parser.add_argument("--output", type=Path)
     serve_parser = subparsers.add_parser(
         "serve", help="run the HydraServe OpenAI-compatible HTTP server"
     )
@@ -81,6 +97,37 @@ def main() -> int:
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser.add_argument("--output", type=Path)
     args = parser.parse_args()
+
+    if args.command == "fit-router-profile":
+        import json
+
+        from hydraserve.router import (
+            CostRouterConfig,
+            build_router_profile,
+            load_calibration_points,
+        )
+
+        try:
+            profile = build_router_profile(
+                load_calibration_points(args.collocated),
+                load_calibration_points(args.pd_disaggregated),
+                minimum_pd_prompt_tokens=args.minimum_pd_prompt_tokens,
+                minimum_savings_ms=args.minimum_savings_ms,
+                minimum_savings_ratio=args.minimum_savings_ratio,
+                pd_uncertainty_multiplier=args.pd_uncertainty_multiplier,
+                ewma_alpha=args.ewma_alpha,
+            )
+            CostRouterConfig.from_dict(profile)
+        except (OSError, ValueError) as exc:
+            parser.error(f"cannot fit router profile: {exc}")
+        output = json.dumps(profile, ensure_ascii=False, indent=2) + "\n"
+        if args.output:
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(output, encoding="utf-8")
+            print(args.output)
+        else:
+            print(output, end="")
+        return 0
 
     if args.command == "serve":
         from hydraserve.api import create_server

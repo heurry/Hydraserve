@@ -56,6 +56,14 @@ savings); the request completed successfully and its cold TTFT was 38.51 s.
 The observation is retained by the online length-bucket calibration while the
 service remains resident.
 
+The checked-in route profile was then regenerated with
+`python -m hydraserve fit-router-profile` from the concurrency-1 short and long
+outputs in this report. Each route supplied 10 successful samples across 9
+distinct lengths (26–9,000 tokens). The nonnegative quadratic fits achieved
+68.02 ms collocated RMSE and 25.67 ms partial-PD RMSE. These figures measure fit
+error on the small calibration set, not prediction error on an independent
+holdout.
+
 ## OOM found and fixed
 
 The first 9K adaptive run failed 0/2 on the decode worker with an attempted

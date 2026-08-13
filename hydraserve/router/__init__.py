@@ -16,13 +16,24 @@ from hydraserve.router.worker_registry import (
     WorkerSelection,
     WorkerTopology,
 )
+from hydraserve.router.calibration import (
+    CalibrationPoint,
+    CurveFitDiagnostics,
+    FittedLatencyCurve,
+    build_router_profile,
+    fit_latency_curve,
+    load_calibration_points,
+)
 
 __all__ = [
     "AdaptiveRouter",
+    "CalibrationPoint",
     "CostAwareRouter",
     "CostRouterConfig",
+    "CurveFitDiagnostics",
     "DecodeWorkerRegistry",
     "DecodeWorkerSnapshot",
+    "FittedLatencyCurve",
     "LatencyCurve",
     "Route",
     "RouteCostStats",
@@ -32,4 +43,7 @@ __all__ = [
     "WorkerScoringConfig",
     "WorkerSelection",
     "WorkerTopology",
+    "build_router_profile",
+    "fit_latency_curve",
+    "load_calibration_points",
 ]

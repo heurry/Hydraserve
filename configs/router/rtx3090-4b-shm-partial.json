@@ -1,19 +1,39 @@
 {
   "collocated": {
-    "fixed_ms": 30.0,
-    "linear_ms_per_token": 0.3,
-    "quadratic_ms_per_token2": 0.00032,
-    "decode_load_scale": 0.25
+    "fixed_ms": 21.802638304077778,
+    "linear_ms_per_token": 0.7440074621754906,
+    "quadratic_ms_per_token2": 0.00027073184949249845,
+    "decode_load_scale": 0.0
   },
   "pd_disaggregated": {
-    "fixed_ms": 250.0,
-    "linear_ms_per_token": 0.68,
-    "quadratic_ms_per_token2": 0.00045,
-    "decode_load_scale": 0.25
+    "fixed_ms": 252.91923530140815,
+    "linear_ms_per_token": 0.6801430442154653,
+    "quadratic_ms_per_token2": 0.00044979155493816183,
+    "decode_load_scale": 0.0
   },
   "minimum_pd_prompt_tokens": 256,
   "minimum_savings_ms": 5.0,
   "minimum_savings_ratio": 0.05,
   "pd_uncertainty_multiplier": 1.1,
-  "ewma_alpha": 0.2
+  "ewma_alpha": 0.2,
+  "metadata": {
+    "fit": {
+      "collocated": {
+        "samples": 10,
+        "unique_prompt_lengths": 9,
+        "minimum_prompt_tokens": 26,
+        "maximum_prompt_tokens": 9000,
+        "rmse_ms": 68.01857437892387
+      },
+      "pd_disaggregated": {
+        "samples": 10,
+        "unique_prompt_lengths": 9,
+        "minimum_prompt_tokens": 26,
+        "maximum_prompt_tokens": 9000,
+        "rmse_ms": 25.67264843629271
+      }
+    },
+    "latency_metric": "ttft_ms",
+    "recommended_input": "concurrency-1 warmed benchmark outputs"
+  }
 }

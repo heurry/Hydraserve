@@ -158,8 +158,16 @@ class CostRouterConfig:
         """
 
         return cls(
-            collocated=LatencyCurve(30.0, 0.30, 0.00032, 0.25),
-            pd_disaggregated=LatencyCurve(250.0, 0.68, 0.00045, 0.25),
+            collocated=LatencyCurve(
+                21.802638304077778,
+                0.7440074621754906,
+                0.00027073184949249845,
+            ),
+            pd_disaggregated=LatencyCurve(
+                252.91923530140815,
+                0.6801430442154653,
+                0.00044979155493816183,
+            ),
             minimum_pd_prompt_tokens=256,
             minimum_savings_ms=5.0,
             minimum_savings_ratio=0.05,
@@ -178,7 +186,9 @@ class CostRouterConfig:
             collocated = LatencyCurve(**payload["collocated"])
             pd_disaggregated = LatencyCurve(**payload["pd_disaggregated"])
             options = {
-                key: value for key, value in payload.items() if key not in expected
+                key: value
+                for key, value in payload.items()
+                if key not in expected and key != "metadata"
             }
             return cls(collocated, pd_disaggregated, **options)
         except TypeError as exc:

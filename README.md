@@ -167,6 +167,21 @@ JSON 分别提供 `collocated` / `pd_disaggregated` 的 fixed、linear、quadrat
 系数，以及最小绝对/相对收益和风险倍率。不同模型、传输后端或硬件应使用各自测量得到
 的 profile；固定 PD 实验仍使用 `--pd`，不会被 adaptive 路由覆盖。
 
+profile 不需要手工拟合。把相同模型/硬件/配置下、预热后的 concurrency-1 benchmark
+结果分别交给以下命令；输入必须覆盖至少三个不同 prompt 长度，失败请求会被排除，输出
+同时携带样本范围和 RMSE：
+
+```bash
+python -m hydraserve fit-router-profile \
+  --collocated benchmark_output/collocated-short.json benchmark_output/collocated-long.json \
+  --pd-disaggregated benchmark_output/pd-short.json benchmark_output/pd-long.json \
+  --output configs/router/my-profile.json
+```
+
+拟合器对 fixed/linear/quadratic 系数施加非负约束，避免噪声生成随长度下降或最终变为负数
+的延迟曲线。并发结果混入排队与 interference，不应作为基础 service-cost 曲线输入；
+它们属于下一层 SLO/externality 校准。
+
 1P+ND 使用一个 prefill worker 和多个各自持有 KV/GDN 容量的 decode worker：
 
 ```bash

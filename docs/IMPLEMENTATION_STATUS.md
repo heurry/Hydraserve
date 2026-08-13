@@ -236,3 +236,21 @@ Next implementation slice:
 1. automate multi-length/multi-concurrency calibration traces and curve fitting;
 2. separate mean service cost from SLO-tail externality under active decode load;
 3. add route-decision hysteresis and profile drift alarms.
+
+## 2026-08-14 — reproducible route-profile fitting
+
+Implemented:
+
+- a `fit-router-profile` CLI consuming native benchmark JSON outputs;
+- strict exclusion of failed requests and a three-distinct-length coverage gate;
+- numerically scaled, nonnegative quadratic least-squares fitting without an
+  external optimization backend;
+- fit metadata containing sample count, prompt range and RMSE;
+- direct loading of fitted profiles, including their audit metadata.
+
+The checked-in 4B/RTX-3090/SHM-PARTIAL profile was regenerated from 10
+collocated and 10 partial-PD concurrency-1 observations spanning 9 distinct
+lengths from 26 to 9,000 tokens. RMSE is 68.02 ms for collocated and 25.67 ms
+for partial PD. Concurrency traces are intentionally not folded into these
+service-cost curves because queueing and decode interference require a separate
+tail-latency model.
