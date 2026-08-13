@@ -69,12 +69,19 @@ class StateTransferDescriptor:
     first_token_id: int | None
     mode: TransferMode
     regions: tuple[RegionDescriptor, ...]
+    state_token_count: int | None = None
 
     def __post_init__(self) -> None:
         if self.request_id < 0 or self.prompt_length <= 0 or not self.model_name:
             raise ValueError("invalid request metadata")
         if not self.regions:
             raise ValueError("a transfer must contain at least one region")
+        if self.state_token_count is None:
+            object.__setattr__(self, "state_token_count", self.prompt_length)
+        if not 0 < self.state_token_count <= self.prompt_length:
+            raise ValueError("state_token_count must be in [1, prompt_length]")
+        if self.prompt_length - self.state_token_count > 1:
+            raise ValueError("only full or N-1 prompt state is supported")
         kv_regions = [r for r in self.regions if r.region_type is RegionType.FULL_ATTN_KV]
         if self.mode is TransferMode.PARTIAL_TRANSFER and kv_regions:
             raise ValueError("partial transfer cannot include full-attention KV")
@@ -90,6 +97,7 @@ class StateTransferDescriptor:
             "first_token_id": self.first_token_id,
             "mode": self.mode.value,
             "regions": [region.to_dict() for region in self.regions],
+            "state_token_count": self.state_token_count,
         }
 
     @classmethod
@@ -101,4 +109,5 @@ class StateTransferDescriptor:
             first_token_id=data.get("first_token_id"),
             mode=TransferMode(data["mode"]),
             regions=tuple(RegionDescriptor.from_dict(r) for r in data["regions"]),
+            state_token_count=data.get("state_token_count"),
         )

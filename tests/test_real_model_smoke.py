@@ -40,3 +40,4 @@ def test_real_qwen35_4b_single_token() -> None:
     assert logits.shape == (1, 1, runtime.config.vocab_size)
     assert torch.isfinite(logits).all()
     assert state.sequence_length == 1
+    assert state.keys == {}

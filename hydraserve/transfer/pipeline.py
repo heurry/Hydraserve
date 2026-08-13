@@ -40,6 +40,7 @@ class TransferPipeline:
         prompt_length: int,
         state: HybridStateBundle,
         first_token_id: int | None = None,
+        state_token_count: int | None = None,
     ) -> StateTransferDescriptor:
         mode = self.backend.transfer_mode
         recurrent = state.recurrent
@@ -90,6 +91,7 @@ class TransferPipeline:
             first_token_id=first_token_id,
             mode=mode,
             regions=tuple(regions),
+            state_token_count=state_token_count,
         )
         key = self._key(request_id)
         self.backend.send(f"{key}:descriptor", descriptor.to_dict(), self.dst_gpu)

@@ -359,8 +359,9 @@ class QwenTextRuntime:
         old_value = state.values.get(layer_index)
         all_key = key if old_key is None else torch.cat((old_key, key), dim=1)
         all_value = value if old_value is None else torch.cat((old_value, value), dim=1)
-        state.keys[layer_index] = all_key
-        state.values[layer_index] = all_value
+        if paged_cache is None:
+            state.keys[layer_index] = all_key
+            state.values[layer_index] = all_value
 
         if sequence > 1 and hidden.is_cuda and self.use_flash_attention and old_key is None:
             from hydraserve.kernels.flash_prefill import flash_attention_varlen

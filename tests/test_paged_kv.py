@@ -28,3 +28,6 @@ def test_paged_kv_write_and_batch_metadata(tiny_model, device: str) -> None:
     table, lengths = cache.batch_metadata((2, 1))
     assert lengths.tolist() == [3, 6]
     assert table[1, :2].tolist() == list(allocation.block_ids)
+    gathered_key, gathered_value = cache.read(1, layer)
+    torch.testing.assert_close(gathered_key[positions], key)
+    torch.testing.assert_close(gathered_value[positions], value)

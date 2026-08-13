@@ -6,6 +6,12 @@ from hydraserve.engine.continuous_batching import (
 )
 from hydraserve.engine.batch_executor import ContinuousBatchExecutor
 from hydraserve.engine.prefill_engine import PrefillEngine, PrefillOutput
+from hydraserve.engine.pd_worker import (
+    DecodePrepared,
+    DecodeWorker,
+    PrefillResult,
+    PrefillWorker,
+)
 from hydraserve.engine.scheduler import CentralScheduler, Request, RequestState
 
 __all__ = [
@@ -14,8 +20,12 @@ __all__ = [
     "ContinuousBatchExecutor",
     "DecodeBatch",
     "DecodeEngine",
+    "DecodePrepared",
+    "DecodeWorker",
     "InstalledRequest",
     "PrefillEngine",
+    "PrefillResult",
+    "PrefillWorker",
     "PrefillBatchItem",
     "PrefillOutput",
     "Request",

@@ -1,0 +1,107 @@
+"""Bridge between model-runtime state dictionaries and transfer regions."""
+
+from __future__ import annotations
+
+from hydraserve.cache.state_pool import LinearState
+from hydraserve.config import ModelConfig
+from hydraserve.model.runtime import RuntimeState
+from hydraserve.transfer.descriptor import StateTransferDescriptor
+from hydraserve.transfer.pipeline import HybridStateBundle
+from hydraserve.cache.kv_quantizer import Int4Tensor, dequantize_int4
+
+
+class RuntimeStateCodec:
+    @staticmethod
+    def extract(model: ModelConfig, state: RuntimeState) -> HybridStateBundle:
+        """Synchronously stage one request's GDN state as contiguous CPU FP32."""
+        import torch
+
+        missing_recurrent = set(model.linear_layer_indices) - state.recurrent.keys()
+        missing_convolution = set(model.linear_layer_indices) - state.convolution.keys()
+        if missing_recurrent or missing_convolution:
+            raise ValueError(
+                f"runtime state is incomplete: recurrent={sorted(missing_recurrent)}, "
+                f"conv={sorted(missing_convolution)}"
+            )
+        recurrent_layers = []
+        convolution_layers = []
+        for layer_index in model.linear_layer_indices:
+            recurrent = state.recurrent[layer_index]
+            convolution = state.convolution[layer_index]
+            if recurrent.shape != (1, *model.ssm_state_shape[1:]):
+                raise ValueError(f"unexpected recurrent shape at layer {layer_index}")
+            if convolution.shape != (1, *model.conv_state_shape[1:]):
+                raise ValueError(f"unexpected conv shape at layer {layer_index}")
+            recurrent_layers.append(recurrent[0].float())
+            convolution_layers.append(convolution[0].float())
+        recurrent_tensor = torch.stack(recurrent_layers).contiguous().cpu()
+        convolution_tensor = torch.stack(convolution_layers).contiguous().cpu()
+        return HybridStateBundle(
+            recurrent=LinearState(
+                recurrent_tensor.numpy(), convolution_tensor.numpy()
+            )
+        )
+
+    @staticmethod
+    def extract_kv(model: ModelConfig, paged_cache, request_id: int):
+        """Gather full-attention KV as ``[layers, 2, tokens, heads, dim]``."""
+        import torch
+
+        layers = []
+        for layer_index in model.full_attention_layer_indices:
+            key, value = paged_cache.read(request_id, layer_index)
+            layers.append(torch.stack((key, value), dim=0))
+        return torch.stack(layers, dim=0).float().cpu().numpy()
+
+    @staticmethod
+    def install_kv(model: ModelConfig, paged_cache, request_id: int, payload) -> None:
+        import numpy as np
+        import torch
+
+        values = dequantize_int4(payload) if isinstance(payload, Int4Tensor) else np.asarray(payload)
+        expected_prefix = (
+            model.num_full_attention_layers,
+            2,
+        )
+        if values.shape[:2] != expected_prefix or values.shape[3:] != (
+            model.num_kv_heads,
+            model.head_dim,
+        ):
+            raise ValueError(f"invalid transferred KV shape {values.shape}")
+        positions = torch.arange(values.shape[2], device=paged_cache.device)
+        for slot, layer_index in enumerate(model.full_attention_layer_indices):
+            key = torch.from_numpy(values[slot, 0]).to(
+                device=paged_cache.device, dtype=paged_cache.dtype
+            )
+            value = torch.from_numpy(values[slot, 1]).to(
+                device=paged_cache.device, dtype=paged_cache.dtype
+            )
+            paged_cache.write(request_id, layer_index, positions, key, value)
+
+    @staticmethod
+    def install(
+        model: ModelConfig,
+        descriptor: StateTransferDescriptor,
+        bundle: HybridStateBundle,
+        *,
+        device,
+    ) -> RuntimeState:
+        """Restore transferred CPU regions into per-layer GPU FP32 state."""
+        import torch
+
+        recurrent = bundle.recurrent
+        if recurrent.ssm_state.shape != model.ssm_state_shape:
+            raise ValueError("transferred recurrent state shape does not match the model")
+        if recurrent.conv_state.shape != model.conv_state_shape:
+            raise ValueError("transferred conv state shape does not match the model")
+        state = RuntimeState(sequence_length=descriptor.state_token_count)
+        recurrent_tensor = torch.from_numpy(recurrent.ssm_state).to(
+            device=device, dtype=torch.float32
+        )
+        convolution_tensor = torch.from_numpy(recurrent.conv_state).to(
+            device=device, dtype=torch.float32
+        )
+        for slot, layer_index in enumerate(model.linear_layer_indices):
+            state.recurrent[layer_index] = recurrent_tensor[slot : slot + 1].contiguous()
+            state.convolution[layer_index] = convolution_tensor[slot : slot + 1].contiguous()
+        return state

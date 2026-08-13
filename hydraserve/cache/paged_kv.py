@@ -79,6 +79,32 @@ class PagedKVCache:
         slot = self._layer_slot(layer_index)
         return self.key[slot], self.value[slot]
 
+    def read(self, request_id: int, layer_index: int):
+        """Gather one request's logical K/V sequence from physical pages."""
+        import torch
+
+        slot = self._layer_slot(layer_index)
+        allocation = self.block_manager.get(request_id)
+        if not allocation.block_ids:
+            empty = torch.empty(
+                0,
+                self.model.num_kv_heads,
+                self.model.head_dim,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            return empty, empty.clone()
+        physical = torch.tensor(
+            allocation.block_ids, device=self.device, dtype=torch.long
+        )
+        keys = self.key[slot, physical].reshape(
+            -1, self.model.num_kv_heads, self.model.head_dim
+        )[: allocation.num_tokens]
+        values = self.value[slot, physical].reshape(
+            -1, self.model.num_kv_heads, self.model.head_dim
+        )[: allocation.num_tokens]
+        return keys.contiguous(), values.contiguous()
+
     def batch_metadata(self, request_ids: Iterable[int]):
         import torch
 

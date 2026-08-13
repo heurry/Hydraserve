@@ -189,10 +189,10 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 
 | 组件 | GPU | 职责 | 代码状态 |
 |------|-----|------|---------|
-| CentralScheduler | CPU | 请求路由、传输协调 | 状态机与路由完成，PD worker 待接入 |
+| CentralScheduler | CPU | 请求路由、传输协调 | 状态机、路由、PD worker 纵切片完成 |
 | Chunked Prefill | GPU 0 | 长 prompt 分块 | 分块调度完成，历史 chunk attention 待接入 |
 | State Extractor | GPU 0 | 逐层提取 KV + 循环状态 | runtime state 已暴露，传输绑定待接入 |
-| TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM 完成，NVLink/P2P 待实现 |
+| TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM/P2P 实现；本机 P2P 不可用，未实测 |
 | TransferPipeline | GPU0->1..N | 层级别异步流水线 | 双状态协议完成，GPU 异步流水待实现 |
 | Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | 调度与 batched runtime executor 完成 |
 | KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 物理页、Triton scatter、block table 完成 |
@@ -445,7 +445,7 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 
 | 实验 | 优先级 | 依赖 |
 |------|--------|------|
-| PD 分离完整端到端（SHM Partial） | P0 | SHM 传输实现 |
+| PD 分离完整端到端（SHM Partial） | 已完成 | 4B 双进程、双 GPU 实测 |
 | B vs D crossover point | P1 | 引擎端到端 |
 | 层级别流水线传输隐藏 | P1 | P2P 或 NVLink |
 | 1P+3D 多目标路由 | P2 | 四卡 P2P 环境 |
@@ -459,6 +459,11 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | LongBench | 长文档问答 | 8K-128K |
 | WikiText-103 | PPL 验证 | 滑动窗口 |
 | GSM8K | 推理精度 | 短上下文 |
+
+本机数据目录为 `/mnt/nvme-data/datasets/benchmark`。当前加载器对 ShareGPT
+顶层大 JSON 数组做增量解析，对 HumanEval 按文件 magic 自动识别 gzip，LongBench
+直接读取 ZIP 成员，不复制解压数据。WikiText 的 raw tarball/CSV 是空文件，使用有效的
+`wikitext-103-test.jsonl`。
 
 ---
 
@@ -526,17 +531,17 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 0 | 环境搭建 + 模型加载 + 硬件实测 | 1 周 | 完成 |
 | 1 | 推理引擎 + Triton kernels | 2.5 周 | 4B 真实 GPU smoke + kernel 对照完成；9B/27B 待实跑 |
 | 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、协议完成；GPU state pool 待接入 worker |
-| 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM 完成，NVLink/P2P 待实现 |
-| 4 | PD 分离核心 + N-1 truncation | 2 周 | 协议纵切片完成，真实 GPU 双进程待接入 |
+| 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM/P2P + 层级协议完成；P2P 待可用硬件实测 |
+| 4 | PD 分离核心 + N-1 truncation | 2 周 | 4B 真实 GPU 双进程 SHM PARTIAL 完成 |
 | 5 | Continuous batching + chunked prefill | 2 周 | batched decode 完成；历史 chunk attention 待接入 |
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 路由和动态 config 完成；9B/27B runtime 待实跑 |
-| 7 | Benchmark + 对比实验 | 2 周 | 待使用新引擎重测 |
-| 8 | API + PD worker + SHM Partial 实测 | 1 周 | 待做 |
+| 7 | Benchmark + 对比实验 | 2 周 | 五类数据集流式加载完成；runner/指标待做 |
+| 8 | API + PD worker + SHM Partial 实测 | 1 周 | PD worker 与 SHM 实测完成；API 待做 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 用 HydraServe 引擎端到端跑通 PARTIAL_TRANSFER
-2. 实测 B vs D crossover point
+1. 完成 persistent serving loop 和 OpenAI-compatible streaming API
+2. 用本机数据集实测 B vs D crossover point
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
 
 ---

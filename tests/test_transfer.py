@@ -74,6 +74,22 @@ def test_partial_transfer_excludes_kv(tiny_model) -> None:
     assert received.recurrent.ssm_state.dtype == np.float32
 
 
+def test_descriptor_records_n_minus_one_state_boundary(tiny_model) -> None:
+    pipeline = TransferPipeline(
+        InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER)
+    )
+    descriptor = pipeline.send(
+        41,
+        tiny_model,
+        12,
+        HybridStateBundle(_state(tiny_model)),
+        first_token_id=8,
+        state_token_count=11,
+    )
+    received, _ = pipeline.receive(41)
+    assert descriptor.state_token_count == received.state_token_count == 11
+
+
 def test_quantized_transfer_packs_kv(tiny_model) -> None:
     backend = InMemoryTransferBackend(TransferMode.QUANTIZED_TRANSFER, bandwidth_gbps=14)
     pipeline = TransferPipeline(backend)

@@ -36,8 +36,29 @@ state uses all projected Q/K/V channels. The resulting FP32 state is 53.48 MB fo
 
 Next implementation slice:
 
-1. multi-process prefill/decode workers using the tested runtime;
-2. PARTIAL_TRANSFER state installation using real GPU state tensors;
-3. asynchronous per-layer transfer pipeline and CUDA P2P/NVLink backend;
-4. prefix cache and chunked-prefill history handling;
-5. OpenAI-compatible streaming API and benchmark harness.
+## 2026-08-13 — PD worker and benchmark-data slice
+
+Implemented:
+
+- runtime-state codec between per-layer GPU tensors and contiguous FP32 transfer regions;
+- N-1 GDN-state boundary, first-token seeding, and decode-side replay verification;
+- real two-process/two-GPU Qwen3.5-4B SHM PARTIAL_TRANSFER test;
+- full-attention KV gather/install for FULL and grouped-INT4 QUANTIZED modes;
+- capability-checked CUDA P2P backend with an explicit failure when peer access is absent;
+- manifest-first per-layer pipeline protocol (unit tested; not hardware validated here);
+- block-aligned full-attention radix prefix cache with reference-safe LRU eviction;
+- streaming adapters for GSM8K, gzip HumanEval, 673 MB ShareGPT JSON arrays,
+  WikiText-103 JSONL, and all LongBench members directly inside its ZIP.
+
+Validation on this host: 32 CPU tests pass; 62 CUDA/Triton tests pass with three
+intentional skips; the opt-in real two-GPU PD test passes. The two RTX 3090s are
+on a NODE topology and report no CUDA peer access, so the P2P implementation is
+not claimed as a real hardware result.
+
+Next implementation slice:
+
+1. persistent multi-process serving loop and worker supervision;
+2. OpenAI-compatible streaming API;
+3. tokenizer-aware benchmark workload generation and latency/throughput metrics;
+4. chunked-prefill history integration;
+5. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.

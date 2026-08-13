@@ -24,9 +24,16 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
 - 自写 Triton Paged Attention 和 Paged KV scatter；
 - 支持异构上下文长度的 Continuous Batching decode executor；
 - Qwen3.5-4B BF16 真实 32 层 prefill/decode GPU smoke。
+- 独立 prefill/decode worker、N-1 truncation 与首 token 一致性校验；
+- 真实双进程、双 GPU 的 SHM PARTIAL_TRANSFER 端到端链路；
+- FULL/INT4 QUANTIZED KV 安装路径与真实物理页读取；
+- CUDA P2P 后端及硬件能力检测（本机 NODE 拓扑无 peer access，自动回退 SHM）；
+- 完整块粒度的 full-attention prefix radix cache（不错误缓存 GDN 状态）；
+- ShareGPT、HumanEval、LongBench、WikiText-103、GSM8K 低内存数据适配器。
 
-多进程 PD serving loop、CUDA P2P/NVLink backend、prefix cache 和 API server
-尚未实现，接口已经为后续阶段留出。
+OpenAI-compatible API、持续运行的多进程 serving loop 和 benchmark 指标采集仍待实现。
+P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
+真实 P2P 实测；层级流水线也只完成协议和单测，不宣称已在 NVLink/P2P 上验证。
 
 ## 模型兼容性
 
@@ -65,6 +72,15 @@ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python -m pytest
 GPU kernel 测试必须在 CUDA 可见环境运行；FlashAttention 测试使用安装了
 `flash-attn` 的环境单独执行。
 
+检查本机基准数据（大文件均流式读取，LongBench 不解压）：
+
+```bash
+python -m hydraserve inspect-datasets /mnt/nvme-data/datasets/benchmark --limit 1
+```
+
+当前目录中 `wikitext-103-raw.tar.gz` 和 `wikitext-103-test.csv` 是 0 字节，
+加载器固定使用有效的 `wikitext-103-test.jsonl`。
+
 ## 代码结构
 
 ```text
@@ -75,7 +91,8 @@ hydraserve/
 ├── cache/                    # Paged KV、FP32 state pool、INT4 codec
 ├── transfer/                 # 描述符、后端、双状态 pipeline
 ├── engine/                   # chunked prefill、continuous batching、状态机
-└── router/                   # 自适应 PD 路由
+├── router/                   # 自适应 PD 路由
+└── benchmark/                # 流式数据集适配器
 ```
 
 设计目标、硬件数据和完整里程碑见 [`main.md`](main.md)。
