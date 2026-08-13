@@ -30,7 +30,13 @@ class PrefillWorker:
         self.pipeline = pipeline
         self.paged_cache = paged_cache
 
-    def process(self, request: Request, *, n_minus_one: bool = True) -> PrefillResult:
+    def process(
+        self,
+        request: Request,
+        *,
+        n_minus_one: bool = True,
+        chunk_size: int = 4096,
+    ) -> PrefillResult:
         import torch
 
         request.transition(RequestState.PREFILL_RUNNING)
@@ -47,8 +53,9 @@ class PrefillWorker:
             [request.token_ids[:split]], device=self.runtime.device, dtype=torch.long
         )
         with torch.inference_mode():
-            logits, state = self.runtime.forward(
+            logits, state = self.runtime.prefill(
                 prefix_ids,
+                chunk_size=chunk_size,
                 paged_cache=self.paged_cache,
                 request_id=request.request_id if self.paged_cache is not None else None,
             )

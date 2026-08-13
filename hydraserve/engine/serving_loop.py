@@ -292,9 +292,12 @@ class ContinuousGenerationLoop:
 class RuntimeGenerationBackend:
     """HydraServe runtime adapter; no external model-execution backend is used."""
 
-    def __init__(self, runtime, paged_cache) -> None:
+    def __init__(self, runtime, paged_cache, *, prefill_chunk_size: int = 4096) -> None:
+        if prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be positive")
         self.runtime = runtime
         self.paged_cache = paged_cache
+        self.prefill_chunk_size = prefill_chunk_size
         self.states: dict[int, object] = {}
 
     def prefill(self, request: ServingRequest) -> int:
@@ -306,8 +309,9 @@ class RuntimeGenerationBackend:
                 [request.token_ids], device=self.runtime.device, dtype=torch.long
             )
             with torch.inference_mode():
-                logits, state = self.runtime.forward(
+                logits, state = self.runtime.prefill(
                     input_ids,
+                    chunk_size=self.prefill_chunk_size,
                     paged_cache=self.paged_cache,
                     request_id=request.request_id,
                 )

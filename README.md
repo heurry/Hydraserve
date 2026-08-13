@@ -22,6 +22,8 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
 - FlashAttention varlen GQA prefill；
 - 自写 Triton RMSNorm、gated RMSNorm、causal conv、GDN recurrent rule；
 - 自写 Triton Paged Attention 和 Paged KV scatter；
+- chunked prefill 的物理页历史读取与 causal offset：首 chunk 可用 FlashAttention，
+  continuation chunk（或禁用 Flash 时）走自写 Triton Paged online-softmax；
 - 支持异构上下文长度的 Continuous Batching decode executor；
 - Qwen3.5-4B BF16 真实 32 层 prefill/decode GPU smoke。
 - 独立 prefill/decode worker、N-1 truncation 与首 token 一致性校验；
@@ -103,6 +105,10 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
 
 此模式中两个模型进程长期驻留：GPU0 做 prefill 并通过 SHM 传输 FP32 GDN 状态，
 GPU1 重算 full-attention KV 后进入 Continuous Batching decode。
+
+`--prefill-chunk-size` 控制 prompt 分块。Paged KV 会预留容量，但 attention 的逻辑
+长度只推进到当前已写入 token，不会读取未来未初始化页。最后一个单 token chunk 与
+多 token chunk 共用同一套 Paged 历史语义。
 
 当前采样器只支持 greedy `temperature=0`，API 只处理文本。运行本机 benchmark：
 

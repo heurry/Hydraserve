@@ -18,6 +18,7 @@ class PDWorkerConfig:
     cache_tokens: int = 65536
     block_size: int = 16
     use_flash_attention: bool = True
+    prefill_chunk_size: int = 4096
 
 
 def _request(request_id: int, token_ids, max_new_tokens: int, *, transferred: bool):
@@ -70,7 +71,11 @@ def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses)
                     command["max_new_tokens"],
                     transferred=False,
                 )
-                result = worker.process(request, n_minus_one=True)
+                result = worker.process(
+                    request,
+                    n_minus_one=True,
+                    chunk_size=config.prefill_chunk_size,
+                )
                 responses.put(
                     {
                         "op": "prefill",
@@ -217,7 +222,7 @@ class DisaggregatedGenerationBackend:
     ) -> None:
         if config.prefill_device == config.decode_device:
             raise ValueError("PD serving requires distinct prefill and decode devices")
-        if min(config.cache_tokens, config.block_size) <= 0:
+        if min(config.cache_tokens, config.block_size, config.prefill_chunk_size) <= 0:
             raise ValueError("cache limits must be positive")
         self.config = config
         self.operation_timeout = operation_timeout

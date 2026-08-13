@@ -533,15 +533,15 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、协议完成；GPU state pool 待接入 worker |
 | 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM/P2P + 层级协议完成；P2P 待可用硬件实测 |
 | 4 | PD 分离核心 + N-1 truncation | 2 周 | 4B 真实 GPU 双进程 SHM PARTIAL 完成 |
-| 5 | Continuous batching + chunked prefill | 2 周 | batched decode 完成；历史 chunk attention 待接入 |
+| 5 | Continuous batching + chunked prefill | 2 周 | 完成：batched decode + Paged 历史与 causal offset |
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 路由和动态 config 完成；9B/27B runtime 待实跑 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 接通 chunked-prefill 的跨 chunk full-attention 历史
-2. 用本机数据集实测 B vs D crossover point
+1. 用本机数据集实测 B vs D crossover point
+2. 实跑 9B/27B runtime
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
 
 ---

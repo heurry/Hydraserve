@@ -145,6 +145,30 @@ class QwenTextRuntime:
         logits = hidden.float() @ embedding.float().transpose(0, 1)
         return logits, state
 
+    def prefill(
+        self,
+        input_ids,
+        *,
+        chunk_size: int,
+        paged_cache=None,
+        request_id: int | None = None,
+    ):
+        """Process one prompt in state-carrying chunks and return final-chunk logits."""
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        if input_ids.ndim != 2 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must be a non-empty [batch, tokens] tensor")
+        state = RuntimeState()
+        logits = None
+        for start in range(0, input_ids.shape[1], chunk_size):
+            logits, state = self.forward(
+                input_ids[:, start : start + chunk_size],
+                state,
+                paged_cache=paged_cache,
+                request_id=request_id,
+            )
+        return logits, state
+
     def decode_batch(self, input_ids, states: list[RuntimeState], paged_cache, request_ids):
         """Advance heterogeneous requests by one token in a shared decode batch."""
         import torch
@@ -363,7 +387,13 @@ class QwenTextRuntime:
             state.keys[layer_index] = all_key
             state.values[layer_index] = all_value
 
-        if sequence > 1 and hidden.is_cuda and self.use_flash_attention and old_key is None:
+        if (
+            sequence > 1
+            and hidden.is_cuda
+            and self.use_flash_attention
+            and state.sequence_length == 0
+            and old_key is None
+        ):
             from hydraserve.kernels.flash_prefill import flash_attention_varlen
 
             packed_query = query.reshape(batch * sequence, config.num_attention_heads, config.head_dim)
@@ -375,12 +405,35 @@ class QwenTextRuntime:
             attention = flash_attention_varlen(
                 packed_query, packed_key, packed_value, cu, sequence
             ).reshape_as(query)
-        elif sequence == 1 and paged_cache is not None and hidden.is_cuda:
-            from hydraserve.kernels.paged_attention import paged_attention
+        elif sequence > 1 and paged_cache is not None:
+            from hydraserve.kernels.paged_attention import paged_prefill_attention
 
-            table, lengths = paged_cache.batch_metadata((request_id,))
+            table, _ = paged_cache.batch_metadata(
+                (request_id,),
+                logical_lengths=(state.sequence_length + sequence,),
+            )
             key_pages, value_pages = paged_cache.layer_cache(layer_index)
-            attention = paged_attention(query[:, 0], key_pages, value_pages, table, lengths)[:, None]
+            attention = paged_prefill_attention(
+                query,
+                key_pages,
+                value_pages,
+                table,
+                query_start=state.sequence_length,
+            )
+        elif sequence == 1 and paged_cache is not None:
+            from hydraserve.kernels.paged_attention import paged_prefill_attention
+
+            table, _ = paged_cache.batch_metadata(
+                (request_id,), logical_lengths=(state.sequence_length + 1,)
+            )
+            key_pages, value_pages = paged_cache.layer_cache(layer_index)
+            attention = paged_prefill_attention(
+                query,
+                key_pages,
+                value_pages,
+                table,
+                query_start=state.sequence_length,
+            )
         else:
             attention = causal_gqa_attention(
                 query, all_key, all_value, query_start=state.sequence_length

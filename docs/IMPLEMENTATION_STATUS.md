@@ -92,6 +92,25 @@ evidence only and correctly show no PD benefit at this scale.
 
 Next implementation slice:
 
-1. chunked-prefill history integration;
-2. full B-vs-D dataset experiments with warmup and controlled arrival traces;
-3. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.
+## 2026-08-13 — chunked Paged prefill history
+
+Implemented and numerically validated:
+
+- separate reserved KV capacity from the currently readable logical prefix;
+- carry GDN convolution/recurrent state across chunks;
+- attend continuation queries to all preceding physical KV pages with the correct
+  per-query causal length;
+- reuse HydraServe's Triton online-softmax Paged Attention across flattened
+  `[request, query-position]` programs, avoiding dense score matrices;
+- retain the permitted FlashAttention fast path for the first chunk when installed;
+- use HydraServe Paged prefill for all chunks when FlashAttention is disabled.
+
+Whole-prompt and chunked tiny-model results match numerically on CPU and CUDA.
+Qwen3.5-4B completed a real 16-token-chunk GSM8K smoke (2/2 requests), and the
+real persistent two-GPU PD regression still passes.
+
+Next implementation slice:
+
+1. full B-vs-D dataset experiments with warmup and controlled arrival traces;
+2. 9B/27B runtime validation;
+3. P2P/NVLink validation on capable hardware.

@@ -39,6 +39,7 @@ def main() -> int:
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
+    serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     serve_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="run local datasets through the HydraServe runtime"
@@ -56,6 +57,7 @@ def main() -> int:
     benchmark_parser.add_argument("--pd", action="store_true")
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
+    benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -81,6 +83,7 @@ def main() -> int:
                     cache_tokens=args.cache_tokens,
                     block_size=args.block_size,
                     use_flash_attention=not args.no_flash_attention,
+                    prefill_chunk_size=args.prefill_chunk_size,
                 )
             )
             model_name = backend.model_name
@@ -105,7 +108,9 @@ def main() -> int:
                 device=args.device,
                 dtype=torch.bfloat16,
             )
-            backend = RuntimeGenerationBackend(runtime, cache)
+            backend = RuntimeGenerationBackend(
+                runtime, cache, prefill_chunk_size=args.prefill_chunk_size
+            )
             model_name = runtime.config.name
         loop = ContinuousGenerationLoop(
             backend,
@@ -155,6 +160,7 @@ def main() -> int:
                     cache_tokens=args.cache_tokens,
                     block_size=args.block_size,
                     use_flash_attention=not args.no_flash_attention,
+                    prefill_chunk_size=args.prefill_chunk_size,
                 )
             )
         else:
@@ -178,7 +184,9 @@ def main() -> int:
                 device=args.device,
                 dtype=torch.bfloat16,
             )
-            backend = RuntimeGenerationBackend(runtime, cache)
+            backend = RuntimeGenerationBackend(
+                runtime, cache, prefill_chunk_size=args.prefill_chunk_size
+            )
         loop = ContinuousGenerationLoop(
             backend,
             max_batch_size=args.concurrency,

@@ -107,6 +107,38 @@ def test_whole_prefill_matches_token_by_token_decode(tiny_model) -> None:
         torch.testing.assert_close(state.convolution[layer], full_state.convolution[layer])
 
 
+def test_chunked_prefill_with_paged_history_matches_whole_prefill(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    token_ids = torch.tensor([[3, 7, 11, 5, 2]])
+    expected, expected_state = runtime.forward(token_ids)
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(8, block_size=2),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cache.allocate(17, token_ids.shape[1])
+    actual, actual_state = runtime.prefill(
+        token_ids,
+        chunk_size=2,
+        paged_cache=cache,
+        request_id=17,
+    )
+    torch.testing.assert_close(actual[:, -1], expected[:, -1], atol=2e-5, rtol=2e-5)
+    assert actual_state.sequence_length == expected_state.sequence_length
+    for layer in tiny_model.linear_layer_indices:
+        torch.testing.assert_close(
+            actual_state.recurrent[layer], expected_state.recurrent[layer]
+        )
+        torch.testing.assert_close(
+            actual_state.convolution[layer], expected_state.convolution[layer]
+        )
+    assert actual_state.keys == actual_state.values == {}
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_tiny_cuda_runtime_matches_cpu(tiny_model) -> None:
     cpu_weights = make_weights(tiny_model)

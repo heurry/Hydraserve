@@ -79,12 +79,15 @@ class PagedKVCache:
         slot = self._layer_slot(layer_index)
         return self.key[slot], self.value[slot]
 
-    def read(self, request_id: int, layer_index: int):
+    def read(self, request_id: int, layer_index: int, *, num_tokens: int | None = None):
         """Gather one request's logical K/V sequence from physical pages."""
         import torch
 
         slot = self._layer_slot(layer_index)
         allocation = self.block_manager.get(request_id)
+        length = allocation.num_tokens if num_tokens is None else num_tokens
+        if not 0 <= length <= allocation.num_tokens:
+            raise ValueError("read length exceeds the request allocation")
         if not allocation.block_ids:
             empty = torch.empty(
                 0,
@@ -99,13 +102,15 @@ class PagedKVCache:
         )
         keys = self.key[slot, physical].reshape(
             -1, self.model.num_kv_heads, self.model.head_dim
-        )[: allocation.num_tokens]
+        )[:length]
         values = self.value[slot, physical].reshape(
             -1, self.model.num_kv_heads, self.model.head_dim
-        )[: allocation.num_tokens]
+        )[:length]
         return keys.contiguous(), values.contiguous()
 
-    def batch_metadata(self, request_ids: Iterable[int]):
+    def batch_metadata(
+        self, request_ids: Iterable[int], *, logical_lengths: Iterable[int] | None = None
+    ):
         import torch
 
         allocations = [self.block_manager.get(request_id) for request_id in request_ids]
@@ -116,11 +121,22 @@ class PagedKVCache:
             (len(allocations), width), -1, device=self.device, dtype=torch.int32
         )
         lengths = torch.empty(len(allocations), device=self.device, dtype=torch.int32)
-        for row, allocation in enumerate(allocations):
+        lengths_override = (
+            [allocation.num_tokens for allocation in allocations]
+            if logical_lengths is None
+            else list(logical_lengths)
+        )
+        if len(lengths_override) != len(allocations):
+            raise ValueError("logical lengths must match request ids")
+        for row, (allocation, logical_length) in enumerate(
+            zip(allocations, lengths_override, strict=True)
+        ):
+            if not 0 <= logical_length <= allocation.num_tokens:
+                raise ValueError("logical length exceeds the request allocation")
             table[row, : len(allocation.block_ids)] = torch.tensor(
                 allocation.block_ids, device=self.device, dtype=torch.int32
             )
-            lengths[row] = allocation.num_tokens
+            lengths[row] = logical_length
         return table, lengths
 
     def _layer_slot(self, layer_index: int) -> int:

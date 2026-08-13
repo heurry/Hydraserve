@@ -56,6 +56,51 @@ def paged_attention(query, key_cache, value_cache, block_table, sequence_lengths
     return output
 
 
+def paged_prefill_attention(
+    query, key_cache, value_cache, block_table, *, query_start: int | object
+):
+    """Causal multi-token attention over paged history using the decode kernel.
+
+    Each ``[request, query_position]`` pair becomes one online-softmax program
+    with a different logical context length. This avoids materializing an
+    attention-score matrix for continuation chunks.
+    """
+    import torch
+
+    if query.ndim != 4 or block_table.ndim != 2:
+        raise ValueError("query/table must be [B,T,H,D] and [B,blocks]")
+    batch, tokens, query_heads, head_dim = query.shape
+    if block_table.shape[0] != batch:
+        raise ValueError("block table batch does not match query")
+    starts = torch.as_tensor(query_start, device=query.device, dtype=torch.int32)
+    if starts.ndim == 0:
+        starts = starts.expand(batch)
+    if starts.shape != (batch,) or bool((starts < 0).any()):
+        raise ValueError("query_start must be non-negative scalar or [batch]")
+    tables = (
+        block_table[:, None, :]
+        .expand(batch, tokens, block_table.shape[1])
+        .reshape(batch * tokens, block_table.shape[1])
+        .contiguous()
+    )
+    lengths = (
+        starts[:, None]
+        + torch.arange(1, tokens + 1, device=query.device, dtype=torch.int32)[None, :]
+    ).reshape(-1).contiguous()
+    flattened = query.reshape(batch * tokens, query_heads, head_dim).contiguous()
+    if query.is_cuda:
+        output = paged_attention(
+            flattened, key_cache, value_cache, tables, lengths
+        )
+    else:
+        from hydraserve.kernels.reference import paged_attention as reference_paged_attention
+
+        output = reference_paged_attention(
+            flattened, key_cache, value_cache, tables, lengths
+        )
+    return output.reshape_as(query)
+
+
 try:
     import triton
     import triton.language as tl
