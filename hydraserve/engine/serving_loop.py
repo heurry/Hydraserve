@@ -1119,8 +1119,14 @@ class RuntimeGenerationBackend:
         *,
         prefill_chunk_size: int = 4096,
         max_state_slots: int = 64,
+        max_decode_batch_size: int | None = None,
     ) -> None:
-        if min(prefill_chunk_size, max_state_slots) <= 0:
+        max_decode_batch_size = (
+            max_state_slots
+            if max_decode_batch_size is None
+            else max_decode_batch_size
+        )
+        if min(prefill_chunk_size, max_state_slots, max_decode_batch_size) <= 0:
             raise ValueError("prefill chunk size and state slots must be positive")
         from hydraserve.cache import GpuLinearStatePool, RequestStateSlotManager
 
@@ -1129,7 +1135,12 @@ class RuntimeGenerationBackend:
         self.prefill_chunk_size = prefill_chunk_size
         config = getattr(runtime, "config", None)
         self.state_pool = (
-            GpuLinearStatePool(max_state_slots, config, device=runtime.device)
+            GpuLinearStatePool(
+                max_state_slots,
+                config,
+                device=runtime.device,
+                workspace_capacity=min(max_state_slots, max_decode_batch_size),
+            )
             if config is not None and config.linear_layer_indices
             else None
         )
@@ -1412,7 +1423,10 @@ class RuntimeGenerationBackend:
         )
 
     def cache_stats(self) -> dict[str, int | float]:
-        return self.paged_cache.stats()
+        stats = self.paged_cache.stats()
+        if self.state_pool is not None:
+            stats.update(self.state_pool.stats())
+        return stats
 
     def audit_resources(self) -> dict[str, int | float]:
         stats = self.paged_cache.audit()
@@ -1421,6 +1435,7 @@ class RuntimeGenerationBackend:
             raise RuntimeError("recurrent-state slots and runtime states disagree")
         return {
             **stats,
+            **({} if self.state_pool is None else self.state_pool.stats()),
             "state_total_slots": state.total_slots,
             "state_allocated_slots": state.allocated_slots,
             "state_free_slots": state.free_slots,

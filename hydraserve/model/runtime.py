@@ -35,6 +35,7 @@ class RuntimeState:
     convolution: dict[int, Any] = field(default_factory=dict)
     keys: dict[int, Any] = field(default_factory=dict)
     values: dict[int, Any] = field(default_factory=dict)
+    _state_pool_ref: Any = field(default=None, repr=False, compare=False)
 
     def clone(self) -> "RuntimeState":
         def copied(values):
@@ -219,13 +220,30 @@ class QwenTextRuntime:
 
     def decode_batch(self, input_ids, states: list[RuntimeState], paged_cache, request_ids):
         """Advance heterogeneous requests by one token in a shared decode batch."""
-        import torch
+        from contextlib import nullcontext
 
         if input_ids.ndim != 2 or input_ids.shape[1] != 1:
             raise ValueError("decode_batch requires [batch, 1] token ids")
         batch = input_ids.shape[0]
         if len(states) != batch or len(request_ids) != batch:
             raise ValueError("states/request_ids must match the decode batch")
+        state_pool = self._shared_state_pool(states)
+        context = (
+            nullcontext(None)
+            if state_pool is None
+            else state_pool.batch(request_ids, states)
+        )
+        with context as pooled_batch:
+            return self._decode_batch_transaction(
+                input_ids, states, paged_cache, request_ids, pooled_batch
+            )
+
+    def _decode_batch_transaction(
+        self, input_ids, states, paged_cache, request_ids, pooled_batch
+    ):
+        import torch
+
+        batch = input_ids.shape[0]
         positions = torch.tensor(
             [[state.sequence_length] for state in states],
             device=self.device,
@@ -250,13 +268,26 @@ class QwenTextRuntime:
             if layer_kind is LayerKind.LINEAR_ATTENTION:
                 if any(layer_index not in state.recurrent for state in states):
                     raise RuntimeError(f"request lacks recurrent state for layer {layer_index}")
-                combined.recurrent[layer_index] = torch.cat(
-                    [state.recurrent[layer_index] for state in states], dim=0
-                ).contiguous()
-                combined.convolution[layer_index] = torch.cat(
-                    [state.convolution[layer_index] for state in states], dim=0
-                ).contiguous()
-                hidden = self._linear_attention(layer_index, hidden, combined)
+                convolution_output = None
+                if pooled_batch is None:
+                    combined.recurrent[layer_index] = torch.cat(
+                        [state.recurrent[layer_index] for state in states], dim=0
+                    ).contiguous()
+                    combined.convolution[layer_index] = torch.cat(
+                        [state.convolution[layer_index] for state in states], dim=0
+                    ).contiguous()
+                else:
+                    recurrent, convolution, convolution_output = pooled_batch.layer(
+                        layer_index
+                    )
+                    combined.recurrent[layer_index] = recurrent
+                    combined.convolution[layer_index] = convolution
+                hidden = self._linear_attention(
+                    layer_index,
+                    hidden,
+                    combined,
+                    convolution_output=convolution_output,
+                )
             else:
                 hidden = self._full_attention_batch_decode(
                     layer_index,
@@ -273,20 +304,41 @@ class QwenTextRuntime:
             hidden = residual + self._mlp(layer_index, hidden)
 
         hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
-        # Commit recurrent state only after every layer completed. Existing
-        # pool-backed views are updated in place; failures leave old state intact.
-        for layer_index, recurrent in combined.recurrent.items():
-            convolution = combined.convolution[layer_index]
-            for row, state in enumerate(states):
-                self._commit_state_tensor(
-                    state.recurrent, layer_index, recurrent[row : row + 1]
+        # The output projection is part of the transaction: do not publish state
+        # if it fails after all transformer layers have run.
+        logits = self._linear(hidden, self._output_weight()).float()
+        if pooled_batch is None:
+            for layer_index, recurrent in combined.recurrent.items():
+                convolution = combined.convolution[layer_index]
+                for row, state in enumerate(states):
+                    self._commit_state_tensor(
+                        state.recurrent, layer_index, recurrent[row : row + 1]
+                    )
+                    self._commit_state_tensor(
+                        state.convolution, layer_index, convolution[row : row + 1]
+                    )
+        else:
+            for layer_index, recurrent in combined.recurrent.items():
+                pooled_batch.set_layer_result(
+                    layer_index, recurrent, combined.convolution[layer_index]
                 )
-                self._commit_state_tensor(
-                    state.convolution, layer_index, convolution[row : row + 1]
-                )
+            pooled_batch.commit()
         for state in states:
             state.sequence_length += 1
-        return self._linear(hidden, self._output_weight()).float(), states
+        return logits, states
+
+    @staticmethod
+    def _shared_state_pool(states):
+        references = [getattr(state, "_state_pool_ref", None) for state in states]
+        if not any(references):
+            return None
+        if not all(references):
+            raise RuntimeError("decode batch mixes pooled and standalone recurrent states")
+        owners = [reference() for reference in references]
+        owner = owners[0]
+        if owner is None or any(candidate is not owner for candidate in owners):
+            raise RuntimeError("decode batch spans incompatible recurrent-state pools")
+        return owner
 
     @staticmethod
     def _commit_state_tensor(mapping, layer_index: int, value) -> None:
@@ -349,7 +401,14 @@ class QwenTextRuntime:
         )
         return self._linear(attention, self._weight(f"{prefix}.o_proj.weight"))
 
-    def _linear_attention(self, layer_index: int, hidden, state: RuntimeState):
+    def _linear_attention(
+        self,
+        layer_index: int,
+        hidden,
+        state: RuntimeState,
+        *,
+        convolution_output=None,
+    ):
         import torch
 
         config = self.config
@@ -372,7 +431,10 @@ class QwenTextRuntime:
             from hydraserve.kernels.gdn import causal_depthwise_conv as triton_causal_conv
 
             mixed, conv_state = triton_causal_conv(
-                mixed.contiguous(), conv_weight.contiguous(), conv_state.contiguous()
+                mixed.contiguous(),
+                conv_weight.contiguous(),
+                conv_state.contiguous(),
+                next_state=convolution_output,
             )
         else:
             mixed, conv_state = causal_depthwise_conv(mixed, conv_weight, conv_state)

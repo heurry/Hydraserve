@@ -183,6 +183,9 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
                 "high_watermark_blocks": 7,
                 "allocation_failures": 3,
                 "internal_fragmentation_tokens": 9,
+                "state_workspace_slots": 4,
+                "state_storage_bytes": 4096,
+                "state_workspace_bytes": 2048,
                 "prefix_cached_blocks": 2,
                 "prefix_referenced_blocks": 1,
                 "prefix_evictable_blocks": 1,
@@ -252,6 +255,11 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert 'hydraserve_route_cost_profile_drift{route="collocated"} 1' in metrics
         assert 'hydraserve_kv_cache_blocks{state="headroom"} 2' in metrics
         assert "hydraserve_kv_allocation_failures_total 3" in metrics
+        assert "hydraserve_recurrent_state_workspace_slots 4" in metrics
+        assert (
+            'hydraserve_recurrent_state_memory_bytes{kind="workspace"} 2048'
+            in metrics
+        )
         assert 'hydraserve_prefix_cache_events_total{event="hit"} 5' in metrics
     finally:
         server.shutdown()

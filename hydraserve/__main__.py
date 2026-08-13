@@ -200,6 +200,7 @@ def main() -> int:
                     cache_tokens_per_worker=args.cache_tokens,
                     block_size=args.block_size,
                     max_state_slots_per_worker=max_active_requests,
+                    max_decode_batch_size_per_worker=args.max_batch_size,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
@@ -219,6 +220,7 @@ def main() -> int:
                 use_flash_attention=not args.no_flash_attention,
                 prefill_chunk_size=args.prefill_chunk_size,
                 max_state_slots=max_active_requests,
+                max_decode_batch_size=args.max_batch_size,
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
@@ -281,6 +283,7 @@ def main() -> int:
                 cache,
                 prefill_chunk_size=args.prefill_chunk_size,
                 max_state_slots=max_active_requests,
+                max_decode_batch_size=args.max_batch_size,
             )
             model_name = runtime.config.name
         loop = ContinuousGenerationLoop(
@@ -364,6 +367,7 @@ def main() -> int:
                     cache_tokens_per_worker=args.cache_tokens,
                     block_size=args.block_size,
                     max_state_slots_per_worker=args.concurrency,
+                    max_decode_batch_size_per_worker=args.concurrency,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
@@ -382,6 +386,7 @@ def main() -> int:
                 use_flash_attention=not args.no_flash_attention,
                 prefill_chunk_size=args.prefill_chunk_size,
                 max_state_slots=args.concurrency,
+                max_decode_batch_size=args.concurrency,
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
@@ -443,6 +448,7 @@ def main() -> int:
                 cache,
                 prefill_chunk_size=args.prefill_chunk_size,
                 max_state_slots=args.concurrency,
+                max_decode_batch_size=args.concurrency,
             )
         loop = ContinuousGenerationLoop(
             backend,

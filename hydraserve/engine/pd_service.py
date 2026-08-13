@@ -38,6 +38,7 @@ class PDWorkerConfig:
     prefix_cache_blocks: int = 0
     prefix_cache_min_frequency: int = 2
     kv_headroom_blocks: int = 0
+    max_decode_batch_size: int = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -249,7 +250,12 @@ def _decode_worker(
         requests = {}
         states = {}
         state_pool = GpuLinearStatePool(
-            config.max_state_slots, runtime.config, device=device
+            config.max_state_slots,
+            runtime.config,
+            device=device,
+            workspace_capacity=min(
+                config.max_state_slots, config.max_decode_batch_size
+            ),
         )
         state_capacity = state_pool.capacity_snapshot().total_slots
         reservations = set()
@@ -261,7 +267,7 @@ def _decode_worker(
                 "kv_free_blocks": capacity.free_blocks,
                 "state_total_slots": state_capacity,
                 "state_free_slots": max(0, state_capacity - live),
-                "kv_cache_stats": cache.stats(),
+                "kv_cache_stats": {**cache.stats(), **state_pool.stats()},
             }
 
         responses.put(
@@ -563,6 +569,7 @@ class DisaggregatedGenerationBackend:
             config.block_size,
             config.prefill_chunk_size,
             config.max_state_slots,
+            config.max_decode_batch_size,
             config.prefix_cache_min_frequency,
         ) <= 0:
             raise ValueError("cache limits must be positive")

@@ -98,6 +98,18 @@ def test_cluster_config_rejects_duplicate_or_overlapping_devices() -> None:
         PDClusterConfig("model", ("cuda:0",))
 
 
+def test_cluster_config_propagates_decode_workspace_capacity() -> None:
+    config = PDClusterConfig(
+        "model",
+        ("cuda:1",),
+        max_state_slots_per_worker=12,
+        max_decode_batch_size_per_worker=5,
+    )
+    worker = config.worker_config(0)
+    assert worker.max_state_slots == 12
+    assert worker.max_decode_batch_size == 5
+
+
 def test_multi_worker_admission_uses_prefix_affinity_and_binds_route() -> None:
     backend = FakeMultiWorkerBackend(
         prefix_affinity=lambda request, worker_id: len(request.token_ids)

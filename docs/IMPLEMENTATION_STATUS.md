@@ -479,3 +479,27 @@ collocated run with four active requests ended with 16/16 pages free, zero state
 slots and references, 14 allocatable pages plus 2 headroom, and a four-page high
 watermark. A real two-GPU PD test ended with 8/8 remote decode pages free, 6
 allocatable plus 2 headroom, and no active allocation/reference leak.
+
+## 2026-08-14 — allocation-free transactional GDN-state batching
+
+Implemented and validated:
+
+- a memory-budgeted, fixed-size layer-major decode workspace for pooled FP32
+  recurrent and convolution states;
+- two batched gathers and two batched commits per decode step instead of
+  per-layer `cat` allocations and per-layer/per-request copies;
+- caller-provided Triton convolution next-state storage, so the kernel writes
+  directly into the transactional workspace;
+- state publication only after the final logits projection succeeds; exceptions
+  leave pooled state and sequence lengths unchanged for exact retry;
+- workspace size derived from the configured decode batch rather than the
+  potentially larger active-request limit, with actual capacity included in the
+  CUDA memory budget and exposed through health/Prometheus metrics.
+
+Using Qwen3.5-4B's actual 53.48 MB/request state shape on one RTX 3090, isolated
+state movement at batch 1/4/8/16 measured 0.2898/1.2135/2.2507/4.6958 ms versus
+0.5310/1.6869/3.0533/5.7370 ms previously (1.83x/1.39x/1.36x/1.22x). The old
+path created 52/204/408/816 MiB of peak transient allocations per step; the
+preallocated hot path created none. A real two-request Qwen3.5-4B batched decode
+matched sequential BF16 logits within 0.12 absolute tolerance and produced
+identical argmax tokens. Real preemption/recovery also passed unchanged.

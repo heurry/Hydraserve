@@ -31,6 +31,13 @@ def test_pd_worker_config_rejects_invalid_state_capacity_without_spawning() -> N
         DisaggregatedGenerationBackend(PDWorkerConfig("unused", max_state_slots=0))
 
 
+def test_pd_worker_config_rejects_invalid_decode_workspace_without_spawning() -> None:
+    with pytest.raises(ValueError, match="cache limits"):
+        DisaggregatedGenerationBackend(
+            PDWorkerConfig("unused", max_decode_batch_size=0)
+        )
+
+
 def test_pd_recovery_rpc_carries_exact_history_without_prefill_sampling() -> None:
     class FakePDBackend(DisaggregatedGenerationBackend):
         def __init__(self):

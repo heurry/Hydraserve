@@ -297,6 +297,10 @@ Paged KV metadata；页表和长度先在 host 打包，再以两个连续 tenso
 Attention 按 16-token tile 做 online softmax。RTX 3090 微基准中 batched scatter 相比逐请求
 launch 在 batch 1/8/32 分别为 1.15×/10.25×/42.79×；连续 metadata 构造相比旧逐行更新
 在 batch 1/8/32/64 分别为 1.52×/10.55×/19.00×/34.50×。这些是微基准，不代表端到端吞吐。
+GDN decode 使用按最大 decode batch 预分配的跨层事务工作区，以整批 gather/commit 代替
+每层 `cat` 和逐请求回拷；最终 logits 成功前不发布状态。真实 4B state shape 下 batch
+1/4/8/16 的搬运加速为 1.83×/1.39×/1.36×/1.22×，并消除每步
+52/204/408/816 MiB 临时分配。工作区槽数和 storage/workspace 字节数可在监控中查看。
 N−1 replay 使用 prefill 端已传输的首 token 作为权威输出；跨 GPU 浮点 argmax 漂移不会
 错误终止请求，但会计入 `hydraserve_pd_replay_mismatches_total` 供诊断。
 

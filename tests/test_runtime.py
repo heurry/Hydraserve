@@ -7,6 +7,7 @@ torch = pytest.importorskip("torch")
 from hydraserve.config import LayerKind
 from hydraserve.cache import (
     CostAwarePrefixPolicy,
+    GpuLinearStatePool,
     KVBlockManager,
     PagedKVCache,
     PrefixCache,
@@ -288,6 +289,13 @@ def test_heterogeneous_batched_decode_matches_sequential(tiny_model) -> None:
 
     batch_cache, batch_states = prepare()
     sequential_cache, sequential_states = prepare()
+    state_pool = GpuLinearStatePool(
+        2, tiny_model, device="cuda", workspace_capacity=2
+    )
+    batch_states = [
+        state_pool.install(request_id, state)
+        for request_id, state in zip((10, 11), batch_states, strict=True)
+    ]
     for cache in (batch_cache, sequential_cache):
         cache.reserve_append(10)
         cache.reserve_append(11)
@@ -334,3 +342,51 @@ def test_heterogeneous_batched_decode_matches_sequential(tiny_model) -> None:
         sequential.append(logits)
     expected = torch.cat(sequential, dim=0)
     torch.testing.assert_close(batched, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_pooled_decode_does_not_commit_when_output_projection_fails(
+    tiny_model, monkeypatch
+) -> None:
+    weights = make_weights(tiny_model, device="cuda", dtype=torch.bfloat16)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=True, use_flash_attention=False
+    )
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(16, block_size=4),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    cache.allocate(7, 3, reserve_tokens=4)
+    _, standalone = runtime.forward(
+        torch.tensor([[1, 2, 3]], device="cuda"),
+        paged_cache=cache,
+        request_id=7,
+    )
+    pool = GpuLinearStatePool(1, tiny_model, device="cuda", workspace_capacity=1)
+    state = pool.install(7, standalone)
+    recurrent_before = {
+        layer: value.clone() for layer, value in state.recurrent.items()
+    }
+    convolution_before = {
+        layer: value.clone() for layer, value in state.convolution.items()
+    }
+    cache.reserve_append(7)
+    bad_output = torch.empty(
+        tiny_model.vocab_size, tiny_model.hidden_size + 1,
+        device="cuda", dtype=torch.bfloat16,
+    )
+    monkeypatch.setattr(runtime, "_output_weight", lambda: bad_output)
+
+    with pytest.raises(RuntimeError):
+        runtime.decode_batch(
+            torch.tensor([[4]], device="cuda"), [state], cache, (7,)
+        )
+
+    assert state.sequence_length == 3
+    for layer in tiny_model.linear_layer_indices:
+        torch.testing.assert_close(state.recurrent[layer], recurrent_before[layer])
+        torch.testing.assert_close(
+            state.convolution[layer], convolution_before[layer]
+        )

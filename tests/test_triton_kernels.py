@@ -54,6 +54,23 @@ def test_triton_causal_conv_matches_reference(sequence: int) -> None:
     torch.testing.assert_close(actual_state, expected_state)
 
 
+def test_triton_causal_conv_reuses_supplied_next_state_buffer() -> None:
+    torch.manual_seed(13)
+    x = torch.randn(3, 1, 19, device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn(19, 4, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(3, 19, 4, device="cuda", dtype=torch.float32)
+    expected, expected_state = reference_causal_conv(x, weight, state)
+    destination = torch.empty_like(state)
+
+    actual, actual_state = triton_causal_conv(
+        x, weight, state, next_state=destination
+    )
+
+    assert actual_state.data_ptr() == destination.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(actual_state, expected_state)
+
+
 @pytest.mark.parametrize("sequence", [1, 3, 17])
 def test_triton_gdn_matches_reference(sequence: int) -> None:
     torch.manual_seed(2)

@@ -219,10 +219,61 @@ def test_gpu_linear_state_pool_uses_contiguous_reusable_views(tiny_model) -> Non
         (np.prod(tiny_model.ssm_state_shape) + np.prod(tiny_model.conv_state_shape))
         * 4
     )
+    assert pool.stats()["state_workspace_slots"] == 2
+    assert pool.stats()["state_storage_bytes"] == 2 * pool.bytes_per_slot
     pool.free(10)
     reused = pool.allocate(11)
     assert pool.slots.get(11) == 0
     assert not bool(reused.recurrent[first_layer].any())
+
+
+def test_gpu_state_batch_is_invisible_until_atomic_commit(tiny_model) -> None:
+    torch = pytest.importorskip("torch")
+    from hydraserve.model.runtime import RuntimeState
+
+    pool = GpuLinearStatePool(
+        3, tiny_model, device="cpu", workspace_capacity=2
+    )
+    states = {}
+    for request_id, fill in ((10, 1.0), (20, 2.0)):
+        source = RuntimeState(sequence_length=4)
+        for layer_index in tiny_model.linear_layer_indices:
+            source.recurrent[layer_index] = torch.full(
+                (1, *tiny_model.ssm_state_shape[1:]), fill
+            )
+            source.convolution[layer_index] = torch.full(
+                (1, *tiny_model.conv_state_shape[1:]), fill + 10
+            )
+        states[request_id] = pool.install(request_id, source)
+
+    recurrent_workspace = pool.ssm_workspace.data_ptr()
+    conv_workspace = pool.conv_workspace.data_ptr()
+    first_layer = tiny_model.linear_layer_indices[0]
+    with pool.batch((20, 10), (states[20], states[10])) as batch:
+        recurrent, convolution, next_convolution = batch.layer(first_layer)
+        assert recurrent[:, 0, 0, 0].tolist() == [2.0, 1.0]
+        assert convolution[:, 0, 0].tolist() == [12.0, 11.0]
+        recurrent.add_(20)
+        next_convolution.copy_(convolution + 30)
+        batch.set_layer_result(first_layer, recurrent, next_convolution)
+        assert states[20].recurrent[first_layer].flatten()[0] == 2
+        assert states[10].convolution[first_layer].flatten()[0] == 11
+        for layer_index in tiny_model.linear_layer_indices[1:]:
+            current_recurrent, current_conv, next_conv = batch.layer(layer_index)
+            next_conv.copy_(current_conv)
+            batch.set_layer_result(layer_index, current_recurrent, next_conv)
+        batch.commit()
+
+    assert states[20].recurrent[first_layer].flatten()[0] == 22
+    assert states[10].recurrent[first_layer].flatten()[0] == 21
+    assert states[20].convolution[first_layer].flatten()[0] == 42
+    assert states[10].convolution[first_layer].flatten()[0] == 41
+    with pool.batch((10,), (states[10],)):
+        assert pool.ssm_workspace.data_ptr() == recurrent_workspace
+        assert pool.conv_workspace.data_ptr() == conv_workspace
+    with pytest.raises(MemoryError, match="workspace"):
+        with pool.batch((10, 20, 30), (states[10], states[20], states[10])):
+            pass
 
 
 def test_int4_round_trip_and_actual_packing() -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 
-def causal_depthwise_conv(hidden, weight, state):
+def causal_depthwise_conv(hidden, weight, state, *, next_state=None):
     """Causal depthwise convolution with explicit fixed-length state."""
     import torch
 
@@ -16,7 +16,15 @@ def causal_depthwise_conv(hidden, weight, state):
     if weight.shape[0] != channels or state.shape != (batch, channels, weight.shape[1]):
         raise ValueError("invalid causal conv state or weight shape")
     output = torch.empty_like(hidden)
-    next_state = torch.empty_like(state)
+    if next_state is None:
+        next_state = torch.empty_like(state)
+    elif (
+        next_state.shape != state.shape
+        or next_state.device != state.device
+        or next_state.dtype != state.dtype
+        or not next_state.is_contiguous()
+    ):
+        raise ValueError("next convolution state must match the input state")
     _causal_conv_kernel[(batch, sequence, channels)](
         hidden,
         weight,

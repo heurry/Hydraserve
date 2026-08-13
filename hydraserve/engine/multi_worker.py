@@ -50,6 +50,7 @@ class PDClusterConfig:
     prefix_cache_min_frequency: int = 2
     kv_headroom_blocks: int = 0
     topologies: tuple[WorkerTopology, ...] = ()
+    max_decode_batch_size_per_worker: int = 64
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
@@ -62,6 +63,7 @@ class PDClusterConfig:
             self.cache_tokens_per_worker,
             self.block_size,
             self.max_state_slots_per_worker,
+            self.max_decode_batch_size_per_worker,
             self.prefill_chunk_size,
             self.prefix_cache_min_frequency,
         ) <= 0:
@@ -86,6 +88,10 @@ class PDClusterConfig:
             use_flash_attention=self.use_flash_attention,
             prefill_chunk_size=self.prefill_chunk_size,
             max_state_slots=self.max_state_slots_per_worker,
+            max_decode_batch_size=min(
+                self.max_state_slots_per_worker,
+                self.max_decode_batch_size_per_worker,
+            ),
             prefix_cache_blocks=self.prefix_cache_blocks,
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
             kv_headroom_blocks=self.kv_headroom_blocks,
@@ -227,6 +233,8 @@ class MultiWorkerGenerationBackend:
             if len(names) != 1:
                 raise RuntimeError("cluster workers loaded different models")
             self.model_name = names.pop()
+            for worker_id, result in enumerate(decode_ready):
+                self._update_worker_capacity(worker_id, result)
         except Exception:
             self.close(force=True)
             raise

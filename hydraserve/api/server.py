@@ -584,8 +584,21 @@ class _Handler(BaseHTTPRequestHandler):
         if cache_stats is not None:
             stats = cache_stats()
             if stats:
+                state_workspace_metrics = []
+                if "state_workspace_slots" in stats:
+                    state_workspace_metrics = [
+                        "# TYPE hydraserve_recurrent_state_workspace_slots gauge",
+                        "hydraserve_recurrent_state_workspace_slots "
+                        f"{stats['state_workspace_slots']}",
+                        "# TYPE hydraserve_recurrent_state_memory_bytes gauge",
+                        'hydraserve_recurrent_state_memory_bytes{kind="storage"} '
+                        f"{stats.get('state_storage_bytes', 0)}",
+                        'hydraserve_recurrent_state_memory_bytes{kind="workspace"} '
+                        f"{stats.get('state_workspace_bytes', 0)}",
+                    ]
                 lines.extend(
                     [
+                        *state_workspace_metrics,
                         "# TYPE hydraserve_kv_cache_blocks gauge",
                         *(
                             f'hydraserve_kv_cache_blocks{{state="{state}"}} '
