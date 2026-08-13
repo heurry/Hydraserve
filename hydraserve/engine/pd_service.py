@@ -323,6 +323,7 @@ def _decode_worker(
                         request,
                         timeout=command.get("timeout"),
                         preallocated=request_id in reservations,
+                        chunk_size=config.prefill_chunk_size,
                     )
                     requests[request_id] = request
                     states[request_id] = state_pool.install(

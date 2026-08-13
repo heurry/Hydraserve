@@ -36,7 +36,9 @@ def test_partial_pd_workers_recompute_kv_and_restore_gdn(tiny_model) -> None:
         device="cpu",
         dtype=torch.float32,
     )
-    prepared = DecodeWorker(decode_runtime, pipeline, cache).receive_and_prepare(request)
+    prepared = DecodeWorker(decode_runtime, pipeline, cache).receive_and_prepare(
+        request, chunk_size=2
+    )
     assert request.state is RequestState.READY
     assert request.generated_token_ids == [prefill.first_token_id]
     assert prepared.state.sequence_length == len(request.token_ids)

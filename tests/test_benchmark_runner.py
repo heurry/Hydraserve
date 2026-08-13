@@ -47,6 +47,7 @@ def test_benchmark_collects_concurrent_latency_and_throughput() -> None:
     assert set(summary.ttft_ms) == {"p50", "p95", "p99"}
     assert set(summary.tpot_ms) == {"p50", "p95", "p99"}
     assert summary.output_token_throughput > 0
+    assert summary.route_counts == {"collocated": 5}
     assert summary.warmup_requests == 1
     assert summary.to_dict()["results"][0]["sample_id"] == "1"
     assert backend.live == set()
@@ -69,6 +70,7 @@ def test_benchmark_records_request_error() -> None:
     assert summary.failed == 1
     assert summary.ttft_ms == {}
     assert summary.results[0].error == "cannot prefill"
+    assert summary.route_counts == {}
 
 
 def test_fixed_and_seeded_poisson_arrival_configuration() -> None:

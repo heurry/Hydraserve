@@ -22,6 +22,9 @@ class RequestMetrics:
     latency_ms: float
     finish_reason: str
     error: str | None = None
+    route: str | None = None
+    route_reason: str | None = None
+    worker_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +41,7 @@ class BenchmarkSummary:
     ttft_ms: dict[str, float]
     tpot_ms: dict[str, float]
     latency_ms: dict[str, float]
+    route_counts: dict[str, int]
     results: tuple[RequestMetrics, ...]
 
     def to_dict(self) -> dict:
@@ -54,6 +58,7 @@ class BenchmarkSummary:
             "ttft_ms": self.ttft_ms,
             "tpot_ms": self.tpot_ms,
             "latency_ms": self.latency_ms,
+            "route_counts": self.route_counts,
             "results": [asdict(result) for result in self.results],
         }
 
@@ -131,6 +136,7 @@ def run_benchmark(
         completion_tokens = 0
         finish_reason = "error"
         error = None
+        handle = None
         try:
             handle = generation_loop.submit(token_ids, max_new_tokens)
             for event in handle:
@@ -159,6 +165,9 @@ def run_benchmark(
             latency_ms,
             finish_reason,
             error,
+            None if handle is None else (handle.request.route or "collocated"),
+            None if handle is None else handle.request.route_reason,
+            None if handle is None else handle.request.worker_id,
         )
 
     offsets: list[float] = []
@@ -190,6 +199,10 @@ def run_benchmark(
     results = tuple(result for result in ordered_results if result is not None)
     succeeded = tuple(result for result in results if result.error is None)
     divisor = wall_time if wall_time > 0 else float("inf")
+    route_counts: dict[str, int] = {}
+    for result in succeeded:
+        route = result.route or "unknown"
+        route_counts[route] = route_counts.get(route, 0) + 1
     return BenchmarkSummary(
         requests=len(results),
         succeeded=len(succeeded),
@@ -207,5 +220,6 @@ def run_benchmark(
             result.tpot_ms for result in succeeded if result.tpot_ms is not None
         ),
         latency_ms=_percentiles(result.latency_ms for result in succeeded),
+        route_counts=route_counts,
         results=results,
     )

@@ -186,3 +186,28 @@ KV scatter measured 1.15x/10.25x/42.79x over per-request launches at batch
 128/512/2048 at B=4, QH=16, D=128. These are kernel microbenchmarks, not
 end-to-end service claims. N>1 decode workers and CUDA P2P remain unvalidated on
 this two-GPU, no-peer-access host.
+
+## 2026-08-14 — long-context and serving stress validation
+
+Implemented and validated:
+
+- decode-side `PARTIAL_TRANSFER` KV recomputation now uses bounded chunked
+  prefill instead of materializing a complete long-prompt forward;
+- benchmark records the actual route, route reason and decode worker binding;
+- concurrent submit/cancel stress and repeated service lifecycle tests;
+- a real two-GPU 9,000-token LongBench regression, with HydraServe Paged
+  Attention enabled for every chunk, completed 2/2 after the memory fix.
+
+The same 9K workload measured 28.65 s collocated TTFT P50 and 42.81 s partial-PD
+TTFT P50. This is an important negative result: the current static 8K routing
+threshold is not suitable for SHM partial transfer because decode-side KV
+recomputation duplicates substantial work. Detailed commands, short-prompt
+throughput, and percentile tables are in
+[`BENCHMARK_2026-08-14.md`](BENCHMARK_2026-08-14.md).
+
+Next implementation slice:
+
+1. replace static route thresholds with calibrated transfer/recompute/load cost;
+2. add online latency observations and conservative fallback when calibration is
+   unavailable;
+3. validate route decisions under mixed prompt lengths and decode pressure.

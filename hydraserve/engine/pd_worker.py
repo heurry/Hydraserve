@@ -115,11 +115,14 @@ class DecodeWorker:
         *,
         timeout: float | None = None,
         preallocated: bool = False,
+        chunk_size: int = 4096,
     ) -> DecodePrepared:
         import torch
 
         if request.state is not RequestState.TRANSFER_PENDING:
             raise RuntimeError("request is not awaiting a PD transfer")
+        if chunk_size <= 0:
+            raise ValueError("decode recompute chunk size must be positive")
         try:
             total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
             if preallocated:
@@ -141,8 +144,9 @@ class DecodeWorker:
             )
             if descriptor.mode is TransferMode.PARTIAL_TRANSFER:
                 with torch.inference_mode():
-                    self.runtime.forward(
+                    self.runtime.prefill(
                         token_ids,
+                        chunk_size=chunk_size,
                         paged_cache=self.paged_cache,
                         request_id=request.request_id,
                     )

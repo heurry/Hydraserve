@@ -199,6 +199,10 @@ crossover 或吞吐结论。
 runner 支持 `--warmup` 排除首次 kernel 编译，并支持 `burst`、固定速率和 seeded
 Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让 GPU1 继续
 推进已有 decode；GPU1 安装新请求的重算阶段仍需与 decode 串行。
+benchmark 结果会记录每个请求的实际 route、route reason 和 worker binding，并汇总
+route counts。2026-08-14 的短 prompt 矩阵与 9K LongBench 实测见
+[`docs/BENCHMARK_2026-08-14.md`](docs/BENCHMARK_2026-08-14.md)：在本机 SHM
+PARTIAL 模式下，静态 8K 阈值会错误偏向 PD，后续路由必须纳入 KV 重算与传输成本。
 运行时 decode 采用事务式状态检查点：整批失败会先回滚逻辑 KV 长度和 GDN 状态，再
 二分重试隔离单请求故障。1P+ND 后端按 worker 汇总部分结果，因此一个 decode worker
 失败不会丢弃其他 worker 已成功生成的 token。
