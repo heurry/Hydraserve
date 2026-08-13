@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import multiprocessing as mp
 from queue import Empty
-from threading import Lock
+from threading import Lock, RLock
 from uuid import uuid4
 
 from hydraserve.engine.serving_loop import (
@@ -13,6 +13,7 @@ from hydraserve.engine.serving_loop import (
     BackendCapacity,
     ServingRequest,
 )
+from hydraserve.router import AdaptiveRouter, Route, RouteDecision, RouteReason
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,15 +28,20 @@ class PDWorkerConfig:
     max_state_slots: int = 64
 
 
-def _request(request_id: int, token_ids, max_new_tokens: int, *, transferred: bool):
+def _request(
+    request_id: int,
+    token_ids,
+    max_new_tokens: int,
+    *,
+    transferred: bool,
+    route: Route = Route.PD_DISAGGREGATED,
+):
     from hydraserve.engine.scheduler import Request, RequestState
-    from hydraserve.router import Route
-
     request = Request(
         request_id,
         tuple(token_ids),
         max_new_tokens,
-        Route.PD_DISAGGREGATED,
+        route,
     )
     if transferred:
         request.transition(RequestState.PREFILL_RUNNING)
@@ -111,6 +117,7 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
 
         from hydraserve.cache import KVBlockManager, PagedKVCache
         from hydraserve.engine.pd_worker import DecodeWorker
+        from hydraserve.engine.scheduler import RequestState
         from hydraserve.model.runtime import QwenTextRuntime
         from hydraserve.transfer import SharedMemoryTransferBackend, TransferPipeline
 
@@ -238,10 +245,42 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
                             "token_id": prepared.first_token_id,
                         }
                     )
+                elif operation == "collocated_prepare":
+                    request_id = command["request_id"]
+                    if request_id not in reservations:
+                        raise RuntimeError("collocated prefill requires a KV reservation")
+                    request = _request(
+                        request_id,
+                        command["token_ids"],
+                        command["max_new_tokens"],
+                        transferred=False,
+                        route=Route.COLLOCATED,
+                    )
+                    request.transition(RequestState.PREFILL_RUNNING)
+                    input_ids = torch.tensor(
+                        [request.token_ids], device=device, dtype=torch.long
+                    )
+                    with torch.inference_mode():
+                        logits, state = runtime.prefill(
+                            input_ids,
+                            chunk_size=config.prefill_chunk_size,
+                            paged_cache=cache,
+                            request_id=request_id,
+                        )
+                    token_id = int(logits[0, -1].argmax())
+                    request.generated_token_ids.append(token_id)
+                    requests[request_id] = request
+                    states[request_id] = state
+                    responses.put(
+                        {
+                            "op": "collocated_prepare",
+                            "request_id": request_id,
+                            "token_id": token_id,
+                        }
+                    )
                 elif operation == "decode":
                     request_ids = tuple(command["request_ids"])
-                    for request_id in request_ids:
-                        cache.reserve_append(request_id)
+                    cache.block_manager.grow_many(request_ids, additional_tokens=1)
                     input_ids = torch.tensor(
                         [requests[request_id].generated_token_ids[-1] for request_id in request_ids],
                         device=device,
@@ -270,8 +309,9 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
                 else:
                     raise ValueError(f"unknown decode-worker operation {operation!r}")
             except Exception as exc:
-                if operation == "prepare":
+                if operation in {"prepare", "collocated_prepare"}:
                     reservations.discard(command.get("request_id"))
+                    cache.free(command.get("request_id"))
                 responses.put(
                     {
                         "op": "error",
@@ -344,6 +384,11 @@ class DisaggregatedGenerationBackend:
             raise
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
+        return self._reserve_decode(request)
+
+    def _reserve_decode(
+        self, request: ServingRequest, *, force_rpc: bool = False
+    ) -> AdmissionDecision:
         total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
         required_blocks = (total_tokens + self.config.block_size - 1) // self.config.block_size
         command = {
@@ -353,7 +398,7 @@ class DisaggregatedGenerationBackend:
             "max_new_tokens": request.max_new_tokens,
         }
         with self._decode_lock:
-            if request.request_id in self._admitted_requests:
+            if request.request_id in self._admitted_requests and not force_rpc:
                 return AdmissionDecision.accept()
             self._decode_commands.put(command)
             result = self._get(self._decode_responses, self.operation_timeout)
@@ -374,6 +419,9 @@ class DisaggregatedGenerationBackend:
         decision = self.admit(request)
         if not decision.admitted:
             raise MemoryError(decision.reason or "request cannot be admitted")
+        return self._prefill_pd(request)
+
+    def _prefill_pd(self, request: ServingRequest) -> int:
         command = {
             "op": "prefill",
             "request_id": request.request_id,
@@ -396,6 +444,19 @@ class DisaggregatedGenerationBackend:
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         return int(prepared["token_id"])
+
+    def _prefill_collocated(self, request: ServingRequest) -> int:
+        command = {
+            "op": "collocated_prepare",
+            "request_id": request.request_id,
+            "token_ids": request.token_ids,
+            "max_new_tokens": request.max_new_tokens,
+        }
+        with self._decode_lock:
+            self._decode_commands.put(command)
+            result = self._get(self._decode_responses, self.operation_timeout)
+        self._check(result, "collocated_prepare", request.request_id)
+        return int(result["token_id"])
 
     def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
         request_ids = tuple(request.request_id for request in requests)
@@ -466,3 +527,115 @@ class DisaggregatedGenerationBackend:
             )
         if request_id is not None and result.get("request_id") != request_id:
             raise RuntimeError("PD worker returned a different request")
+
+
+@dataclass(frozen=True, slots=True)
+class RoutingStats:
+    collocated: int
+    pd_disaggregated: int
+    pd_failures: int
+    prefill_healthy: bool
+
+
+class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
+    """Route each request between collocated and PD execution.
+
+    Both routes use HydraServe's resident decode worker and the same KV/state
+    admission transaction. The route is immutable once admitted. An ambiguous
+    PD timeout fails that request and quarantines the prefill route; only later
+    requests safely degrade to collocated execution.
+    """
+
+    def __init__(
+        self,
+        config: PDWorkerConfig,
+        *,
+        router: AdaptiveRouter | None = None,
+        startup_timeout: float = 180.0,
+        operation_timeout: float = 600.0,
+    ) -> None:
+        self.router = router or AdaptiveRouter()
+        self._route_decisions: dict[int, RouteDecision] = {}
+        self._route_lock = RLock()
+        self._collocated_count = 0
+        self._pd_count = 0
+        self._pd_failures = 0
+        self._prefill_healthy = True
+        super().__init__(
+            config,
+            startup_timeout=startup_timeout,
+            operation_timeout=operation_timeout,
+        )
+
+    def admit(self, request: ServingRequest) -> AdmissionDecision:
+        with self._route_lock:
+            if request.request_id in self._route_decisions:
+                return super().admit(request)
+        capacity = self.capacity()
+        with self._route_lock:
+            prefill_healthy = self._prefill_healthy
+        if prefill_healthy:
+            decision = self.router.decide(
+                len(request.token_ids),
+                capacity.decode_load,
+                capacity.has_request_slot,
+            )
+        else:
+            decision = RouteDecision(
+                route=Route.COLLOCATED,
+                reason=RouteReason.PREFILL_UNAVAILABLE,
+                prompt_tokens=len(request.token_ids),
+                decode_load=capacity.decode_load,
+                decode_has_slot=capacity.has_request_slot,
+            )
+        admitted = super().admit(request)
+        if admitted.admitted:
+            with self._route_lock:
+                bound = self._route_decisions.setdefault(request.request_id, decision)
+                request.route = bound.route.value
+                request.route_reason = bound.reason.value
+        return admitted
+
+    def prefill(self, request: ServingRequest) -> int:
+        admitted = self.admit(request)
+        if not admitted.admitted:
+            raise MemoryError(admitted.reason or "request cannot be admitted")
+        decision = self.route_for(request.request_id)
+        if decision.route is Route.COLLOCATED:
+            token_id = self._prefill_collocated(request)
+            with self._route_lock:
+                self._collocated_count += 1
+            return token_id
+        try:
+            token_id = self._prefill_pd(request)
+        except TimeoutError:
+            with self._route_lock:
+                self._pd_failures += 1
+                self._prefill_healthy = False
+            raise
+        with self._route_lock:
+            self._pd_count += 1
+        return token_id
+
+    def route_for(self, request_id: int) -> RouteDecision:
+        with self._route_lock:
+            try:
+                return self._route_decisions[request_id]
+            except KeyError as exc:
+                raise KeyError(f"request {request_id} has no bound route") from exc
+
+    def release(self, request_id: int) -> None:
+        try:
+            super().release(request_id)
+        finally:
+            with self._route_lock:
+                self._route_decisions.pop(request_id, None)
+
+    def routing_stats(self) -> RoutingStats:
+        with self._route_lock:
+            return RoutingStats(
+                collocated=self._collocated_count,
+                pd_disaggregated=self._pd_count,
+                pd_failures=self._pd_failures,
+                prefill_healthy=self._prefill_healthy,
+            )

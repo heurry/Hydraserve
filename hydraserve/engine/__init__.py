@@ -23,10 +23,16 @@ from hydraserve.engine.serving_loop import (
     RuntimeGenerationBackend,
     ServingRequest,
 )
-from hydraserve.engine.pd_service import DisaggregatedGenerationBackend, PDWorkerConfig
+from hydraserve.engine.pd_service import (
+    AdaptiveGenerationBackend,
+    DisaggregatedGenerationBackend,
+    PDWorkerConfig,
+    RoutingStats,
+)
 
 __all__ = [
     "AdmissionDecision",
+    "AdaptiveGenerationBackend",
     "BackendCapacity",
     "CentralScheduler",
     "ContinuousBatchScheduler",
@@ -51,4 +57,5 @@ __all__ = [
     "ServingRequest",
     "DisaggregatedGenerationBackend",
     "PDWorkerConfig",
+    "RoutingStats",
 ]

@@ -32,7 +32,21 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         if self.path == "/health":
-            self._json(200, {"status": "ok"})
+            payload: dict[str, Any] = {"status": "ok"}
+            capacity = getattr(self.hydra.generation_loop.backend, "capacity", None)
+            if capacity is not None:
+                snapshot = capacity()
+                payload["capacity"] = {
+                    "kv_total_blocks": snapshot.kv_total_blocks,
+                    "kv_free_blocks": snapshot.kv_free_blocks,
+                    "state_total_slots": snapshot.state_total_slots,
+                    "state_free_slots": snapshot.state_free_slots,
+                    "decode_load": snapshot.decode_load,
+                }
+            self._json(200, payload)
+            return
+        if self.path == "/metrics":
+            self._metrics()
             return
         if self.path == "/v1/models":
             self._json(
@@ -209,6 +223,52 @@ class _Handler(BaseHTTPRequestHandler):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _metrics(self) -> None:
+        loop = self.hydra.generation_loop
+        backend = loop.backend
+        lines = [
+            "# TYPE hydraserve_admission_pending_requests gauge",
+            f"hydraserve_admission_pending_requests {loop.pending_count}",
+            "# TYPE hydraserve_admission_pending_tokens gauge",
+            f"hydraserve_admission_pending_tokens {loop.pending_tokens}",
+        ]
+        capacity = getattr(backend, "capacity", None)
+        if capacity is not None:
+            snapshot = capacity()
+            lines.extend(
+                [
+                    "# TYPE hydraserve_kv_blocks gauge",
+                    f'hydraserve_kv_blocks{{state="total"}} {snapshot.kv_total_blocks}',
+                    f'hydraserve_kv_blocks{{state="free"}} {snapshot.kv_free_blocks}',
+                    "# TYPE hydraserve_recurrent_state_slots gauge",
+                    f'hydraserve_recurrent_state_slots{{state="total"}} {snapshot.state_total_slots}',
+                    f'hydraserve_recurrent_state_slots{{state="free"}} {snapshot.state_free_slots}',
+                    "# TYPE hydraserve_decode_load gauge",
+                    f"hydraserve_decode_load {snapshot.decode_load}",
+                ]
+            )
+        routing_stats = getattr(backend, "routing_stats", None)
+        if routing_stats is not None:
+            stats = routing_stats()
+            lines.extend(
+                [
+                    "# TYPE hydraserve_routed_requests_total counter",
+                    f'hydraserve_routed_requests_total{{route="collocated"}} {stats.collocated}',
+                    f'hydraserve_routed_requests_total{{route="pd_disaggregated"}} {stats.pd_disaggregated}',
+                    "# TYPE hydraserve_pd_failures_total counter",
+                    f"hydraserve_pd_failures_total {stats.pd_failures}",
+                    "# TYPE hydraserve_prefill_worker_healthy gauge",
+                    f"hydraserve_prefill_worker_healthy {1 if stats.prefill_healthy else 0}",
+                ]
+            )
+        body = ("\n".join(lines) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()

@@ -9,6 +9,25 @@ class Route(str, Enum):
     PD_DISAGGREGATED = "pd_disaggregated"
 
 
+class RouteReason(str, Enum):
+    SHORT_PROMPT = "short_prompt"
+    MEDIUM_PROMPT = "medium_prompt"
+    LONG_PROMPT_PD = "long_prompt_pd"
+    FORCED_LONG_PROMPT = "forced_long_prompt"
+    DECODE_SATURATED = "decode_saturated"
+    NO_DECODE_SLOT = "no_decode_slot"
+    PREFILL_UNAVAILABLE = "prefill_unavailable"
+
+
+@dataclass(frozen=True, slots=True)
+class RouteDecision:
+    route: Route
+    reason: RouteReason
+    prompt_tokens: int
+    decode_load: float
+    decode_has_slot: bool
+
+
 @dataclass(frozen=True, slots=True)
 class RouterConfig:
     short_prompt_tokens: int = 2_048
@@ -28,18 +47,37 @@ class AdaptiveRouter:
         self.config = config or RouterConfig()
 
     def route(self, prompt_tokens: int, decode_load: float, decode_has_slot: bool = True) -> Route:
+        return self.decide(prompt_tokens, decode_load, decode_has_slot).route
+
+    def decide(
+        self,
+        prompt_tokens: int,
+        decode_load: float,
+        decode_has_slot: bool = True,
+    ) -> RouteDecision:
         if prompt_tokens <= 0:
             raise ValueError("prompt_tokens must be positive")
         if not 0 <= decode_load <= 1:
             raise ValueError("decode_load must be in [0, 1]")
         if prompt_tokens >= self.config.force_pd_tokens:
-            return Route.PD_DISAGGREGATED
-        if prompt_tokens < self.config.short_prompt_tokens:
-            return Route.COLLOCATED
-        if (
+            route, reason = Route.PD_DISAGGREGATED, RouteReason.FORCED_LONG_PROMPT
+        elif prompt_tokens < self.config.short_prompt_tokens:
+            route, reason = Route.COLLOCATED, RouteReason.SHORT_PROMPT
+        elif not decode_has_slot:
+            route, reason = Route.COLLOCATED, RouteReason.NO_DECODE_SLOT
+        elif (
             prompt_tokens >= self.config.long_prompt_tokens
-            and decode_has_slot
             and decode_load < self.config.decode_load_limit
         ):
-            return Route.PD_DISAGGREGATED
-        return Route.COLLOCATED
+            route, reason = Route.PD_DISAGGREGATED, RouteReason.LONG_PROMPT_PD
+        elif prompt_tokens >= self.config.long_prompt_tokens:
+            route, reason = Route.COLLOCATED, RouteReason.DECODE_SATURATED
+        else:
+            route, reason = Route.COLLOCATED, RouteReason.MEDIUM_PROMPT
+        return RouteDecision(
+            route=route,
+            reason=reason,
+            prompt_tokens=prompt_tokens,
+            decode_load=decode_load,
+            decode_has_slot=decode_has_slot,
+        )

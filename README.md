@@ -43,15 +43,17 @@ Prefill–Decode 分离推理引擎。当前主线按 [`main.md`](main.md) 从�
 当前还包括驻留式 Continuous Batching 生成循环、直接读取 `tokenizer.json` 的文本
 tokenizer、OpenAI-compatible completions/chat/SSE API，以及 TTFT/TPOT/P50/P95/P99
 benchmark runner。HTTP 和 benchmark CLI 可在单 GPU collocated 与双进程双 GPU
-PARTIAL PD 间切换。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
+PARTIAL PD 间切换，也支持同一常驻双 GPU 服务对每个请求动态选择 collocated 或 PD。
+短请求直接在 decode worker 完成 prefill，长请求由 prefill worker 生成 GDN 状态后转交
+decode worker；两条路径共享相同的 KV/GDN 准入与 continuous decode 生命周期。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
 真实 P2P 实测；层级流水线也只完成协议和单测，不宣称已在 NVLink/P2P 上验证。
 
 服务入口具有有界 admission queue（请求数与 token 双上限）。临时 KV/state 容量不足
 会保持排队，单请求永久超过 worker 容量会单独失败，入口过载返回 HTTP 429。统一的
 KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
 
-这里的“已实现”仍不等于整个系统已经达到生产完成态。逐请求 Collocated/PD 混合路由、
-1P+ND、Prefix Cache 与真实执行路径的复用集成、完整抢占重算、故障恢复、压力与长稳验证
+这里的“已实现”仍不等于整个系统已经达到生产完成态。1P+ND、Prefix Cache 与真实执行
+路径的复用集成、完整抢占重算、worker 自动恢复、压力与长稳验证
 仍在生产化路线中。
 
 ## 模型兼容性
@@ -132,6 +134,18 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
 此模式中两个模型进程长期驻留：GPU0 做 prefill 并通过 SHM 传输 FP32 GDN 状态，
 GPU1 重算 full-attention KV 后进入 Continuous Batching decode。
 
+逐请求自适应模式：
+
+```bash
+python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  --adaptive --device cuda:0 --decode-device cuda:1 --port 8000
+```
+
+路由在 admission 成功时绑定，依据 prompt 长度和统一 KV/GDN 容量快照决策，执行中不
+改变归属。RPC 超时属于结果未知：当前请求失败并隔离 prefill 路径，后续请求安全降级到
+collocated，不对同一请求进行可能重复执行的盲重试。`/health` 暴露容量，`/metrics`
+输出 Prometheus 文本格式的队列、KV、state slot、路由和 worker 健康指标。
+
 `--prefill-chunk-size` 控制 prompt 分块。Paged KV 会预留容量，但 attention 的逻辑
 长度只推进到当前已写入 token，不会读取未来未初始化页。最后一个单 token chunk 与
 多 token chunk 共用同一套 Paged 历史语义。
@@ -146,7 +160,8 @@ python -m hydraserve benchmark \
   --output benchmark_output/gsm8k.json
 ```
 
-在相同命令后增加 `--pd --decode-device cuda:1` 即可按同一指标口径跑 PD。两请求
+在相同命令后增加 `--pd --decode-device cuda:1` 可跑固定 PD，使用 `--adaptive` 可跑
+逐请求混合路由。两请求
 冷启动烟测已打通 collocated 与 PD；这种短 prompt 小样本中 PD 更慢，不能作为
 crossover 或吞吐结论。
 

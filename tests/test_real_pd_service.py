@@ -7,10 +7,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from hydraserve.engine import (
+    AdaptiveGenerationBackend,
     ContinuousGenerationLoop,
     DisaggregatedGenerationBackend,
     PDWorkerConfig,
 )
+from hydraserve.router import AdaptiveRouter, Route, RouterConfig
 
 
 pytestmark = [
@@ -43,3 +45,35 @@ def test_persistent_real_two_gpu_pd_generation() -> None:
     assert [event.token_id for event in second_events[:-1]]
     assert first_events[-1].finish_reason == "length"
     assert second_events[-1].finish_reason == "length"
+
+
+def test_real_adaptive_service_executes_both_routes() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = AdaptiveGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            use_flash_attention=False,
+        ),
+        router=AdaptiveRouter(
+            RouterConfig(
+                short_prompt_tokens=4,
+                long_prompt_tokens=8,
+                force_pd_tokens=16,
+            )
+        ),
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    short = loop.submit([1, 42, 17], max_new_tokens=2)
+    long = loop.submit([1, 12, 23, 4, 5, 6, 7, 8, 9, 10], max_new_tokens=2)
+    short_events = list(short)
+    long_events = list(long)
+    assert short.request.route == Route.COLLOCATED.value
+    assert long.request.route == Route.PD_DISAGGREGATED.value
+    stats = backend.routing_stats()
+    loop.close()
+    assert short_events[-1].finish_reason == "length"
+    assert long_events[-1].finish_reason == "length"
+    assert stats.collocated == 1
+    assert stats.pd_disaggregated == 1

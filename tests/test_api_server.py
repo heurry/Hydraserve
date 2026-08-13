@@ -138,3 +138,39 @@ def test_overload_returns_http_429() -> None:
         server.shutdown()
         server.server_close()
         thread.join(3)
+
+
+def test_health_and_prometheus_metrics_expose_capacity() -> None:
+    from hydraserve.engine import BackendCapacity
+
+    class CapacityBackend(FakeBackend):
+        def capacity(self):
+            return BackendCapacity(10, 7, 4, 3)
+
+    loop = ContinuousGenerationLoop(CapacityBackend())
+    try:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            generation_loop=loop,
+            tokenizer=FakeTokenizer(),
+            model_name="tiny",
+        )
+    except PermissionError:
+        pytest.skip("sandbox forbids loopback sockets")
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urlopen(base + "/health", timeout=3) as response:
+            health = json.loads(response.read())
+        assert health["capacity"]["kv_free_blocks"] == 7
+        with urlopen(base + "/metrics", timeout=3) as response:
+            metrics = response.read().decode()
+        assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
+        assert "hydraserve_admission_pending_requests 0" in metrics
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)
+        loop.close()

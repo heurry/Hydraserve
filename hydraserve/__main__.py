@@ -35,7 +35,9 @@ def main() -> int:
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--device", default="cuda:0")
     serve_parser.add_argument("--decode-device", default="cuda:1")
-    serve_parser.add_argument("--pd", action="store_true")
+    serve_mode = serve_parser.add_mutually_exclusive_group()
+    serve_mode.add_argument("--pd", action="store_true")
+    serve_mode.add_argument("--adaptive", action="store_true")
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
@@ -62,7 +64,9 @@ def main() -> int:
     benchmark_parser.add_argument("--seed", type=int, default=0)
     benchmark_parser.add_argument("--device", default="cuda:0")
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
-    benchmark_parser.add_argument("--pd", action="store_true")
+    benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
+    benchmark_mode.add_argument("--pd", action="store_true")
+    benchmark_mode.add_argument("--adaptive", action="store_true")
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
@@ -73,6 +77,7 @@ def main() -> int:
     if args.command == "serve":
         from hydraserve.api import create_server
         from hydraserve.engine import (
+            AdaptiveGenerationBackend,
             ContinuousGenerationLoop,
             DisaggregatedGenerationBackend,
             PDWorkerConfig,
@@ -88,8 +93,13 @@ def main() -> int:
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
         tokenizer = QwenTokenizer(args.model)
-        if args.pd:
-            backend = DisaggregatedGenerationBackend(
+        if args.pd or args.adaptive:
+            backend_type = (
+                AdaptiveGenerationBackend
+                if args.adaptive
+                else DisaggregatedGenerationBackend
+            )
+            backend = backend_type(
                 PDWorkerConfig(
                     str(args.model),
                     prefill_device=args.device,
@@ -145,7 +155,9 @@ def main() -> int:
             model_name=model_name,
         )
         print(
-            f"HydraServe model={model_name} mode={'pd' if args.pd else 'collocated'} listening on "
+            f"HydraServe model={model_name} "
+            f"mode={'adaptive' if args.adaptive else ('pd' if args.pd else 'collocated')} "
+            "listening on "
             f"http://{args.host}:{args.port}"
         )
         try:
@@ -162,6 +174,7 @@ def main() -> int:
 
         from hydraserve.benchmark import iter_dataset, run_benchmark
         from hydraserve.engine import (
+            AdaptiveGenerationBackend,
             ContinuousGenerationLoop,
             DisaggregatedGenerationBackend,
             PDWorkerConfig,
@@ -171,8 +184,13 @@ def main() -> int:
         if args.cache_tokens <= 0 or args.block_size <= 0:
             parser.error("cache limits must be positive")
         tokenizer = QwenTokenizer(args.model)
-        if args.pd:
-            backend = DisaggregatedGenerationBackend(
+        if args.pd or args.adaptive:
+            backend_type = (
+                AdaptiveGenerationBackend
+                if args.adaptive
+                else DisaggregatedGenerationBackend
+            )
+            backend = backend_type(
                 PDWorkerConfig(
                     str(args.model),
                     prefill_device=args.device,

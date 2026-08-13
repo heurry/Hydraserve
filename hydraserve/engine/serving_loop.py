@@ -85,6 +85,8 @@ class ServingRequest:
     max_new_tokens: int
     generated_token_ids: list[int] = field(default_factory=list)
     cancelled: Event = field(default_factory=Event)
+    route: str | None = None
+    route_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
