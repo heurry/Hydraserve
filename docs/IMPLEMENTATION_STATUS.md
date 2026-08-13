@@ -410,6 +410,29 @@ The real two-GPU test terminated an idle Qwen3.5-4B prefill process. The very
 first subsequent long request completed on the collocated route, and after one
 successful background restart the same prompt returned to PD and completed.
 
+## 2026-08-14 — supervised legacy adaptive and fixed-PD workers
+
+The original one-prefill/one-decode backends now use the same production
+failure semantics instead of blocking on raw multiprocessing queue reads:
+
+- prefill and decode RPCs poll child liveness every 100 ms and have independent
+  bounded restart state machines, fresh queues, model-name handshakes, health,
+  and restart counters;
+- single-decode adaptive mode fails closed to collocated during prefill reload
+  and restores PD only after a successful handshake;
+- fixed `--pd` cannot change route, so admission remains deferred while prefill
+  reloads and proceeds without exposing a transient worker failure to clients;
+- decode loss invalidates all local reservations, suspends affected active
+  requests, and exact-replays them after the replacement decode process is ready;
+- API health/metrics consume the same decode and prefill recovery interfaces for
+  legacy and 1P+ND backends.
+
+Real Qwen3.5-4B validation killed both legacy adaptive subprocesses in one
+service lifetime: prefill failover/restoration passed, then an active seeded
+sampling request survived decode loss and matched an uninterrupted baseline.
+A separate fixed-PD test killed prefill before submission; the request aged in
+admission during model reload and then completed normally on PD.
+
 ## 2026-08-14 — KV safety headroom, audit, and observability
 
 Implemented and validated:

@@ -253,6 +253,12 @@ adaptive 1P+ND coordinator 也会在 admission 和 RPC 等待期间检查 prefil
 PD 路由。`/health` 和 `/metrics` 暴露 decode/prefill 健康、恢复中状态、重启计数及 fault
 suspension 数。
 
+相同的进程监督现在也覆盖旧的单 decode-device `--adaptive` 和静态 `--pd`。adaptive
+在 prefill 重载期间保持 collocated 服务；静态 PD 没有可用的 collocated 路由语义，因此
+请求保留在 admission 队列并在 prefill 恢复后继续。decode 进程丢失时，两者都会使旧
+KV/GDN 所有权失效，并对已经输出 token 的请求执行精确 replay，而不是等待完整 RPC
+timeout 或直接丢失请求。
+
 `--max-active-requests` 控制已准入并持有 KV/GDN 容量的请求数，必须不小于
 `--max-batch-size`；后者只控制单步真正进入 decode kernel 的数量。两者分离后，调度器
 可以在一个 batch 之外保留等待 decode 的活跃请求，并做 priority-weighted fairness、

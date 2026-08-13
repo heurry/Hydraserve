@@ -27,6 +27,9 @@ class FakeAdaptiveBackend(AdaptiveGenerationBackend):
     def capacity(self):
         return self.snapshot
 
+    def _prefill_available(self):
+        return self._prefill_healthy
+
     def _reserve_decode(self, request, *, force_rpc=False):
         self.calls.append(("reserve", request.request_id, force_rpc))
         return AdmissionDecision.accept()

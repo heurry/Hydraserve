@@ -469,6 +469,131 @@ def test_real_prefill_worker_crash_fails_closed_then_restores_pd_route() -> None
     assert stats.healthy
 
 
+def test_real_legacy_adaptive_workers_restart_and_active_decode_recovers() -> None:
+    from threading import Event
+    from time import monotonic, sleep
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    inner = AdaptiveGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            max_state_slots=1,
+            use_flash_attention=False,
+        ),
+        router=AdaptiveRouter(
+            RouterConfig(short_prompt_tokens=4, long_prompt_tokens=8)
+        ),
+        startup_timeout=180,
+        operation_timeout=30,
+        worker_restart_backoff_s=0.1,
+    )
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class ControlledBackend:
+        supports_async_prefill = True
+
+        def __init__(self):
+            self.arm_decode_crash = False
+            self.blocked = False
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def decode(self, requests):
+            if self.arm_decode_crash and not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(30)
+            return inner.decode(requests)
+
+    controlled = ControlledBackend()
+    loop = ContinuousGenerationLoop(controlled, max_batch_size=1)
+    long_prompt = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    sampling = SamplingParams(temperature=0.8, top_k=16, seed=271828)
+    try:
+        dead_prefill = inner._prefill
+        dead_prefill.terminate()
+        dead_prefill.join(10)
+        degraded = loop.submit(long_prompt, max_new_tokens=1)
+        assert list(degraded)[-1].finish_reason == "length"
+        assert degraded.request.route == Route.COLLOCATED.value
+
+        deadline = monotonic() + 180
+        while not inner.prefill_recovery_stats().healthy:
+            assert monotonic() < deadline, "legacy prefill worker did not recover"
+            sleep(0.1)
+        restored = loop.submit(long_prompt, max_new_tokens=1)
+        assert list(restored)[-1].finish_reason == "length"
+        assert restored.request.route == Route.PD_DISAGGREGATED.value
+
+        controlled.arm_decode_crash = True
+        active = loop.submit(
+            [1, 42, 17, 9], max_new_tokens=3, sampling_params=sampling
+        )
+        first = active.get(timeout=120)
+        assert decode_entered.wait(120)
+        dead_decode = inner._decode
+        dead_decode.terminate()
+        dead_decode.join(10)
+        allow_decode.set()
+        recovered_events = [first, *list(active)]
+        controlled.arm_decode_crash = False
+        reference_events = list(
+            loop.submit(
+                [1, 42, 17, 9],
+                max_new_tokens=3,
+                sampling_params=sampling,
+            )
+        )
+        decode_stats = inner.recovery_stats()
+    finally:
+        loop.close(timeout=120)
+
+    recovered = [event.token_id for event in recovered_events if event.token_id is not None]
+    reference = [event.token_id for event in reference_events if event.token_id is not None]
+    assert recovered == reference
+    assert recovered_events[-1].finish_reason == "length"
+    assert loop.fault_suspensions_total == 1
+    assert loop.recoveries_total == 1
+    assert decode_stats.successes == 1
+    assert decode_stats.healthy_workers == 1
+
+
+def test_real_fixed_pd_waits_for_prefill_restart_without_failing_request() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = DisaggregatedGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            max_state_slots=1,
+            use_flash_attention=False,
+        ),
+        startup_timeout=180,
+        operation_timeout=30,
+        worker_restart_backoff_s=0.1,
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    try:
+        dead_prefill = backend._prefill
+        dead_prefill.terminate()
+        dead_prefill.join(10)
+        handle = loop.submit([1, 42, 17, 9], max_new_tokens=2)
+        events = list(handle)
+        stats = backend.prefill_recovery_stats()
+    finally:
+        loop.close(timeout=120)
+
+    assert events[-1].finish_reason == "length"
+    assert handle.request.route == Route.PD_DISAGGREGATED.value
+    assert handle.request.admission_age > 0
+    assert stats.healthy
+    assert stats.successes == 1
+
+
 def test_real_decode_worker_retains_and_reuses_full_attention_prefix_pages() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required")

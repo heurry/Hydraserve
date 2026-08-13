@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import multiprocessing as mp
 from pathlib import Path
 from queue import Empty
-from threading import Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from time import monotonic
 from uuid import uuid4
 
@@ -43,6 +43,29 @@ class PDWorkerConfig:
 @dataclass(frozen=True, slots=True)
 class TransferValidationStats:
     replay_mismatches: int
+
+
+class PDWorkerUnavailableError(RuntimeError):
+    """A fixed-PD worker exited or timed out during an RPC."""
+
+
+@dataclass(frozen=True, slots=True)
+class PDDecodeRecoveryStats:
+    total_workers: int
+    healthy_workers: int
+    attempts: int
+    successes: int
+    failures: int
+    recovering_workers: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PDPrefillRecoveryStats:
+    healthy: bool
+    attempts: int
+    successes: int
+    failures: int
+    recovering: bool
 
 
 def _request(
@@ -530,6 +553,8 @@ class DisaggregatedGenerationBackend:
         *,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        max_worker_restarts: int = 3,
+        worker_restart_backoff_s: float = 0.5,
     ) -> None:
         if config.prefill_device == config.decode_device:
             raise ValueError("PD serving requires distinct prefill and decode devices")
@@ -543,6 +568,8 @@ class DisaggregatedGenerationBackend:
             raise ValueError("cache limits must be positive")
         if config.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
+        if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
+            raise ValueError("invalid worker recovery policy")
         total_blocks = (
             config.cache_tokens + config.block_size - 1
         ) // config.block_size
@@ -551,25 +578,36 @@ class DisaggregatedGenerationBackend:
         self.config = config
         self.supports_async_prefill = True
         self.operation_timeout = operation_timeout
+        self.startup_timeout = startup_timeout
+        self.max_worker_restarts = max_worker_restarts
+        self.worker_restart_backoff_s = worker_restart_backoff_s
         self.namespace = f"hydraserve-pd-{uuid4().hex}"
-        context = mp.get_context("spawn")
-        self._prefill_commands = context.Queue()
-        self._prefill_responses = context.Queue()
-        self._decode_commands = context.Queue()
-        self._decode_responses = context.Queue()
-        self._prefill = context.Process(
-            target=_prefill_worker,
-            args=(config, self.namespace, self._prefill_commands, self._prefill_responses),
-            name="hydraserve-prefill",
-        )
-        self._decode = context.Process(
-            target=_decode_worker,
-            args=(config, self.namespace, self._decode_commands, self._decode_responses),
-            name="hydraserve-decode",
-        )
+        self._context = mp.get_context("spawn")
+        self._prefill_commands = self._context.Queue()
+        self._prefill_responses = self._context.Queue()
+        self._decode_commands = self._context.Queue()
+        self._decode_responses = self._context.Queue()
+        self._prefill = self._new_prefill_process()
+        self._decode = self._new_decode_process()
         self._closed = False
+        self._prefill_lock = Lock()
         self._decode_lock = Lock()
+        self._recovery_lock = RLock()
+        self._recovery_stop = Event()
+        self._prefill_healthy = True
+        self._decode_healthy = True
+        self._prefill_recovering = False
+        self._decode_recovering = False
+        self._prefill_recovery_thread: Thread | None = None
+        self._decode_recovery_thread: Thread | None = None
+        self._prefill_recovery_attempts = 0
+        self._prefill_recovery_successes = 0
+        self._prefill_recovery_failures = 0
+        self._decode_recovery_attempts = 0
+        self._decode_recovery_successes = 0
+        self._decode_recovery_failures = 0
         self._admitted_requests: set[int] = set()
+        self._lost_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
         self._last_capacity: BackendCapacity | None = None
         self._last_cache_stats: dict[str, int | float] = {}
@@ -590,11 +628,17 @@ class DisaggregatedGenerationBackend:
             raise
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
+        if not self._decode_available():
+            return AdmissionDecision.defer("decode worker is restarting")
+        if not self._prefill_available():
+            return AdmissionDecision.defer("prefill worker is restarting")
         return self._reserve_decode(request)
 
     def _reserve_decode(
         self, request: ServingRequest, *, force_rpc: bool = False
     ) -> AdmissionDecision:
+        if not self._decode_available():
+            return AdmissionDecision.defer("decode worker is restarting")
         initial_capacity = self.capacity()
         total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
         required_blocks = (total_tokens + self.config.block_size - 1) // self.config.block_size
@@ -608,9 +652,8 @@ class DisaggregatedGenerationBackend:
         with self._decode_lock:
             if request.request_id in self._admitted_requests and not force_rpc:
                 return AdmissionDecision.accept()
-            self._decode_commands.put(command)
-            result = self._get(self._decode_responses, self.operation_timeout)
-            self._check(result, "admission", request.request_id)
+        result = self._decode_rpc(command, "admission", request.request_id)
+        with self._decode_lock:
             self._update_capacity(result)
             if result.get("admitted"):
                 self._admitted_requests.add(request.request_id)
@@ -643,19 +686,16 @@ class DisaggregatedGenerationBackend:
             "max_new_tokens": request.max_new_tokens,
             "sampling_params": request.sampling_params,
         }
-        self._prefill_commands.put(command)
-        result = self._get(self._prefill_responses, self.operation_timeout)
-        self._check(result, "prefill", request.request_id)
-        with self._decode_lock:
-            self._decode_commands.put(
-                {
-                    **command,
-                    "op": "prepare",
-                    "timeout": self.operation_timeout,
-                }
-            )
-            prepared = self._get(self._decode_responses, self.operation_timeout)
-        self._check(prepared, "prepare", request.request_id)
+        result = self._prefill_rpc(command, request.request_id)
+        prepared = self._decode_rpc(
+            {
+                **command,
+                "op": "prepare",
+                "timeout": self.operation_timeout,
+            },
+            "prepare",
+            request.request_id,
+        )
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         if not prepared.get("replay_consistent", True):
@@ -671,10 +711,9 @@ class DisaggregatedGenerationBackend:
             "max_new_tokens": request.max_new_tokens,
             "sampling_params": request.sampling_params,
         }
-        with self._decode_lock:
-            self._decode_commands.put(command)
-            result = self._get(self._decode_responses, self.operation_timeout)
-        self._check(result, "collocated_prepare", request.request_id)
+        result = self._decode_rpc(
+            command, "collocated_prepare", request.request_id
+        )
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(result["token_id"])
 
@@ -682,10 +721,36 @@ class DisaggregatedGenerationBackend:
         self, requests: tuple[ServingRequest, ...]
     ) -> tuple[int | TokenSample, ...]:
         request_ids = tuple(request.request_id for request in requests)
-        with self._decode_lock:
-            self._decode_commands.put({"op": "decode", "request_ids": request_ids})
-            result = self._get(self._decode_responses, self.operation_timeout)
-        self._check(result, "decode")
+        lost = tuple(
+            request_id for request_id in request_ids if request_id in self._lost_requests
+        )
+        if lost:
+            from hydraserve.engine.serving_loop import PartialDecodeError
+
+            live_requests = tuple(
+                request for request in requests if request.request_id not in lost
+            )
+            successes = {}
+            if live_requests:
+                live_samples = self.decode(live_requests)
+                successes.update(
+                    (request.request_id, sample)
+                    for request, sample in zip(
+                        live_requests, live_samples, strict=True
+                    )
+                )
+            raise PartialDecodeError(
+                successes,
+                {
+                    request_id: PDWorkerUnavailableError(
+                        f"request {request_id} lost decode-worker state"
+                    )
+                    for request_id in lost
+                },
+            )
+        result = self._decode_rpc(
+            {"op": "decode", "request_ids": request_ids}, "decode"
+        )
         if tuple(result["request_ids"]) != request_ids:
             raise RuntimeError("decode worker returned a different request batch")
         samples = result.get("samples")
@@ -711,10 +776,7 @@ class DisaggregatedGenerationBackend:
             "sampling_params": request.sampling_params,
         }
         try:
-            with self._decode_lock:
-                self._decode_commands.put(command)
-                result = self._get(self._decode_responses, self.operation_timeout)
-            self._check(result, "recover", request.request_id)
+            result = self._decode_rpc(command, "recover", request.request_id)
             self._update_capacity(result)
             return AdmissionDecision.accept()
         except Exception:
@@ -728,11 +790,15 @@ class DisaggregatedGenerationBackend:
         if self._closed:
             return
         with self._decode_lock:
-            self._decode_commands.put({"op": "release", "request_id": request_id})
-            result = self._get(self._decode_responses, self.operation_timeout)
+            known = request_id in self._admitted_requests
             self._admitted_requests.discard(request_id)
             self._reserved_blocks.pop(request_id, None)
-        self._check(result, "release", request_id)
+            self._lost_requests.discard(request_id)
+        if not known:
+            return
+        result = self._decode_rpc(
+            {"op": "release", "request_id": request_id}, "release", request_id
+        )
         self._update_capacity(result)
 
     def capacity(self) -> BackendCapacity:
@@ -758,16 +824,49 @@ class DisaggregatedGenerationBackend:
         with self._decode_lock:
             return dict(self._last_cache_stats)
 
+    def recovery_stats(self) -> PDDecodeRecoveryStats:
+        self._decode_available()
+        with self._recovery_lock:
+            return PDDecodeRecoveryStats(
+                1,
+                1 if self._decode_healthy else 0,
+                self._decode_recovery_attempts,
+                self._decode_recovery_successes,
+                self._decode_recovery_failures,
+                (0,) if self._decode_recovering else (),
+            )
+
+    def prefill_recovery_stats(self) -> PDPrefillRecoveryStats:
+        self._prefill_available()
+        with self._recovery_lock:
+            return PDPrefillRecoveryStats(
+                self._prefill_healthy,
+                self._prefill_recovery_attempts,
+                self._prefill_recovery_successes,
+                self._prefill_recovery_failures,
+                self._prefill_recovering,
+            )
+
+    def abandon(self, request_id: int) -> None:
+        with self._decode_lock:
+            self._admitted_requests.discard(request_id)
+            self._reserved_blocks.pop(request_id, None)
+            self._lost_requests.discard(request_id)
+
+    def is_recoverable_decode_error(
+        self, request_id: int, error: BaseException
+    ) -> bool:
+        return isinstance(error, (PDWorkerUnavailableError, TimeoutError)) or (
+            request_id in self._lost_requests
+        )
+
     def prefix_match_tokens(self, token_ids) -> int:
         command = {
             "op": "prefix_probe",
             "request_id": -1,
             "token_ids": tuple(int(token) for token in token_ids),
         }
-        with self._decode_lock:
-            self._decode_commands.put(command)
-            result = self._get(self._decode_responses, self.operation_timeout)
-        self._check(result, "prefix_probe", -1)
+        result = self._decode_rpc(command, "prefix_probe", -1)
         self._update_capacity(result)
         return int(result["matched_tokens"])
 
@@ -788,10 +887,195 @@ class DisaggregatedGenerationBackend:
                 if isinstance(value, (int, float))
             }
 
+    def _prefill_available(self) -> bool:
+        with self._recovery_lock:
+            if self._closed or not self._prefill_healthy:
+                return False
+        if self._prefill.is_alive():
+            return True
+        with self._recovery_lock:
+            self._prefill_healthy = False
+        self._schedule_recovery("prefill")
+        return False
+
+    def _decode_available(self) -> bool:
+        with self._recovery_lock:
+            if self._closed or not self._decode_healthy:
+                return False
+        if self._decode.is_alive():
+            return True
+        self._invalidate_decode()
+        self._schedule_recovery("decode")
+        return False
+
+    def _prefill_rpc(self, command: dict, request_id: int) -> dict:
+        failure = None
+        with self._prefill_lock:
+            try:
+                if not self._prefill.is_alive():
+                    raise PDWorkerUnavailableError("prefill worker is not running")
+                self._prefill_commands.put(command)
+                result = self._get_worker_response(
+                    "prefill", self.operation_timeout
+                )
+            except (TimeoutError, PDWorkerUnavailableError) as exc:
+                failure = exc
+        if failure is not None:
+            with self._recovery_lock:
+                self._prefill_healthy = False
+            self._schedule_recovery("prefill")
+            raise failure
+        self._check(result, "prefill", request_id)
+        return result
+
+    def _decode_rpc(
+        self, command: dict, expected_op: str, request_id: int | None = None
+    ) -> dict:
+        failure = None
+        with self._decode_lock:
+            try:
+                if not self._decode.is_alive():
+                    raise PDWorkerUnavailableError("decode worker is not running")
+                self._decode_commands.put(command)
+                result = self._get_worker_response("decode", self.operation_timeout)
+            except (TimeoutError, PDWorkerUnavailableError) as exc:
+                failure = exc
+        if failure is not None:
+            self._invalidate_decode()
+            self._schedule_recovery("decode")
+            raise failure
+        self._check(result, expected_op, request_id)
+        return result
+
+    def _get_worker_response(self, kind: str, timeout: float):
+        process = self._prefill if kind == "prefill" else self._decode
+        responses = self._prefill_responses if kind == "prefill" else self._decode_responses
+        deadline = monotonic() + timeout
+        while True:
+            if not process.is_alive():
+                raise PDWorkerUnavailableError(f"{kind} worker exited during RPC")
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"timed out waiting for {kind} worker")
+            try:
+                return responses.get(timeout=min(0.1, remaining))
+            except Empty:
+                continue
+
+    def _invalidate_decode(self) -> None:
+        with self._recovery_lock, self._decode_lock:
+            self._decode_healthy = False
+            self._lost_requests.update(self._admitted_requests)
+            self._admitted_requests.clear()
+            self._reserved_blocks.clear()
+            self._last_capacity = None
+
+    def _schedule_recovery(self, kind: str) -> None:
+        with self._recovery_lock:
+            if self._closed:
+                return
+            attribute = f"_{kind}_recovering"
+            if getattr(self, attribute):
+                return
+            setattr(self, attribute, True)
+            thread = Thread(
+                target=self._recover_worker,
+                args=(kind,),
+                name=f"hydraserve-recover-{kind}",
+                daemon=True,
+            )
+            setattr(self, f"_{kind}_recovery_thread", thread)
+        thread.start()
+
+    def _recover_worker(self, kind: str) -> None:
+        try:
+            for attempt in range(self.max_worker_restarts):
+                if self._recovery_stop.is_set():
+                    return
+                with self._recovery_lock:
+                    name = f"_{kind}_recovery_attempts"
+                    setattr(self, name, getattr(self, name) + 1)
+                try:
+                    self._restart_worker_once(kind)
+                except Exception:
+                    with self._recovery_lock:
+                        name = f"_{kind}_recovery_failures"
+                        setattr(self, name, getattr(self, name) + 1)
+                    if self._recovery_stop.wait(
+                        self.worker_restart_backoff_s * (2**attempt)
+                    ):
+                        return
+                    continue
+                if self._recovery_stop.is_set():
+                    return
+                with self._recovery_lock:
+                    setattr(self, f"_{kind}_healthy", True)
+                    name = f"_{kind}_recovery_successes"
+                    setattr(self, name, getattr(self, name) + 1)
+                return
+        finally:
+            with self._recovery_lock:
+                setattr(self, f"_{kind}_recovering", False)
+                setattr(self, f"_{kind}_recovery_thread", None)
+
+    def _restart_worker_once(self, kind: str) -> None:
+        lock = self._prefill_lock if kind == "prefill" else self._decode_lock
+        with lock:
+            if self._recovery_stop.is_set():
+                return
+            process = self._prefill if kind == "prefill" else self._decode
+            if process.is_alive():
+                process.terminate()
+            process.join(10)
+            commands = self._context.Queue()
+            responses = self._context.Queue()
+            if kind == "prefill":
+                self._prefill_commands = commands
+                self._prefill_responses = responses
+                process = self._new_prefill_process()
+                self._prefill = process
+            else:
+                self._decode_commands = commands
+                self._decode_responses = responses
+                process = self._new_decode_process()
+                self._decode = process
+            process.start()
+            result = self._get_worker_response(kind, self.startup_timeout)
+            self._check(result, "ready")
+            if result.get("model_name") != self.model_name:
+                raise RuntimeError(f"restarted {kind} worker loaded a different model")
+            if kind == "decode":
+                self._update_capacity(result)
+
+    def _new_prefill_process(self):
+        return self._context.Process(
+            target=_prefill_worker,
+            args=(
+                self.config,
+                self.namespace,
+                self._prefill_commands,
+                self._prefill_responses,
+            ),
+            name="hydraserve-prefill",
+        )
+
+    def _new_decode_process(self):
+        return self._context.Process(
+            target=_decode_worker,
+            args=(
+                self.config,
+                self.namespace,
+                self._decode_commands,
+                self._decode_responses,
+            ),
+            name="hydraserve-decode",
+        )
+
     def close(self, *, force: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
+        self._recovery_stop.set()
         for commands in (self._prefill_commands, self._decode_commands):
             commands.put({"op": "shutdown"})
         if not force:
@@ -849,6 +1133,8 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
         router: AdaptiveRouter | None = None,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        max_worker_restarts: int = 3,
+        worker_restart_backoff_s: float = 0.5,
     ) -> None:
         self.router = router or CostAwareRouter()
         self._route_decisions: dict[int, RouteDecision] = {}
@@ -861,15 +1147,16 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
             config,
             startup_timeout=startup_timeout,
             operation_timeout=operation_timeout,
+            max_worker_restarts=max_worker_restarts,
+            worker_restart_backoff_s=worker_restart_backoff_s,
         )
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
         with self._route_lock:
             if request.request_id in self._route_decisions:
-                return super().admit(request)
+                return self._reserve_decode(request)
         capacity = self.capacity()
-        with self._route_lock:
-            prefill_healthy = self._prefill_healthy
+        prefill_healthy = self._prefill_available()
         if prefill_healthy:
             decision = self.router.decide(
                 len(request.token_ids),
@@ -885,7 +1172,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 decode_load=capacity.decode_load,
                 decode_has_slot=capacity.has_request_slot,
             )
-        admitted = super().admit(request)
+        admitted = self._reserve_decode(request)
         if admitted.admitted:
             with self._route_lock:
                 bound = self._route_decisions.setdefault(request.request_id, decision)
@@ -914,7 +1201,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
             return token_id
         try:
             token_id = self._prefill_pd(request)
-        except TimeoutError:
+        except (TimeoutError, PDWorkerUnavailableError):
             with self._route_lock:
                 self._pd_failures += 1
                 self._prefill_healthy = False

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from queue import Queue
-from threading import Lock
+from threading import Event, Lock, RLock
 from types import SimpleNamespace
 
 from hydraserve.engine import (
@@ -48,6 +48,12 @@ def test_pd_recovery_rpc_carries_exact_history_without_prefill_sampling() -> Non
         def _update_capacity(self, result):
             return None
 
+        def _decode_rpc(self, command, expected_op, request_id=None):
+            self._decode_commands.put(command)
+            result = self._decode_responses.get(timeout=1)
+            self._check(result, expected_op, request_id)
+            return result
+
         def release(self, request_id):
             self.released.append(request_id)
 
@@ -62,3 +68,53 @@ def test_pd_recovery_rpc_carries_exact_history_without_prefill_sampling() -> Non
     assert command["generated_token_ids"] == (8, 9, 10)
     assert command["replay_token_ids"] == (1, 2, 8, 9)
     assert backend.released == []
+
+
+def test_fixed_pd_detects_dead_prefill_before_waiting_for_rpc_timeout() -> None:
+    class DeadProcess:
+        def is_alive(self):
+            return False
+
+    backend = object.__new__(DisaggregatedGenerationBackend)
+    backend._recovery_lock = RLock()
+    backend._closed = False
+    backend._prefill_healthy = True
+    backend._prefill = DeadProcess()
+    scheduled = []
+    backend._schedule_recovery = scheduled.append
+
+    assert not backend._prefill_available()
+    assert not backend._prefill_healthy
+    assert scheduled == ["prefill"]
+
+
+def test_fixed_pd_worker_recovery_retries_with_backoff() -> None:
+    class RecoveringBackend:
+        max_worker_restarts = 3
+        worker_restart_backoff_s = 0
+
+        def __init__(self):
+            self._recovery_stop = Event()
+            self._recovery_lock = RLock()
+            self._prefill_healthy = False
+            self._prefill_recovering = True
+            self._prefill_recovery_thread = None
+            self._prefill_recovery_attempts = 0
+            self._prefill_recovery_successes = 0
+            self._prefill_recovery_failures = 0
+            self.calls = 0
+
+        def _restart_worker_once(self, kind):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("startup failed")
+
+    backend = RecoveringBackend()
+    DisaggregatedGenerationBackend._recover_worker(backend, "prefill")
+
+    assert backend.calls == 2
+    assert backend._prefill_healthy
+    assert backend._prefill_recovery_attempts == 2
+    assert backend._prefill_recovery_successes == 1
+    assert backend._prefill_recovery_failures == 1
+    assert not backend._prefill_recovering

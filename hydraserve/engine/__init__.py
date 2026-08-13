@@ -31,6 +31,9 @@ from hydraserve.engine.pd_service import (
     AdaptiveGenerationBackend,
     DisaggregatedGenerationBackend,
     PDWorkerConfig,
+    PDWorkerUnavailableError,
+    PDDecodeRecoveryStats,
+    PDPrefillRecoveryStats,
     RoutingStats,
     TransferValidationStats,
 )
@@ -83,6 +86,9 @@ __all__ = [
     "ServingRequest",
     "DisaggregatedGenerationBackend",
     "PDWorkerConfig",
+    "PDWorkerUnavailableError",
+    "PDDecodeRecoveryStats",
+    "PDPrefillRecoveryStats",
     "RoutingStats",
     "TransferValidationStats",
 ]
