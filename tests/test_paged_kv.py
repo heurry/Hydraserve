@@ -47,6 +47,40 @@ def test_paged_kv_write_and_batch_metadata(tiny_model, device: str) -> None:
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_paged_kv_batched_decode_scatter(tiny_model, device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    manager = KVBlockManager(8, block_size=4)
+    cache = PagedKVCache(tiny_model, manager, device=device, dtype=torch.float32)
+    cache.allocate(1, 5)
+    cache.allocate(2, 3)
+    table, _ = cache.batch_metadata((1, 2))
+    positions = torch.tensor([4, 2], device=device, dtype=torch.int32)
+    key = torch.arange(
+        2 * tiny_model.num_kv_heads * tiny_model.head_dim,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(2, tiny_model.num_kv_heads, tiny_model.head_dim)
+    value = -key
+    layer = tiny_model.full_attention_layer_indices[0]
+    cache.write_decode_batch(
+        (1, 2),
+        layer,
+        positions,
+        key,
+        value,
+        table,
+        logical_positions=(4, 2),
+    )
+    first_key, first_value = cache.read(1, layer)
+    second_key, second_value = cache.read(2, layer)
+    torch.testing.assert_close(first_key[4], key[0])
+    torch.testing.assert_close(first_value[4], value[0])
+    torch.testing.assert_close(second_key[2], key[1])
+    torch.testing.assert_close(second_value[2], value[1])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_paged_prefill_attention_preserves_chunk_history(tiny_model, device: str) -> None:
     if device == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA is required")

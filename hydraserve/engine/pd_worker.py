@@ -22,6 +22,7 @@ class PrefillResult:
 class DecodePrepared:
     first_token_id: int | None
     state: RuntimeState
+    replay_consistent: bool = True
 
 
 class PrefillWorker:
@@ -160,6 +161,7 @@ class DecodeWorker:
                 bundle,
                 device=self.runtime.device,
             )
+            replay_consistent = True
             if descriptor.state_token_count == descriptor.prompt_length - 1:
                 last_prompt_token = torch.tensor(
                     [[request.token_ids[-1]]],
@@ -179,11 +181,10 @@ class DecodeWorker:
                     (request.sampling_params,),
                     steps=(0,),
                 )[0].token_id
-                if descriptor.first_token_id is not None and replay_token != descriptor.first_token_id:
-                    raise RuntimeError(
-                        f"N-1 replay token mismatch: prefill={descriptor.first_token_id}, "
-                        f"decode={replay_token}"
-                    )
+                replay_consistent = (
+                    descriptor.first_token_id is None
+                    or replay_token == descriptor.first_token_id
+                )
             self.paged_cache.publish_prefix(request.request_id, request.token_ids)
         except Exception:
             self.paged_cache.free(request.request_id)
@@ -192,4 +193,4 @@ class DecodeWorker:
         if descriptor.first_token_id is not None:
             request.generated_token_ids.append(descriptor.first_token_id)
         request.transition(RequestState.READY)
-        return DecodePrepared(descriptor.first_token_id, state)
+        return DecodePrepared(descriptor.first_token_id, state, replay_consistent)

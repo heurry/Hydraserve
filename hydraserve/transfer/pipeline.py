@@ -94,17 +94,22 @@ class TransferPipeline:
             state_token_count=state_token_count,
         )
         key = self._key(request_id)
-        self.backend.send(f"{key}:descriptor", descriptor.to_dict(), self.dst_gpu)
-        self.backend.send(f"{key}:payload", payload, self.dst_gpu)
+        self.backend.send(
+            f"{key}:bundle",
+            {"descriptor": descriptor.to_dict(), "payload": payload},
+            self.dst_gpu,
+        )
         return descriptor
 
     def receive(self, request_id: int, timeout: float | None = None) -> tuple[StateTransferDescriptor, HybridStateBundle]:
         key = self._key(request_id)
-        raw_descriptor = self.backend.receive(
-            f"{key}:descriptor", self.dst_gpu, timeout=timeout
+        envelope = self.backend.receive(
+            f"{key}:bundle", self.dst_gpu, timeout=timeout
         )
-        payload = self.backend.receive(f"{key}:payload", self.dst_gpu, timeout=timeout)
-        descriptor = StateTransferDescriptor.from_dict(raw_descriptor)
+        if not isinstance(envelope, dict) or set(envelope) != {"descriptor", "payload"}:
+            raise RuntimeError("received an invalid state-transfer envelope")
+        descriptor = StateTransferDescriptor.from_dict(envelope["descriptor"])
+        payload = envelope["payload"]
         if descriptor.request_id != request_id:
             raise RuntimeError("received descriptor for the wrong request")
         recurrent = LinearState(

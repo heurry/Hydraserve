@@ -32,6 +32,11 @@ class PDWorkerConfig:
     prefix_cache_min_frequency: int = 2
 
 
+@dataclass(frozen=True, slots=True)
+class TransferValidationStats:
+    replay_mismatches: int
+
+
 def _request(
     request_id: int,
     token_ids,
@@ -154,6 +159,7 @@ def _decode_worker(
         from hydraserve.cache import (
             CacheNamespace,
             CostAwarePrefixPolicy,
+            GpuLinearStatePool,
             KVBlockManager,
             PagedKVCache,
             PrefixCache,
@@ -207,6 +213,10 @@ def _decode_worker(
         )
         requests = {}
         states = {}
+        state_pool = GpuLinearStatePool(
+            config.max_state_slots, runtime.config, device=device
+        )
+        state_capacity = state_pool.capacity_snapshot().total_slots
         reservations = set()
         def capacity_payload():
             capacity = cache.block_manager.capacity()
@@ -214,8 +224,8 @@ def _decode_worker(
             return {
                 "kv_total_blocks": capacity.total_blocks,
                 "kv_free_blocks": capacity.free_blocks,
-                "state_total_slots": config.max_state_slots,
-                "state_free_slots": max(0, config.max_state_slots - live),
+                "state_total_slots": state_capacity,
+                "state_free_slots": max(0, state_capacity - live),
             }
 
         responses.put(
@@ -260,7 +270,7 @@ def _decode_worker(
                                 **capacity_payload(),
                             }
                         )
-                    elif len(live_requests) >= config.max_state_slots:
+                    elif len(live_requests) >= state_capacity:
                         responses.put(
                             {
                                 "op": "admission",
@@ -315,12 +325,15 @@ def _decode_worker(
                         preallocated=request_id in reservations,
                     )
                     requests[request_id] = request
-                    states[request_id] = prepared.state
+                    states[request_id] = state_pool.install(
+                        request_id, prepared.state
+                    )
                     responses.put(
                         {
                             "op": "prepare",
                             "request_id": request_id,
                             "token_id": prepared.first_token_id,
+                            "replay_consistent": prepared.replay_consistent,
                         }
                     )
                 elif operation == "collocated_prepare":
@@ -356,7 +369,7 @@ def _decode_worker(
                     token_id = sample.token_id
                     request.generated_token_ids.append(token_id)
                     requests[request_id] = request
-                    states[request_id] = state
+                    states[request_id] = state_pool.install(request_id, state)
                     responses.put(
                         {
                             "op": "collocated_prepare",
@@ -406,6 +419,7 @@ def _decode_worker(
                     request_id = command["request_id"]
                     reservations.discard(request_id)
                     states.pop(request_id, None)
+                    state_pool.free(request_id)
                     requests.pop(request_id, None)
                     cache.free(request_id)
                     responses.put(
@@ -426,6 +440,7 @@ def _decode_worker(
             except Exception as exc:
                 if operation in {"prepare", "collocated_prepare"}:
                     reservations.discard(command.get("request_id"))
+                    state_pool.free(command.get("request_id"))
                     cache.free(command.get("request_id"))
                 responses.put(
                     {
@@ -488,6 +503,7 @@ class DisaggregatedGenerationBackend:
         self._admitted_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
         self._last_capacity: BackendCapacity | None = None
+        self._replay_mismatches = 0
         self._decode.start()
         self._prefill.start()
         try:
@@ -566,6 +582,8 @@ class DisaggregatedGenerationBackend:
         self._check(prepared, "prepare", request.request_id)
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
+        if not prepared.get("replay_consistent", True):
+            self._replay_mismatches += 1
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
 
@@ -625,6 +643,9 @@ class DisaggregatedGenerationBackend:
                 state_total_slots=self.config.max_state_slots,
                 state_free_slots=max(0, self.config.max_state_slots - allocated_slots),
             )
+
+    def transfer_validation_stats(self) -> TransferValidationStats:
+        return TransferValidationStats(self._replay_mismatches)
 
     def prefix_match_tokens(self, token_ids) -> int:
         command = {

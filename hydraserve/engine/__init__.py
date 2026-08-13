@@ -32,6 +32,7 @@ from hydraserve.engine.pd_service import (
     DisaggregatedGenerationBackend,
     PDWorkerConfig,
     RoutingStats,
+    TransferValidationStats,
 )
 from hydraserve.engine.multi_worker import (
     MultiWorkerGenerationBackend,
@@ -79,4 +80,5 @@ __all__ = [
     "DisaggregatedGenerationBackend",
     "PDWorkerConfig",
     "RoutingStats",
+    "TransferValidationStats",
 ]

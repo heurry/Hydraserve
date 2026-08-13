@@ -54,8 +54,8 @@ decode worker；两条路径共享相同的 KV/GDN 准入与 continuous decode �
 KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
 
 这里的“已实现”仍不等于整个系统已经达到生产完成态。抢占后的精确状态/KV 回放、
-decode 故障域隔离、带老化的加权公平调度和 decode worker 自动恢复已经实现；
-1P+ND（N>1）多卡实测、完整采样语义、压力与长稳验证仍在生产化路线中。
+decode 故障域隔离、带老化的加权公平调度、decode worker 自动恢复和完整单 choice
+采样语义已经实现；1P+ND（N>1）多卡实测、压力与长稳验证仍在生产化路线中。
 
 ## 模型兼容性
 
@@ -208,6 +208,15 @@ Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让
 不会阻塞后续可准入请求。decode 子进程退出或 RPC 超时后会先从路由摘除，重建进程与
 IPC 队列，并在模型名和容量握手通过后重新加入。`/health` 和 `/metrics` 暴露 worker
 健康数、恢复中列表及重启计数。
+
+当前 PCIe fallback 使用不经 pickle 的 typed ndarray 单-envelope SHM，header 在内容写完后
+才发布；GDN 状态通过 pinned host staging 搬运。decode worker 按实时剩余显存计算可保证
+的 FP32 state slot 数，并预分配 layer-major 连续 GPU pool。每轮 decode 只构造一次
+Paged KV metadata，full-attention 层使用单次 batched Triton KV scatter；Paged Attention
+按 16-token tile 做 online softmax。RTX 3090 微基准中 batched scatter 相比逐请求 launch
+在 batch 1/8/32 分别为 1.15×/10.25×/42.79×；这些是 kernel 微基准，不代表端到端吞吐。
+N−1 replay 使用 prefill 端已传输的首 token 作为权威输出；跨 GPU 浮点 argmax 漂移不会
+错误终止请求，但会计入 `hydraserve_pd_replay_mismatches_total` 供诊断。
 
 ## 代码结构
 

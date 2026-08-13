@@ -520,6 +520,15 @@ class _Handler(BaseHTTPRequestHandler):
                     f'hydraserve_worker_restarts_total{{outcome="failure"}} {stats.failures}',
                 ]
             )
+        validation_stats = getattr(backend, "transfer_validation_stats", None)
+        if validation_stats is not None:
+            stats = validation_stats()
+            lines.extend(
+                [
+                    "# TYPE hydraserve_pd_replay_mismatches_total counter",
+                    f"hydraserve_pd_replay_mismatches_total {stats.replay_mismatches}",
+                ]
+            )
         body = ("\n".join(lines) + "\n").encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

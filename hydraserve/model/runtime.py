@@ -231,6 +231,12 @@ class QwenTextRuntime:
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
         hidden = self._embedding(input_ids, embedding)
         combined = RuntimeState()
+        paged_metadata = (
+            paged_cache.batch_metadata(request_ids)
+            if self.config.num_full_attention_layers
+            else None
+        )
+        logical_positions = tuple(state.sequence_length for state in states)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
             prefix = layer_prefix(layer_index)
@@ -246,12 +252,15 @@ class QwenTextRuntime:
                     [state.convolution[layer_index] for state in states], dim=0
                 ).contiguous()
                 hidden = self._linear_attention(layer_index, hidden, combined)
-                for row, state in enumerate(states):
-                    state.recurrent[layer_index] = combined.recurrent[layer_index][row : row + 1].clone()
-                    state.convolution[layer_index] = combined.convolution[layer_index][row : row + 1].clone()
             else:
                 hidden = self._full_attention_batch_decode(
-                    layer_index, hidden, positions, paged_cache, request_ids
+                    layer_index,
+                    hidden,
+                    positions,
+                    paged_cache,
+                    request_ids,
+                    paged_metadata,
+                    logical_positions,
                 )
             hidden = residual + hidden
             residual = hidden
@@ -259,12 +268,43 @@ class QwenTextRuntime:
             hidden = residual + self._mlp(layer_index, hidden)
 
         hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
+        # Commit recurrent state only after every layer completed. Existing
+        # pool-backed views are updated in place; failures leave old state intact.
+        for layer_index, recurrent in combined.recurrent.items():
+            convolution = combined.convolution[layer_index]
+            for row, state in enumerate(states):
+                self._commit_state_tensor(
+                    state.recurrent, layer_index, recurrent[row : row + 1]
+                )
+                self._commit_state_tensor(
+                    state.convolution, layer_index, convolution[row : row + 1]
+                )
         for state in states:
             state.sequence_length += 1
         return self._linear(hidden, self._output_weight()).float(), states
 
+    @staticmethod
+    def _commit_state_tensor(mapping, layer_index: int, value) -> None:
+        current = mapping.get(layer_index)
+        if (
+            current is not None
+            and current.shape == value.shape
+            and current.device == value.device
+            and current.dtype == value.dtype
+        ):
+            current.copy_(value)
+        else:
+            mapping[layer_index] = value.clone()
+
     def _full_attention_batch_decode(
-        self, layer_index: int, hidden, positions, paged_cache, request_ids
+        self,
+        layer_index: int,
+        hidden,
+        positions,
+        paged_cache,
+        request_ids,
+        paged_metadata,
+        logical_positions,
     ):
         import torch
 
@@ -285,15 +325,16 @@ class QwenTextRuntime:
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         query = apply_text_rope(query, positions, config.rope_theta, rotary_dim)
         key = apply_text_rope(key, positions, config.rope_theta, rotary_dim)
-        for row, request_id in enumerate(request_ids):
-            paged_cache.write(
-                request_id,
-                layer_index,
-                positions[row],
-                key[row],
-                value[row],
-            )
-        table, lengths = paged_cache.batch_metadata(request_ids)
+        table, lengths = paged_metadata
+        paged_cache.write_decode_batch(
+            request_ids,
+            layer_index,
+            positions[:, 0],
+            key[:, 0],
+            value[:, 0],
+            table,
+            logical_positions=logical_positions,
+        )
         key_pages, value_pages = paged_cache.layer_cache(layer_index)
         from hydraserve.kernels.paged_attention import paged_attention
 

@@ -3,8 +3,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from hashlib import sha256
+import json
 from multiprocessing import shared_memory
-import pickle
+import numpy as np
 import struct
 from threading import Condition
 from time import monotonic, sleep
@@ -99,13 +100,14 @@ class InMemoryTransferBackend(TransferBackend):
 class SharedMemoryTransferBackend(TransferBackend):
     """One-shot POSIX shared-memory mailboxes for the low-bandwidth fallback.
 
-    Payloads are pickled because protocol metadata and NumPy arrays travel as one
-    atomic message.  This backend is only for mutually trusted local workers.
-    Production transports should serialize typed tensor regions directly.
+    NumPy regions are copied directly into a typed wire layout. The header is
+    published last, so a receiver can never deserialize a partially written
+    message merely because the POSIX object already exists.
     """
 
-    _HEADER = struct.Struct("!8sQ")
-    _MAGIC = b"HYDRA001"
+    _HEADER = struct.Struct("!8sQQ")
+    _MAGIC = b"HYDRA002"
+    _PENDING = b"\0" * 8
 
     def __init__(
         self,
@@ -129,17 +131,37 @@ class SharedMemoryTransferBackend(TransferBackend):
     def send(self, key: str, payload: Any, dst: int, stream: Any = None) -> None:
         if dst < 0 or not key:
             raise ValueError("invalid transfer destination or key")
-        blob = pickle.dumps(payload, protocol=pickle.HIGHEST_PROTOCOL)
+        metadata, arrays = self._encode(payload)
+        metadata_blob = json.dumps(
+            metadata, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8")
+        payload_size = sum(array.nbytes for array in arrays)
         name = self._mailbox_name(key, dst)
         try:
             memory = shared_memory.SharedMemory(
-                name=name, create=True, size=self._HEADER.size + len(blob)
+                name=name,
+                create=True,
+                size=self._HEADER.size + len(metadata_blob) + payload_size,
             )
         except FileExistsError as exc:
             raise RuntimeError(f"unconsumed shared-memory transfer exists: {key}") from exc
         try:
-            memory.buf[: self._HEADER.size] = self._HEADER.pack(self._MAGIC, len(blob))
-            memory.buf[self._HEADER.size :] = blob
+            memory.buf[: self._HEADER.size] = self._HEADER.pack(
+                self._PENDING, 0, 0
+            )
+            cursor = self._HEADER.size
+            memory.buf[cursor : cursor + len(metadata_blob)] = metadata_blob
+            cursor += len(metadata_blob)
+            for array in arrays:
+                data = memoryview(array).cast("B")
+                try:
+                    memory.buf[cursor : cursor + array.nbytes] = data
+                finally:
+                    data.release()
+                cursor += array.nbytes
+            memory.buf[: self._HEADER.size] = self._HEADER.pack(
+                self._MAGIC, len(metadata_blob), payload_size
+            )
             self._owned_names.add(name)
         finally:
             memory.close()
@@ -160,15 +182,104 @@ class SharedMemoryTransferBackend(TransferBackend):
                     raise TimeoutError(f"timed out waiting for transfer {key}")
                 sleep(self._poll_interval)
         try:
-            magic, size = self._HEADER.unpack(bytes(memory.buf[: self._HEADER.size]))
-            if magic != self._MAGIC or size > len(memory.buf) - self._HEADER.size:
+            while True:
+                magic, metadata_size, payload_size = self._HEADER.unpack(
+                    bytes(memory.buf[: self._HEADER.size])
+                )
+                if magic == self._MAGIC:
+                    break
+                if magic != self._PENDING:
+                    raise RuntimeError(f"corrupt shared-memory transfer: {key}")
+                if deadline is not None and monotonic() >= deadline:
+                    raise TimeoutError(f"timed out waiting for transfer {key} publication")
+                sleep(self._poll_interval)
+            available = len(memory.buf) - self._HEADER.size
+            if metadata_size + payload_size != available:
                 raise RuntimeError(f"corrupt shared-memory transfer: {key}")
-            payload = pickle.loads(bytes(memory.buf[self._HEADER.size : self._HEADER.size + size]))
+            metadata_start = self._HEADER.size
+            payload_start = metadata_start + metadata_size
+            metadata = json.loads(
+                bytes(memory.buf[metadata_start:payload_start]).decode("utf-8")
+            )
+            payload_view = memory.buf[payload_start:]
+            try:
+                payload = self._decode(metadata, payload_view)
+            finally:
+                payload_view.release()
         finally:
             memory.close()
             memory.unlink()
             self._owned_names.discard(name)
         return payload
+
+    @classmethod
+    def _encode(cls, payload: Any) -> tuple[Any, tuple[np.ndarray, ...]]:
+        arrays: list[np.ndarray] = []
+
+        def visit(value):
+            if isinstance(value, np.ndarray):
+                contiguous = np.ascontiguousarray(value)
+                index = len(arrays)
+                arrays.append(contiguous)
+                return {
+                    "__hydra_ndarray__": index,
+                    "shape": list(contiguous.shape),
+                    "dtype": contiguous.dtype.str,
+                    "nbytes": contiguous.nbytes,
+                }
+            if isinstance(value, dict):
+                if not all(isinstance(key, str) for key in value):
+                    raise TypeError("shared-memory dictionaries require string keys")
+                return {key: visit(item) for key, item in value.items()}
+            if isinstance(value, tuple):
+                return {"__hydra_tuple__": [visit(item) for item in value]}
+            if isinstance(value, list):
+                return [visit(item) for item in value]
+            if isinstance(value, (str, int, float, bool, type(None))):
+                return value
+            raise TypeError(
+                f"unsupported shared-memory payload type: {type(value).__name__}"
+            )
+
+        return visit(payload), tuple(arrays)
+
+    @classmethod
+    def _decode(cls, metadata: Any, payload) -> Any:
+        arrays: dict[int, np.ndarray] = {}
+        cursor = 0
+
+        def visit(value):
+            nonlocal cursor
+            if isinstance(value, dict) and "__hydra_ndarray__" in value:
+                index = int(value["__hydra_ndarray__"])
+                if index in arrays:
+                    raise RuntimeError("duplicate ndarray index in shared-memory payload")
+                dtype = np.dtype(value["dtype"])
+                shape = tuple(int(item) for item in value["shape"])
+                nbytes = int(value["nbytes"])
+                expected = int(np.prod(shape, dtype=np.int64)) * dtype.itemsize
+                if nbytes != expected or cursor + nbytes > len(payload):
+                    raise RuntimeError("invalid ndarray region in shared-memory payload")
+                region = payload[cursor : cursor + nbytes]
+                try:
+                    array = np.ndarray(shape, dtype=dtype, buffer=region).copy()
+                finally:
+                    region.release()
+                cursor += nbytes
+                arrays[index] = array
+                return array
+            if isinstance(value, dict) and "__hydra_tuple__" in value:
+                return tuple(visit(item) for item in value["__hydra_tuple__"])
+            if isinstance(value, dict):
+                return {key: visit(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [visit(item) for item in value]
+            return value
+
+        decoded = visit(metadata)
+        if cursor != len(payload):
+            raise RuntimeError("unreferenced bytes in shared-memory payload")
+        return decoded
 
     def get_bandwidth(self) -> float:
         return self._bandwidth

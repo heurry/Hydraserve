@@ -658,12 +658,22 @@ class RuntimeGenerationBackend:
     ) -> None:
         if min(prefill_chunk_size, max_state_slots) <= 0:
             raise ValueError("prefill chunk size and state slots must be positive")
-        from hydraserve.cache import RequestStateSlotManager
+        from hydraserve.cache import GpuLinearStatePool, RequestStateSlotManager
 
         self.runtime = runtime
         self.paged_cache = paged_cache
         self.prefill_chunk_size = prefill_chunk_size
-        self.state_slots = RequestStateSlotManager(max_state_slots)
+        config = getattr(runtime, "config", None)
+        self.state_pool = (
+            GpuLinearStatePool(max_state_slots, config, device=runtime.device)
+            if config is not None and config.linear_layer_indices
+            else None
+        )
+        self.state_slots = (
+            self.state_pool.slots
+            if self.state_pool is not None
+            else RequestStateSlotManager(max_state_slots)
+        )
         self.states: dict[int, object] = {}
         self._admission_lock = Lock()
 
@@ -702,7 +712,10 @@ class RuntimeGenerationBackend:
                 return AdmissionDecision.accept()
             if allocation is not None or owns_state_slot:
                 manager.free(request.request_id)
-                self.state_slots.free(request.request_id)
+                if self.state_pool is not None:
+                    self.state_pool.free(request.request_id)
+                else:
+                    self.state_slots.free(request.request_id)
                 self.states.pop(request.request_id, None)
             try:
                 self.state_slots.allocate(request.request_id)
@@ -746,6 +759,8 @@ class RuntimeGenerationBackend:
                     request_id=request.request_id,
                 )
             self.paged_cache.publish_prefix(request.request_id, request.token_ids)
+            if self.state_pool is not None:
+                state = self.state_pool.install(request.request_id, state)
             self.states[request.request_id] = state
             from hydraserve.engine.sampling import sample_logits
 
@@ -868,7 +883,10 @@ class RuntimeGenerationBackend:
         with self._admission_lock:
             self.states.pop(request_id, None)
             self.paged_cache.free(request_id)
-            self.state_slots.free(request_id)
+            if self.state_pool is not None:
+                self.state_pool.free(request_id)
+            else:
+                self.state_slots.free(request_id)
 
     def capacity(self) -> BackendCapacity:
         kv = self.paged_cache.block_manager.capacity()

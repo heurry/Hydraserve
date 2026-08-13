@@ -155,3 +155,34 @@ Next implementation slice:
 1. broaden B-vs-D across prompt lengths, concurrency, and arrival rates;
 2. optimize and benchmark the new INT4 kernel;
 3. P2P/NVLink validation on capable hardware.
+
+## 2026-08-14 — production scheduling, recovery, sampling, and decode memory
+
+Implemented and regression tested:
+
+- joint KV/recurrent-state admission, bounded queues, and HTTP 429 backpressure;
+- cost-aware physical-page prefix cache, per-request adaptive routing, and 1P+ND
+  worker binding with capacity/cache/topology scoring;
+- exact preemption replay, transactional state/KV rollback, batch/worker failure
+  isolation, decode-worker restart, and health/restart metrics;
+- aging weighted-fair decode selection and admission without head-of-line blocking;
+- per-request temperature/top-p/top-k/min-p, penalties, seed, stop sequences,
+  completion/chat logprobs, and streaming usage semantics;
+- typed atomic single-envelope SHM with pinned staging, a layer-major contiguous
+  GPU GDN-state pool sized from actual free memory, and in-place transactional
+  recurrent-state commits;
+- one metadata build per decode iteration, one batched Triton KV scatter per
+  full-attention layer, and 16-token tiled Triton Paged Attention.
+
+The transferred prefill token is authoritative for N-1 execution. A replay
+argmax difference caused by cross-GPU floating-point ties is counted in
+`hydraserve_pd_replay_mismatches_total` instead of incorrectly failing the
+request; replay still advances and installs the decode-side state.
+
+Real two-GPU Qwen3.5-4B tests cover physical prefix reuse, worker crash/restart,
+seeded PD sampling, typed SHM, and pooled-state decode. On one RTX 3090, batched
+KV scatter measured 1.15x/10.25x/42.79x over per-request launches at batch
+1/8/32. Tiled Paged Attention measured 0.0241/0.1098/0.3479 ms for context
+128/512/2048 at B=4, QH=16, D=128. These are kernel microbenchmarks, not
+end-to-end service claims. N>1 decode workers and CUDA P2P remain unvalidated on
+this two-GPU, no-peer-access host.

@@ -109,3 +109,26 @@ def test_posix_shared_memory_partial_transfer(tiny_model) -> None:
         assert descriptor.mode is TransferMode.PARTIAL_TRANSFER
         np.testing.assert_array_equal(received.recurrent.conv_state, 2)
         assert received.kv_cache is None
+
+
+def test_shared_memory_typed_codec_preserves_nested_arrays_and_tuples() -> None:
+    payload = {
+        "states": (
+            np.arange(12, dtype=np.float32).reshape(3, 4),
+            np.arange(5, dtype=np.int32),
+        ),
+        "metadata": {"layers": [1, 3], "enabled": True},
+    }
+    with SharedMemoryTransferBackend(namespace="hydraserve-typed-pytest") as backend:
+        backend.send("typed", payload, 1)
+        restored = backend.receive("typed", 1, timeout=1)
+    assert isinstance(restored["states"], tuple)
+    np.testing.assert_array_equal(restored["states"][0], payload["states"][0])
+    np.testing.assert_array_equal(restored["states"][1], payload["states"][1])
+    assert restored["metadata"] == payload["metadata"]
+
+
+def test_shared_memory_typed_codec_rejects_unsupported_objects() -> None:
+    backend = SharedMemoryTransferBackend(namespace="hydraserve-typed-reject")
+    with pytest.raises(TypeError, match="unsupported"):
+        backend.send("bad", {"value": object()}, 1)

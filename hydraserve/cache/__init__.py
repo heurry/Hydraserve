@@ -14,6 +14,7 @@ from hydraserve.cache.prefix_cache import (
 from hydraserve.cache.state_pool import (
     LinearState,
     LinearStatePool,
+    GpuLinearStatePool,
     RequestStateSlotManager,
     StateSlotCapacity,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "KVBlockManager",
     "LinearState",
     "LinearStatePool",
+    "GpuLinearStatePool",
     "RequestStateSlotManager",
     "StateSlotCapacity",
     "PagedKVCache",

@@ -50,6 +50,7 @@ def paged_attention(query, key_cache, value_cache, block_table, sequence_lengths
         SCALE=head_dim**-0.5,
         BLOCK_SIZE=block_size,
         BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_T=16,
         MAX_CONTEXT=max_context,
         num_warps=8,
     )
@@ -127,6 +128,7 @@ try:
         SCALE: tl.constexpr,
         BLOCK_SIZE: tl.constexpr,
         BLOCK_D: tl.constexpr,
+        BLOCK_T: tl.constexpr,
         MAX_CONTEXT: tl.constexpr,
     ):
         request = tl.program_id(0)
@@ -144,28 +146,39 @@ try:
         maximum = -float("inf")
         denominator = 0.0
         accumulator = tl.zeros((BLOCK_D,), dtype=tl.float32)
-        for token in tl.range(0, MAX_CONTEXT, 1):
-            valid = token < length
-            logical_block = token // BLOCK_SIZE
-            block_offset = token % BLOCK_SIZE
+        for token_start in tl.range(0, MAX_CONTEXT, BLOCK_T):
+            tokens = token_start + tl.arange(0, BLOCK_T)
+            valid = tokens < length
+            logical_block = tokens // BLOCK_SIZE
+            block_offset = tokens % BLOCK_SIZE
             physical_block = tl.load(
-                table_ptr + request * stride_tb + logical_block, mask=valid, other=0
+                table_ptr + request * stride_tb + logical_block,
+                mask=valid,
+                other=0,
             )
             cache_offsets = (
-                physical_block * stride_cb
-                + block_offset * stride_ct
+                physical_block[:, None] * stride_cb
+                + block_offset[:, None] * stride_ct
                 + kv_head * stride_ch
-                + dimensions
+                + dimensions[None, :]
             )
-            key = tl.load(key_ptr + cache_offsets, mask=valid & dimension_mask, other=0.0).to(tl.float32)
-            score = tl.sum(query * key, axis=0) * SCALE
+            tile_mask = valid[:, None] & dimension_mask[None, :]
+            key = tl.load(
+                key_ptr + cache_offsets, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            score = tl.sum(query[None, :] * key, axis=1) * SCALE
             score = tl.where(valid, score, -float("inf"))
-            next_maximum = tl.maximum(maximum, score)
+            tile_maximum = tl.max(score, axis=0)
+            next_maximum = tl.maximum(maximum, tile_maximum)
             old_scale = tl.exp(maximum - next_maximum)
             probability = tl.where(valid, tl.exp(score - next_maximum), 0.0)
-            value = tl.load(value_ptr + cache_offsets, mask=valid & dimension_mask, other=0.0).to(tl.float32)
-            accumulator = accumulator * old_scale + probability * value
-            denominator = denominator * old_scale + probability
+            value = tl.load(
+                value_ptr + cache_offsets, mask=tile_mask, other=0.0
+            ).to(tl.float32)
+            accumulator = accumulator * old_scale + tl.sum(
+                probability[:, None] * value, axis=0
+            )
+            denominator = denominator * old_scale + tl.sum(probability, axis=0)
             maximum = next_maximum
         result = accumulator / denominator
         tl.store(

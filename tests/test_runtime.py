@@ -252,7 +252,37 @@ def test_heterogeneous_batched_decode_matches_sequential(tiny_model) -> None:
         cache.reserve_append(10)
         cache.reserve_append(11)
     tokens = torch.tensor([[7], [8]], device="cuda")
+    recurrent_pointers = {
+        (row, layer): state.recurrent[layer].data_ptr()
+        for row, state in enumerate(batch_states)
+        for layer in tiny_model.linear_layer_indices
+    }
+    convolution_pointers = {
+        (row, layer): state.convolution[layer].data_ptr()
+        for row, state in enumerate(batch_states)
+        for layer in tiny_model.linear_layer_indices
+    }
+    metadata_calls = 0
+    original_metadata = batch_cache.batch_metadata
+
+    def counted_metadata(*args, **kwargs):
+        nonlocal metadata_calls
+        metadata_calls += 1
+        return original_metadata(*args, **kwargs)
+
+    batch_cache.batch_metadata = counted_metadata
     batched, _ = runtime.decode_batch(tokens, batch_states, batch_cache, (10, 11))
+    assert metadata_calls == 1
+    assert recurrent_pointers == {
+        (row, layer): state.recurrent[layer].data_ptr()
+        for row, state in enumerate(batch_states)
+        for layer in tiny_model.linear_layer_indices
+    }
+    assert convolution_pointers == {
+        (row, layer): state.convolution[layer].data_ptr()
+        for row, state in enumerate(batch_states)
+        for layer in tiny_model.linear_layer_indices
+    }
     sequential = []
     for row, request_id in enumerate((10, 11)):
         logits, _ = runtime.forward(

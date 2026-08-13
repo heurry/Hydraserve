@@ -7,6 +7,7 @@ from hydraserve.cache import (
     KVBlockManager,
     LinearState,
     LinearStatePool,
+    GpuLinearStatePool,
     RequestStateSlotManager,
     dequantize_int4,
     quantize_int4,
@@ -119,6 +120,36 @@ def test_request_state_slots_are_bounded_and_idempotent() -> None:
     slots.free(1)
     assert slots.allocate(2) == 0
     assert slots.capacity().allocated_slots == 1
+
+
+def test_gpu_linear_state_pool_uses_contiguous_reusable_views(tiny_model) -> None:
+    torch = pytest.importorskip("torch")
+    from hydraserve.model.runtime import RuntimeState
+
+    pool = GpuLinearStatePool(2, tiny_model, device="cpu")
+    source = RuntimeState(sequence_length=7)
+    for layer_index in tiny_model.linear_layer_indices:
+        source.recurrent[layer_index] = torch.ones(
+            (1, *tiny_model.ssm_state_shape[1:]), dtype=torch.float32
+        )
+        source.convolution[layer_index] = torch.full(
+            (1, *tiny_model.conv_state_shape[1:]), 2.0, dtype=torch.float32
+        )
+    state = pool.install(10, source)
+    assert state.sequence_length == 7
+    first_layer = tiny_model.linear_layer_indices[0]
+    state.recurrent[first_layer].fill_(3)
+    assert pool.ssm_storage[0, 0].flatten()[0] == 3
+    assert pool.ssm_storage.is_contiguous()
+    assert pool.capacity == pool.requested_capacity == 2
+    assert pool.bytes_per_slot == (
+        (np.prod(tiny_model.ssm_state_shape) + np.prod(tiny_model.conv_state_shape))
+        * 4
+    )
+    pool.free(10)
+    reused = pool.allocate(11)
+    assert pool.slots.get(11) == 0
+    assert not bool(reused.recurrent[first_layer].any())
 
 
 def test_int4_round_trip_and_actual_packing() -> None:

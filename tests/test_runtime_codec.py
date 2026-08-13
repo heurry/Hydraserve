@@ -42,3 +42,25 @@ def test_runtime_state_transfer_round_trip(tiny_model) -> None:
         torch.testing.assert_close(
             restored.convolution[layer_index], state.convolution[layer_index].float()
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_runtime_codec_uses_pinned_host_staging_for_cuda(tiny_model) -> None:
+    state = RuntimeState(sequence_length=3)
+    for layer_index in tiny_model.linear_layer_indices:
+        state.recurrent[layer_index] = torch.ones(
+            (1, *tiny_model.ssm_state_shape[1:]), device="cuda", dtype=torch.float32
+        )
+        state.convolution[layer_index] = torch.ones(
+            (1, *tiny_model.conv_state_shape[1:]), device="cuda", dtype=torch.float32
+        )
+    bundle = RuntimeStateCodec.extract(tiny_model, state)
+    assert torch.from_numpy(bundle.recurrent.ssm_state).is_pinned()
+    assert torch.from_numpy(bundle.recurrent.conv_state).is_pinned()
+    descriptor = TransferPipeline(
+        InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER)
+    ).send(91, tiny_model, 3, bundle)
+    restored = RuntimeStateCodec.install(
+        tiny_model, descriptor, bundle, device="cuda"
+    )
+    assert all(value.is_cuda for value in restored.recurrent.values())

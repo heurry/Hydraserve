@@ -34,8 +34,11 @@ class RuntimeStateCodec:
                 raise ValueError(f"unexpected conv shape at layer {layer_index}")
             recurrent_layers.append(recurrent[0].float())
             convolution_layers.append(convolution[0].float())
-        recurrent_tensor = torch.stack(recurrent_layers).contiguous().cpu()
-        convolution_tensor = torch.stack(convolution_layers).contiguous().cpu()
+        recurrent_tensor = torch.stack(recurrent_layers).contiguous()
+        convolution_tensor = torch.stack(convolution_layers).contiguous()
+        recurrent_tensor, convolution_tensor = RuntimeStateCodec._stage_to_host(
+            recurrent_tensor, convolution_tensor
+        )
         return HybridStateBundle(
             recurrent=LinearState(
                 recurrent_tensor.numpy(), convolution_tensor.numpy()
@@ -95,13 +98,56 @@ class RuntimeStateCodec:
         if recurrent.conv_state.shape != model.conv_state_shape:
             raise ValueError("transferred conv state shape does not match the model")
         state = RuntimeState(sequence_length=descriptor.state_token_count)
-        recurrent_tensor = torch.from_numpy(recurrent.ssm_state).to(
-            device=device, dtype=torch.float32
-        )
-        convolution_tensor = torch.from_numpy(recurrent.conv_state).to(
-            device=device, dtype=torch.float32
+        recurrent_tensor, convolution_tensor = RuntimeStateCodec._stage_to_device(
+            recurrent.ssm_state,
+            recurrent.conv_state,
+            device=device,
         )
         for slot, layer_index in enumerate(model.linear_layer_indices):
             state.recurrent[layer_index] = recurrent_tensor[slot : slot + 1].contiguous()
             state.convolution[layer_index] = convolution_tensor[slot : slot + 1].contiguous()
         return state
+
+    @staticmethod
+    def _stage_to_host(*tensors):
+        import torch
+
+        if not tensors or not tensors[0].is_cuda:
+            return tuple(tensor.cpu() for tensor in tensors)
+        staged = tuple(
+            torch.empty(
+                tensor.shape,
+                device="cpu",
+                dtype=tensor.dtype,
+                pin_memory=True,
+            )
+            for tensor in tensors
+        )
+        for destination, source in zip(staged, tensors, strict=True):
+            destination.copy_(source, non_blocking=True)
+        torch.cuda.current_stream(tensors[0].device).synchronize()
+        return staged
+
+    @staticmethod
+    def _stage_to_device(*arrays, device):
+        import torch
+
+        target = torch.device(device)
+        sources = tuple(torch.from_numpy(array) for array in arrays)
+        if target.type != "cuda":
+            return tuple(source.to(device=target, dtype=torch.float32) for source in sources)
+        pinned = tuple(
+            torch.empty(
+                source.shape,
+                device="cpu",
+                dtype=torch.float32,
+                pin_memory=True,
+            )
+            for source in sources
+        )
+        for destination, source in zip(pinned, sources, strict=True):
+            destination.copy_(source)
+        return tuple(
+            source.to(device=target, dtype=torch.float32, non_blocking=True)
+            for source in pinned
+        )

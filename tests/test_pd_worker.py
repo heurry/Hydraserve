@@ -93,3 +93,29 @@ def test_quantized_pd_workers_install_kv_without_recompute(tiny_model) -> None:
     target_key, target_value = decode_cache.read(request.request_id, layer)
     torch.testing.assert_close(target_key, source_key, atol=0.15, rtol=0.15)
     torch.testing.assert_close(target_value, source_value, atol=0.15, rtol=0.15)
+
+
+def test_n_minus_one_replay_drift_is_observed_but_prefill_token_is_authoritative(
+    tiny_model,
+) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    backend = InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER)
+    pipeline = TransferPipeline(backend)
+    request = CentralScheduler().submit([1, 3, 5, 7], max_new_tokens=2)
+    result = PrefillWorker(runtime, pipeline).process(request)
+    envelope = backend._messages[(1, f"request:{request.request_id}:bundle")]
+    authoritative = (result.first_token_id + 1) % tiny_model.vocab_size
+    envelope["descriptor"]["first_token_id"] = authoritative
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(16, block_size=4),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    prepared = DecodeWorker(runtime, pipeline, cache).receive_and_prepare(request)
+    assert not prepared.replay_consistent
+    assert prepared.first_token_id == authoritative
+    assert request.generated_token_ids == [authoritative]

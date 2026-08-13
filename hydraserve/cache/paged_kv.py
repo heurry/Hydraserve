@@ -205,6 +205,71 @@ class PagedKVCache:
         slot = self._layer_slot(layer_index)
         return self.key[slot], self.value[slot]
 
+    def write_decode_batch(
+        self,
+        request_ids,
+        layer_index: int,
+        positions,
+        key,
+        value,
+        block_table,
+        *,
+        logical_positions,
+    ) -> None:
+        """Write one decode KV token per request without per-row launches."""
+        import torch
+
+        request_ids = tuple(int(request_id) for request_id in request_ids)
+        logical_positions = tuple(int(position) for position in logical_positions)
+        batch = len(request_ids)
+        if not (
+            len(logical_positions) == batch
+            and positions.shape == (batch,)
+            and key.shape == value.shape
+            and key.shape
+            == (batch, self.model.num_kv_heads, self.model.head_dim)
+            and block_table.shape[0] == batch
+        ):
+            raise ValueError("invalid batched decode KV metadata")
+        for request_id, position in zip(
+            request_ids, logical_positions, strict=True
+        ):
+            allocation = self.block_manager.get(request_id)
+            if not 0 <= position < allocation.num_tokens:
+                raise IndexError("decode KV position is outside the request allocation")
+            if position < self.matched_prefix_tokens(request_id):
+                raise RuntimeError("decode attempted to overwrite a shared prefix page")
+            required_blocks = self.block_manager.blocks_required(position + 1)
+            if required_blocks > block_table.shape[1]:
+                raise IndexError("decode block table does not cover the write position")
+        slot = self._layer_slot(layer_index)
+        positions = positions.to(device=self.device, dtype=torch.int32).contiguous()
+        key = key.to(device=self.device, dtype=self.dtype).contiguous()
+        value = value.to(device=self.device, dtype=self.dtype).contiguous()
+        block_table = block_table.to(
+            device=self.device, dtype=torch.int32
+        ).contiguous()
+        if self.device.type == "cuda":
+            from hydraserve.kernels.kv_cache import write_paged_kv_batch
+
+            write_paged_kv_batch(
+                key,
+                value,
+                positions,
+                block_table,
+                self.key[slot],
+                self.value[slot],
+            )
+            return
+        for row, request_id in enumerate(request_ids):
+            self.write(
+                request_id,
+                layer_index,
+                positions[row : row + 1],
+                key[row : row + 1],
+                value[row : row + 1],
+            )
+
     def read(self, request_id: int, layer_index: int, *, num_tokens: int | None = None):
         """Gather one request's logical K/V sequence from physical pages."""
         import torch

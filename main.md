@@ -191,12 +191,12 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 |------|-----|------|---------|
 | CentralScheduler | CPU | 请求路由、传输协调 | 状态机、无队首阻塞资源准入、带老化加权公平 decode、逐请求混合执行路由与 route binding 完成 |
 | Chunked Prefill | GPU 0 | 长 prompt 分块 | 分块调度、Paged 历史与 causal offset 完成 |
-| State Extractor | GPU 0 | 逐层提取 KV + 循环状态 | runtime state 已暴露，传输绑定待接入 |
+| State Extractor | GPU 0 | 提取 KV + 循环状态 | N−1 GDN 状态、pinned host staging 与 typed SHM 传输已接入；逐层 P2P overlap 待验证 |
 | TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM/P2P 实现；本机 P2P 不可用，未实测 |
-| TransferPipeline | GPU0->1..N | 层级别异步流水线 | 双状态协议完成，GPU 异步流水待实现 |
-| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证、抢占后精确回放、事务回滚与 batch/worker 故障隔离完成；优先级待完善 |
-| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 容量预留、批量原子增长、共享页引用计数/写保护/压力淘汰、Triton scatter 完成 |
-| Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | FP32 状态与 worker slot 容量准入完成；连续 GPU pool 待优化 |
+| TransferPipeline | GPU0->1..N | 状态传输 | typed 单-envelope SHM、原子发布、pinned D2H/H2D 完成；P2P 层级 GPU 异步流水仍待可用硬件接入验证 |
+| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证、精确回放、事务回滚、故障隔离与老化加权公平调度完成 |
+| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 容量预留、批量原子增长、共享页引用计数/写保护/压力淘汰、batched Triton scatter 与 tiled online-softmax 完成 |
+| Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | layer-major 连续 GPU pool、显存预算化保证容量、decode 原地事务提交完成 |
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 策略与真实 Paged KV 页生命周期、worker affinity 探测完成；GDN 不缓存 |
 | Adaptive Router | CPU | Collocated vs PD 路由 | 逐请求执行、1P+ND registry、容量/缓存亲和/拓扑评分、跨 worker 并行 decode、worker 自动摘流/重启/握手完成；N>1 实机待验证 |
 | ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
@@ -531,18 +531,18 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 |-------|------|------|------|
 | 0 | 环境搭建 + 模型加载 + 硬件实测 | 1 周 | 完成 |
 | 1 | 推理引擎 + Triton kernels | 2.5 周 | 4B/9B BF16 + 27B AWQ 真实 GPU smoke 完成 |
-| 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、协议完成；GPU state pool 待接入 worker |
+| 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、连续 GPU state pool 与显存预算化准入完成 |
 | 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM/P2P + 层级协议完成；P2P 待可用硬件实测 |
 | 4 | PD 分离核心 + N-1 truncation | 2 周 | 4B 真实 GPU 双进程 SHM PARTIAL 完成 |
 | 5 | Continuous batching + chunked prefill | 2 周 | 完成：batched decode + Paged 历史与 causal offset |
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
-| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享/回收/真实 affinity；P5 抢占重算与故障隔离；P6 公平调度/worker 恢复；P7 采样/stop/logprobs API 完成 |
+| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享；P5 抢占/故障隔离；P6 调度/worker 恢复；P7 采样 API；P8 typed SHM/state pool/batched KV scatter/tiled attention 完成 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 优化 GPU 异步传输流水、decode kernel 与连续 GPU state pool
+1. 建立压力、故障矩阵、长稳与正式 B-vs-D benchmark 验证
 2. 在 4+ GPU 环境验证 1P+ND 与拓扑路由，再跑正式 B vs D 性能矩阵
 3. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER

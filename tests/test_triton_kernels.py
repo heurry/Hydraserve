@@ -70,17 +70,27 @@ def test_triton_gdn_matches_reference(sequence: int) -> None:
     torch.testing.assert_close(actual_state, expected_state, atol=2e-4, rtol=2e-4)
 
 
-@pytest.mark.parametrize("lengths", [[1, 5], [7, 12], [16, 13]])
-def test_triton_paged_attention_matches_reference(lengths: list[int]) -> None:
+@pytest.mark.parametrize("head_dim", [32, 128])
+@pytest.mark.parametrize(
+    "lengths", [[1, 5], [7, 12], [16, 13], [17, 31], [63, 129]]
+)
+def test_triton_paged_attention_matches_reference(
+    lengths: list[int], head_dim: int
+) -> None:
     torch.manual_seed(3)
-    batch, query_heads, kv_heads, head_dim = 2, 4, 2, 32
-    block_size, physical_blocks = 4, 8
+    batch, query_heads, kv_heads = 2, 4, 2
+    block_size = 4
+    table_width = (max(lengths) + block_size - 1) // block_size
+    physical_blocks = batch * table_width
     query = torch.randn(batch, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(
         physical_blocks, block_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
     value = torch.randn_like(key)
-    table = torch.tensor([[3, 1, 7, 0], [5, 2, 6, 4]], device="cuda", dtype=torch.int32)
+    table = torch.arange(
+        physical_blocks, device="cuda", dtype=torch.int32
+    ).reshape(batch, table_width)
+    table[0] = table[0].flip(0)
     sequence_lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
     expected = reference_paged_attention(query, key, value, table, sequence_lengths)
     actual = triton_paged_attention(query, key, value, table, sequence_lengths)

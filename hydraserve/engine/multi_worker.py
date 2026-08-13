@@ -187,6 +187,7 @@ class MultiWorkerGenerationBackend:
         self._recovery_attempts = 0
         self._recovery_successes = 0
         self._recovery_failures = 0
+        self._replay_mismatches = 0
 
         for process in self._decode_processes:
             process.start()
@@ -303,6 +304,9 @@ class MultiWorkerGenerationBackend:
         )
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
+        if not prepared.get("replay_consistent", True):
+            with self._state_lock:
+                self._replay_mismatches += 1
         with self._state_lock:
             self._pd_count += 1
         sample = result.get("sample")
@@ -414,6 +418,12 @@ class MultiWorkerGenerationBackend:
                 self._recovery_failures,
                 tuple(sorted(self._recovering_workers)),
             )
+
+    def transfer_validation_stats(self):
+        from hydraserve.engine.pd_service import TransferValidationStats
+
+        with self._state_lock:
+            return TransferValidationStats(self._replay_mismatches)
 
     def close(self, *, force: bool = False) -> None:
         if self._closed:
