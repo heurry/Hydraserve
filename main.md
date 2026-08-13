@@ -194,7 +194,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | State Extractor | GPU 0 | 逐层提取 KV + 循环状态 | runtime state 已暴露，传输绑定待接入 |
 | TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM/P2P 实现；本机 P2P 不可用，未实测 |
 | TransferPipeline | GPU0->1..N | 层级别异步流水线 | 双状态协议完成，GPU 异步流水待实现 |
-| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证完成；生产级优先级与真实重算恢复待完善 |
+| Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证、抢占后精确回放、事务回滚与 batch/worker 故障隔离完成；优先级待完善 |
 | KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 容量预留、批量原子增长、共享页引用计数/写保护/压力淘汰、Triton scatter 完成 |
 | Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | FP32 状态与 worker slot 容量准入完成；连续 GPU pool 待优化 |
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 策略与真实 Paged KV 页生命周期、worker affinity 探测完成；GDN 不缓存 |
@@ -538,11 +538,11 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
-| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享/回收/真实 affinity 完成 |
+| 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享/回收/真实 affinity；P5 抢占重算与 batch/worker 故障隔离完成 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
-1. 完善抢占重算、跨 worker batch 故障隔离与 worker 自动恢复
+1. 实现 worker 自动恢复、优先级/公平调度及完整采样与 API 语义
 2. 在 4+ GPU 环境验证 1P+ND 与拓扑路由，再跑正式 B vs D 性能矩阵
 3. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER

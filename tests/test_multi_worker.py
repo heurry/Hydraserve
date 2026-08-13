@@ -9,6 +9,7 @@ from hydraserve.engine import (
     AdmissionDecision,
     BackendCapacity,
     MultiWorkerGenerationBackend,
+    PartialDecodeError,
     PDClusterConfig,
     ServingRequest,
 )
@@ -99,6 +100,24 @@ def test_multi_worker_decode_groups_by_worker_and_preserves_input_order() -> Non
         ("decode", 0, (0, 2)),
         ("decode", 1, (1, 3)),
     }
+
+
+def test_multi_worker_decode_isolates_failed_worker_group() -> None:
+    class OneWorkerFails(FakeMultiWorkerBackend):
+        def _decode_rpc(self, worker_id, command, expected_op, request_id=None):
+            if expected_op == "decode" and worker_id == 1:
+                raise RuntimeError("worker 1 failed")
+            return super()._decode_rpc(worker_id, command, expected_op, request_id)
+
+    backend = OneWorkerFails()
+    requests = tuple(ServingRequest(index, (index + 1,), 2) for index in range(4))
+    for request, worker_id in zip(requests, (0, 1, 0, 1), strict=True):
+        backend.registry.bind(request.request_id, worker_id)
+    with pytest.raises(PartialDecodeError) as raised:
+        backend.decode(requests)
+    assert raised.value.token_ids == {0: 0, 2: 2}
+    assert set(raised.value.errors) == {1, 3}
+    assert all("worker 1 failed" in str(error) for error in raised.value.errors.values())
 
 
 def test_multi_worker_admission_defers_when_cluster_is_full() -> None:

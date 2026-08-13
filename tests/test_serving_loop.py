@@ -9,6 +9,7 @@ from hydraserve.engine import (
     BackendCapacity,
     ContinuousGenerationLoop,
     OverloadedError,
+    PartialDecodeError,
     RuntimeGenerationBackend,
     ServingRequest,
 )
@@ -114,6 +115,46 @@ def test_decode_failure_finishes_entire_affected_batch() -> None:
     assert first_events[-1].finish_reason == "error"
     assert second_events[-1].finish_reason == "error"
     assert "decode exploded" in first_events[-1].error
+    assert backend.live == set()
+
+
+def test_partial_decode_failure_preserves_healthy_requests() -> None:
+    first_decode = Event()
+    allow_decode = Event()
+
+    class PartiallyFailingBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.failed_once = False
+            self.blocked_once = False
+
+        def decode(self, requests):
+            if not self.blocked_once:
+                self.blocked_once = True
+                first_decode.set()
+                assert allow_decode.wait(2)
+            if not self.failed_once and len(requests) == 2:
+                self.failed_once = True
+                healthy, failed = requests
+                raise PartialDecodeError(
+                    {healthy.request_id: healthy.generated_token_ids[-1] + 1},
+                    {failed.request_id: RuntimeError("bound worker failed")},
+                )
+            return super().decode(requests)
+
+    backend = PartiallyFailingBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    healthy = loop.submit([1], max_new_tokens=3)
+    assert first_decode.wait(2)
+    failed = loop.submit([10], max_new_tokens=3)
+    allow_decode.set()
+    healthy_events = _collect(healthy)
+    failed_events = _collect(failed)
+    loop.close()
+    assert [event.token_id for event in healthy_events[:-1]] == [2, 3, 4]
+    assert healthy_events[-1].finish_reason == "length"
+    assert failed_events[-1].finish_reason == "error"
+    assert "bound worker failed" in failed_events[-1].error
     assert backend.live == set()
 
 
@@ -284,6 +325,60 @@ def test_runtime_admission_reserves_kv_and_recurrent_state_together() -> None:
     assert backend.admit(second).admitted
     backend.release(2)
     assert cache.block_manager.num_free_blocks == cache.block_manager.num_blocks
+
+
+def test_runtime_decode_bisects_failure_and_rolls_back_failed_request() -> None:
+    torch = pytest.importorskip("torch")
+    from dataclasses import dataclass
+    from hydraserve.cache import KVBlockManager
+
+    @dataclass
+    class State:
+        sequence_length: int
+
+    class FakePagedCache:
+        def __init__(self):
+            self.block_manager = KVBlockManager(8, block_size=4)
+
+        def free(self, request_id):
+            self.block_manager.free(request_id)
+
+    class SelectiveRuntime:
+        device = torch.device("cpu")
+
+        def decode_batch(self, input_ids, states, paged_cache, request_ids):
+            if 2 in request_ids:
+                for state in states:
+                    state.sequence_length += 100
+                raise RuntimeError("request 2 kernel failure")
+            for state in states:
+                state.sequence_length += 1
+            logits = torch.zeros(len(request_ids), 1, 16)
+            for row, token in enumerate(input_ids[:, 0]):
+                logits[row, 0, int(token) + 1] = 1
+            return logits, states
+
+    cache = FakePagedCache()
+    backend = RuntimeGenerationBackend(SelectiveRuntime(), cache, max_state_slots=2)
+    requests = (
+        ServingRequest(1, (1,), 3, generated_token_ids=[4]),
+        ServingRequest(2, (2,), 3, generated_token_ids=[7]),
+    )
+    for request in requests:
+        cache.block_manager.allocate(request.request_id, 1, reserve_tokens=3)
+        backend.state_slots.allocate(request.request_id)
+        backend.states[request.request_id] = State(1)
+
+    with pytest.raises(PartialDecodeError) as raised:
+        backend.decode(requests)
+    assert raised.value.token_ids == {1: 5}
+    assert set(raised.value.errors) == {2}
+    assert backend.states[1].sequence_length == 2
+    assert backend.states[2].sequence_length == 1
+    assert cache.block_manager.get(1).num_tokens == 2
+    assert cache.block_manager.get(2).num_tokens == 1
+    backend.release(1)
+    backend.release(2)
 
 
 def test_backend_capacity_uses_most_constrained_resource() -> None:

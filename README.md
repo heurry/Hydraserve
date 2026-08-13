@@ -53,9 +53,9 @@ decode worker；两条路径共享相同的 KV/GDN 准入与 continuous decode �
 会保持排队，单请求永久超过 worker 容量会单独失败，入口过载返回 HTTP 429。统一的
 KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
 
-这里的“已实现”仍不等于整个系统已经达到生产完成态。1P+ND 多卡实测、完整抢占重算、
-worker 自动恢复、压力与长稳验证
-仍在生产化路线中。
+这里的“已实现”仍不等于整个系统已经达到生产完成态。抢占后的精确状态/KV 回放与
+decode 故障域隔离已经实现；1P+ND（N>1）多卡实测、worker 自动恢复、采样语义、
+压力与长稳验证仍在生产化路线中。
 
 ## 模型兼容性
 
@@ -195,6 +195,9 @@ crossover 或吞吐结论。
 runner 支持 `--warmup` 排除首次 kernel 编译，并支持 `burst`、固定速率和 seeded
 Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让 GPU1 继续
 推进已有 decode；GPU1 安装新请求的重算阶段仍需与 decode 串行。
+运行时 decode 采用事务式状态检查点：整批失败会先回滚逻辑 KV 长度和 GDN 状态，再
+二分重试隔离单请求故障。1P+ND 后端按 worker 汇总部分结果，因此一个 decode worker
+失败不会丢弃其他 worker 已成功生成的 token。
 
 ## 代码结构
 

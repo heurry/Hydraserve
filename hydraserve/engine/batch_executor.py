@@ -30,6 +30,35 @@ class ContinuousBatchExecutor:
             raise ValueError(f"duplicate runtime state for request {request_id}")
         self.states[request_id] = state
 
+    def preempt(self, request_id: int) -> None:
+        self.scheduler.preempt(request_id)
+        self.states.pop(request_id, None)
+
+    def recover(self, request_id: int, *, chunk_size: int = 4096) -> Any:
+        """Replay prompt + processed output and publish state only on success."""
+        import torch
+
+        if chunk_size <= 0:
+            raise ValueError("recovery chunk size must be positive")
+        plan = self.scheduler.resume(request_id)
+        input_ids = torch.tensor(
+            [plan.replay_token_ids], device=self.runtime.device, dtype=torch.long
+        )
+        try:
+            _, state = self.runtime.prefill(
+                input_ids,
+                chunk_size=chunk_size,
+                paged_cache=self.paged_cache,
+                request_id=request_id,
+            )
+        except Exception:
+            self.scheduler.fail_recompute(request_id)
+            self.states.pop(request_id, None)
+            raise
+        self.states[request_id] = state
+        self.scheduler.mark_recompute_complete(request_id)
+        return state
+
     def step(self) -> tuple[DecodeBatch, tuple[int, ...]]:
         import torch
 

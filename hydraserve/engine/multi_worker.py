@@ -19,6 +19,7 @@ from hydraserve.engine.pd_service import (
 from hydraserve.engine.serving_loop import (
     AdmissionDecision,
     BackendCapacity,
+    PartialDecodeError,
     ServingRequest,
 )
 from hydraserve.router import (
@@ -307,15 +308,30 @@ class MultiWorkerGenerationBackend:
                 raise RuntimeError("decode worker returned a different request batch")
             return indexed_requests, tuple(int(token) for token in result["token_ids"])
 
+        failures: dict[int, BaseException] = {}
+        successes: dict[int, int] = {}
         with ThreadPoolExecutor(max_workers=len(groups)) as executor:
-            futures = [
-                executor.submit(execute, worker_id, tuple(indexed))
+            futures = {
+                executor.submit(execute, worker_id, tuple(indexed)): tuple(indexed)
                 for worker_id, indexed in groups.items()
-            ]
-            for future in futures:
-                indexed, token_ids = future.result()
-                for (position, _), token_id in zip(indexed, token_ids, strict=True):
-                    output[position] = token_id
+            }
+            for future, scheduled in futures.items():
+                try:
+                    indexed, token_ids = future.result()
+                    if len(indexed) != len(token_ids):
+                        raise RuntimeError(
+                            "decode worker output count does not match its request group"
+                        )
+                    for (position, request), token_id in zip(
+                        indexed, token_ids, strict=True
+                    ):
+                        output[position] = token_id
+                        successes[request.request_id] = token_id
+                except Exception as exc:
+                    for _, request in scheduled:
+                        failures[request.request_id] = exc
+        if failures:
+            raise PartialDecodeError(successes, failures)
         return tuple(output)
 
     def release(self, request_id: int) -> None:

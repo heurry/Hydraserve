@@ -21,6 +21,13 @@ class DecodeBatch:
     token_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class RecoveryPlan:
+    request_id: int
+    replay_token_ids: tuple[int, ...]
+    generated_token_ids: tuple[int, ...]
+
+
 class ContinuousBatchScheduler:
     """Iteration-level scheduler: each active sequence contributes one decode token."""
 
@@ -188,24 +195,50 @@ class ContinuousBatchScheduler:
             self.block_manager.free(request_id)
             self._preempted.append(request_id)
 
-    def resume(self, request_id: int) -> None:
+    def resume(self, request_id: int) -> RecoveryPlan:
+        """Reserve capacity and enter RECOVERING; caller must replay the plan."""
         with self._lock:
             request = self._request(request_id)
             if request.state is not RequestState.PREEMPTED:
                 raise RuntimeError("request is not preempted")
-            required_tokens = len(request.token_ids) + len(request.generated_token_ids)
+            replay = request.token_ids + tuple(request.generated_token_ids[:-1])
+            required_tokens = len(replay)
             total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
             self.block_manager.allocate(
                 request_id,
                 required_tokens,
                 reserve_tokens=max(required_tokens, total_tokens),
             )
-            request.transition(RequestState.READY)
+            request.transition(RequestState.RECOVERING)
             try:
                 self._preempted.remove(request_id)
             except ValueError:
                 pass
+            return RecoveryPlan(
+                request_id,
+                replay,
+                tuple(request.generated_token_ids),
+            )
+
+    def mark_recompute_complete(self, request_id: int) -> None:
+        with self._lock:
+            request = self._request(request_id)
+            if request.state is not RequestState.RECOVERING:
+                raise RuntimeError("request is not recovering")
+            request.transition(RequestState.READY)
             self._ready.append(request_id)
+
+    def fail_recompute(self, request_id: int, *, retryable: bool = False) -> None:
+        with self._lock:
+            request = self._request(request_id)
+            if request.state is not RequestState.RECOVERING:
+                raise RuntimeError("request is not recovering")
+            self.block_manager.free(request_id)
+            if retryable:
+                request.transition(RequestState.PREEMPTED)
+                self._preempted.append(request_id)
+            else:
+                request.transition(RequestState.FAILED)
 
     def cancel(self, request_id: int) -> None:
         with self._lock:

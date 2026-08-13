@@ -31,7 +31,7 @@ def test_new_requests_join_between_decode_iterations() -> None:
     assert second.state is RequestState.RUNNING
 
 
-def test_preempt_releases_blocks_and_resume_reallocates() -> None:
+def test_preempt_releases_blocks_and_resume_requires_recompute() -> None:
     blocks = KVBlockManager(16, block_size=4)
     request = CentralScheduler().submit([1, 2, 3, 4], max_new_tokens=3)
     blocks.allocate(request.request_id, 4)
@@ -44,9 +44,49 @@ def test_preempt_releases_blocks_and_resume_reallocates() -> None:
     scheduler.preempt(request.request_id)
     assert request.state is RequestState.PREEMPTED
     assert blocks.num_free_blocks == 16
-    scheduler.resume(request.request_id)
-    assert request.state is RequestState.READY
+    plan = scheduler.resume(request.request_id)
+    assert plan.replay_token_ids == (1, 2, 3, 4)
+    assert plan.generated_token_ids == (9,)
+    assert request.state is RequestState.RECOVERING
     assert blocks.num_free_blocks == 14
+    assert scheduler.next_decode_batch().request_ids == ()
+    scheduler.mark_recompute_complete(request.request_id)
+    assert request.state is RequestState.READY
+    assert scheduler.next_decode_batch().token_ids == (9,)
+
+
+def test_recovery_replays_only_tokens_already_consumed_by_model() -> None:
+    blocks = KVBlockManager(16, block_size=4)
+    request = CentralScheduler().submit([1, 2], max_new_tokens=4)
+    scheduler = ContinuousBatchScheduler(blocks)
+    scheduler.add(request)
+    scheduler.next_prefill_batch()
+    scheduler.mark_prefill_complete(request.request_id)
+    for token in (7, 8):
+        batch = scheduler.next_decode_batch()
+        scheduler.commit_decode_tokens(batch, (token,))
+
+    scheduler.preempt(request.request_id)
+    plan = scheduler.resume(request.request_id)
+    assert plan.replay_token_ids == (1, 2, 7)
+    assert plan.generated_token_ids == (7, 8)
+    assert blocks.get(request.request_id).num_tokens == 3
+
+
+def test_failed_recompute_releases_reservation() -> None:
+    blocks = KVBlockManager(8, block_size=4)
+    request = CentralScheduler().submit([1, 2], max_new_tokens=2)
+    scheduler = ContinuousBatchScheduler(blocks)
+    scheduler.add(request)
+    scheduler.next_prefill_batch()
+    scheduler.mark_prefill_complete(request.request_id)
+    batch = scheduler.next_decode_batch()
+    scheduler.commit_decode_tokens(batch, (7,))
+    scheduler.preempt(request.request_id)
+    scheduler.resume(request.request_id)
+    scheduler.fail_recompute(request.request_id)
+    assert request.state is RequestState.FAILED
+    assert blocks.num_free_blocks == blocks.num_blocks
 
 
 def test_scheduler_rejects_request_that_cannot_reserve_full_decode() -> None:

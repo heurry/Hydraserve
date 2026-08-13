@@ -3,6 +3,7 @@ from hydraserve.engine.continuous_batching import (
     ContinuousBatchScheduler,
     DecodeBatch,
     PrefillBatchItem,
+    RecoveryPlan,
 )
 from hydraserve.engine.batch_executor import ContinuousBatchExecutor
 from hydraserve.engine.prefill_engine import PrefillEngine, PrefillOutput
@@ -20,6 +21,7 @@ from hydraserve.engine.serving_loop import (
     GenerationEvent,
     GenerationHandle,
     OverloadedError,
+    PartialDecodeError,
     RuntimeGenerationBackend,
     ServingRequest,
 )
@@ -52,11 +54,13 @@ __all__ = [
     "PrefillBatchItem",
     "PrefillOutput",
     "Request",
+    "RecoveryPlan",
     "RequestState",
     "ContinuousGenerationLoop",
     "GenerationEvent",
     "GenerationHandle",
     "OverloadedError",
+    "PartialDecodeError",
     "MultiWorkerGenerationBackend",
     "PDClusterConfig",
     "RuntimeGenerationBackend",

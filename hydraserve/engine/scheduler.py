@@ -15,6 +15,7 @@ class RequestState(str, Enum):
     READY = "ready"
     RUNNING = "running"
     PREEMPTED = "preempted"
+    RECOVERING = "recovering"
     FINISHED = "finished"
     FAILED = "failed"
 
@@ -33,7 +34,12 @@ _TRANSITIONS: dict[RequestState, set[RequestState]] = {
         RequestState.FINISHED,
         RequestState.FAILED,
     },
-    RequestState.PREEMPTED: {RequestState.READY, RequestState.FAILED},
+    RequestState.PREEMPTED: {RequestState.RECOVERING, RequestState.FAILED},
+    RequestState.RECOVERING: {
+        RequestState.READY,
+        RequestState.PREEMPTED,
+        RequestState.FAILED,
+    },
     RequestState.FINISHED: set(),
     RequestState.FAILED: set(),
 }

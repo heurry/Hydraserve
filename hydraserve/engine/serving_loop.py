@@ -20,6 +20,21 @@ class OverloadedError(RuntimeError):
     """The bounded admission queue cannot accept more work."""
 
 
+class PartialDecodeError(RuntimeError):
+    """A decode iteration succeeded for some requests and failed for others."""
+
+    def __init__(self, token_ids: dict[int, int], errors: dict[int, BaseException]) -> None:
+        overlap = set(token_ids) & set(errors)
+        if overlap:
+            raise ValueError(f"partial decode outcomes overlap for requests {sorted(overlap)}")
+        if not errors:
+            raise ValueError("partial decode error requires at least one failed request")
+        self.token_ids = {int(key): int(value) for key, value in token_ids.items()}
+        self.errors = {int(key): value for key, value in errors.items()}
+        failed = ", ".join(str(request_id) for request_id in sorted(self.errors))
+        super().__init__(f"decode failed for request(s): {failed}")
+
+
 @dataclass(frozen=True, slots=True)
 class AdmissionDecision:
     admitted: bool
@@ -373,17 +388,44 @@ class ContinuousGenerationLoop:
             token_ids = self.backend.decode(batch)
             if len(token_ids) != len(batch):
                 raise RuntimeError("decode output count does not match the batch")
+        except PartialDecodeError as exc:
+            expected = {request.request_id for request in batch}
+            actual = set(exc.token_ids) | set(exc.errors)
+            if actual != expected:
+                malformed = RuntimeError(
+                    "partial decode outcome does not cover the scheduled batch"
+                )
+                for request in batch:
+                    self._fail(request, malformed, active=active, release=True)
+                return
+            for request in batch:
+                error = exc.errors.get(request.request_id)
+                if error is not None:
+                    self._fail(request, error, active=active, release=True)
+                else:
+                    self._accept_decode_token(
+                        request, exc.token_ids[request.request_id], active
+                    )
+            return
         except Exception as exc:
             for request in batch:
                 self._fail(request, exc, active=active, release=True)
             return
         for request, token_id in zip(batch, token_ids, strict=True):
-            token_id = int(token_id)
-            request.generated_token_ids.append(token_id)
-            self._emit(request, token_id)
-            reason = self._finish_reason(request, token_id)
-            if reason is not None:
-                self._finish(request, reason, active=active, release=True)
+            self._accept_decode_token(request, token_id, active)
+
+    def _accept_decode_token(
+        self,
+        request: ServingRequest,
+        token_id: int,
+        active: OrderedDict[int, ServingRequest],
+    ) -> None:
+        token_id = int(token_id)
+        request.generated_token_ids.append(token_id)
+        self._emit(request, token_id)
+        reason = self._finish_reason(request, token_id)
+        if reason is not None:
+            self._finish(request, reason, active=active, release=True)
 
     def _remove_cancelled(self, active: OrderedDict[int, ServingRequest]) -> bool:
         cancelled = [request for request in active.values() if request.cancelled.is_set()]
@@ -629,24 +671,97 @@ class RuntimeGenerationBackend:
             raise
 
     def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
+        """Decode transactionally, bisecting a failed batch to isolate requests."""
         import torch
 
-        for request in requests:
-            self.paged_cache.reserve_append(request.request_id)
-        input_ids = torch.tensor(
-            [request.generated_token_ids[-1] for request in requests],
-            device=self.runtime.device,
-            dtype=torch.long,
-        ).unsqueeze(1)
-        states = [self.states[request.request_id] for request in requests]
-        with torch.inference_mode():
-            logits, _ = self.runtime.decode_batch(
-                input_ids,
-                states,
-                self.paged_cache,
-                tuple(request.request_id for request in requests),
-            )
-        return tuple(int(token) for token in logits[:, -1].argmax(dim=-1).tolist())
+        if not requests:
+            return ()
+        request_by_id = {request.request_id: request for request in requests}
+        if len(request_by_id) != len(requests):
+            raise ValueError("decode requests must have unique request ids")
+        manager = self.paged_cache.block_manager
+        base_lengths = {
+            request.request_id: manager.get(request.request_id).num_tokens
+            for request in requests
+        }
+        checkpoints = {
+            request.request_id: self._checkpoint_state(self.states[request.request_id])
+            for request in requests
+        }
+
+        def restore(request_ids: tuple[int, ...]) -> None:
+            for request_id in request_ids:
+                manager.truncate(request_id, base_lengths[request_id])
+                self.states[request_id] = self._checkpoint_state(
+                    checkpoints[request_id]
+                )
+
+        def attempt(request_ids: tuple[int, ...]) -> tuple[int, ...]:
+            manager.grow_many(request_ids, additional_tokens=1)
+            input_ids = torch.tensor(
+                [request_by_id[item].generated_token_ids[-1] for item in request_ids],
+                device=self.runtime.device,
+                dtype=torch.long,
+            ).unsqueeze(1)
+            states = [self.states[item] for item in request_ids]
+            try:
+                with torch.inference_mode():
+                    logits, _ = self.runtime.decode_batch(
+                        input_ids,
+                        states,
+                        self.paged_cache,
+                        request_ids,
+                    )
+                token_ids = tuple(
+                    int(token) for token in logits[:, -1].argmax(dim=-1).tolist()
+                )
+                if len(token_ids) != len(request_ids):
+                    raise RuntimeError(
+                        "runtime decode output count does not match its request group"
+                    )
+                return token_ids
+            except Exception:
+                restore(request_ids)
+                raise
+
+        all_ids = tuple(request_by_id)
+        try:
+            return attempt(all_ids)
+        except Exception:
+            pass
+
+        successes: dict[int, int] = {}
+        failures: dict[int, Exception] = {}
+
+        def isolate(request_ids: tuple[int, ...]) -> None:
+            try:
+                token_ids = attempt(request_ids)
+            except Exception as exc:
+                if len(request_ids) == 1:
+                    failures[request_ids[0]] = exc
+                    return
+                middle = len(request_ids) // 2
+                isolate(request_ids[:middle])
+                isolate(request_ids[middle:])
+                return
+            successes.update(zip(request_ids, token_ids, strict=True))
+
+        isolate(all_ids)
+        if failures:
+            raise PartialDecodeError(successes, failures)
+        return tuple(successes[request.request_id] for request in requests)
+
+    @staticmethod
+    def _checkpoint_state(state):
+        """Take a cheap decode rollback point without copying immutable tensors."""
+        from copy import copy
+
+        checkpoint = copy(state)
+        for name in ("recurrent", "convolution", "keys", "values"):
+            values = getattr(state, name, None)
+            if isinstance(values, dict):
+                setattr(checkpoint, name, values.copy())
+        return checkpoint
 
     def release(self, request_id: int) -> None:
         with self._admission_lock:
