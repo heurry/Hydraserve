@@ -288,6 +288,13 @@ decode worker 通过独立 `recover` RPC 在本地重算并安装状态，不重
 prefix 页，只回收满足请求所需的数量；仍不足则事务式拒绝，现有 allocation/refcount
 不变。
 
+`--cache-tokens` 是物理 KV 的目标上限。模型权重加载后，memory planner 按实际空闲显存、
+KV block 字节数、至少一个完整 GDN 事务槽、512 MiB CUDA hard reserve 和 64 MiB allocator
+guard 计算可安全分配的页数；不能兑现时明确缩容并通过 health/metrics 暴露 requested、
+planned、allocated bytes 和 clamped 状态。FP8 loader 会提前按该目标增加最少的
+host-streamed 投影，尽量先兑现用户的 cache 配置。PD prefill worker 也使用同一套物理
+Paged KV，不再以逐 chunk `torch.cat` 累积 dense K/V；每个请求发送完状态后立即释放页。
+
 allocator 维护物理/可准入页、高水位、allocation failure、active allocation、共享页、
 总引用、logical/reserved token 和 block-tail 内部碎片。Paged KV `audit()` 对账
 request block references + prefix owners = allocator total references，并检查 free list、

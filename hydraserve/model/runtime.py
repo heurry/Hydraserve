@@ -77,10 +77,13 @@ class QwenTextRuntime:
         dtype: Any = None,
         use_triton: bool = True,
         use_flash_attention: bool = True,
+        requested_cache_tokens: int | None = None,
     ) -> "QwenTextRuntime":
         import torch
 
         config = load_model_config(model_dir)
+        if requested_cache_tokens is not None and requested_cache_tokens <= 0:
+            raise ValueError("requested cache tokens must be positive")
         loader = ShardedSafeTensorLoader(model_dir)
         dtype = dtype or torch.bfloat16
         names = loader.keys(f"{LANGUAGE_PREFIX}.")
@@ -120,7 +123,18 @@ class QwenTextRuntime:
             )
             # Preserve space for the recurrent-state pool, KV pages, CUDA
             # libraries and decode activations on memory-bound consumer GPUs.
-            reserve_bytes = max(1024**3, config.recurrent_state_bytes * 3)
+            state_transaction_bytes = config.decode_state_transaction_bytes
+            state_reserve_bytes = max(
+                state_transaction_bytes * 2,
+                state_transaction_bytes + 512 * 1024**2,
+            ) + 64 * 1024**2
+            reserve_bytes = max(1024**3, state_reserve_bytes)
+            if requested_cache_tokens is not None:
+                reserve_bytes = max(
+                    reserve_bytes,
+                    requested_cache_tokens * config.kv_bytes_per_token_bf16
+                    + max(1024**3, state_reserve_bytes),
+                )
             if estimated_gpu_bytes + reserve_bytes > free_bytes:
                 cpu_weight_names.add("lm_head.weight")
                 estimated_gpu_bytes -= estimated_sizes["lm_head.weight"]

@@ -102,6 +102,7 @@ def _prefill_worker(
     try:
         import torch
 
+        from hydraserve.cache import KVBlockManager, PagedKVCache, plan_paged_kv_blocks
         from hydraserve.engine.pd_worker import PrefillWorker
         from hydraserve.model.runtime import QwenTextRuntime
         from hydraserve.transfer import SharedMemoryTransferBackend, TransferPipeline
@@ -114,6 +115,27 @@ def _prefill_worker(
             dtype=torch.bfloat16,
             use_triton=True,
             use_flash_attention=config.use_flash_attention,
+            requested_cache_tokens=config.cache_tokens,
+        )
+        requested_blocks = (
+            config.cache_tokens + config.block_size - 1
+        ) // config.block_size
+        memory_plan = plan_paged_kv_blocks(
+            runtime.config,
+            requested_blocks,
+            block_size=config.block_size,
+            dtype=torch.bfloat16,
+            device=device,
+            state_slots=1,
+            state_workspace_slots=0,
+            state_memory_fraction=1.0,
+        )
+        prefill_cache = PagedKVCache(
+            runtime.config,
+            KVBlockManager(memory_plan.planned_blocks, block_size=config.block_size),
+            device=device,
+            dtype=torch.bfloat16,
+            memory_plan=memory_plan,
         )
         namespaces = (namespace,) if isinstance(namespace, str) else tuple(namespace)
         if not namespaces:
@@ -128,6 +150,7 @@ def _prefill_worker(
                     TransferPipeline(
                         backend, src_gpu=0, dst_gpu=worker_index + 1
                     ),
+                    prefill_cache,
                 )
             )
         responses.put({"op": "ready", "model_name": runtime.config.name})
@@ -148,11 +171,14 @@ def _prefill_worker(
                     transferred=False,
                     sampling_params=command.get("sampling_params"),
                 )
-                result = workers[worker_index].process(
-                    request,
-                    n_minus_one=True,
-                    chunk_size=config.prefill_chunk_size,
-                )
+                try:
+                    result = workers[worker_index].process(
+                        request,
+                        n_minus_one=True,
+                        chunk_size=config.prefill_chunk_size,
+                    )
+                finally:
+                    prefill_cache.free(request_id)
                 responses.put(
                     {
                         "op": "prefill",
@@ -195,6 +221,7 @@ def _decode_worker(
             KVBlockManager,
             PagedKVCache,
             PrefixCache,
+            plan_paged_kv_blocks,
         )
         from hydraserve.engine.pd_worker import DecodeWorker
         from hydraserve.engine.scheduler import RequestState
@@ -211,8 +238,21 @@ def _decode_worker(
             # PARTIAL decode recomputes the whole prompt; do not require the
             # optional prefill-only FlashAttention package on decode workers.
             use_flash_attention=False,
+            requested_cache_tokens=config.cache_tokens,
         )
-        blocks = (config.cache_tokens + config.block_size - 1) // config.block_size
+        requested_blocks = (
+            config.cache_tokens + config.block_size - 1
+        ) // config.block_size
+        memory_plan = plan_paged_kv_blocks(
+            runtime.config,
+            requested_blocks,
+            block_size=config.block_size,
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        blocks = memory_plan.planned_blocks
+        if config.kv_headroom_blocks >= blocks:
+            raise MemoryError("KV headroom consumes the memory-planned cache")
         prefix_cache = (
             PrefixCache(
                 config.block_size,
@@ -240,6 +280,7 @@ def _decode_worker(
                 tokenizer_revision=revision,
                 model_revision=revision,
             ),
+            memory_plan=memory_plan,
         )
         backend = SharedMemoryTransferBackend(namespace=namespace)
         worker = DecodeWorker(

@@ -25,6 +25,7 @@ class PagedKVCache:
         dtype: Any,
         prefix_cache: PrefixCache | None = None,
         cache_namespace: CacheNamespace = DEFAULT_NAMESPACE,
+        memory_plan=None,
     ) -> None:
         import torch
 
@@ -38,6 +39,14 @@ class PagedKVCache:
             raise ValueError("prefix cache and KV allocator block sizes must match")
         self.prefix_cache = prefix_cache
         self.cache_namespace = cache_namespace
+        if memory_plan is not None and memory_plan.planned_blocks != block_manager.num_blocks:
+            raise ValueError("KV memory plan does not match the block manager")
+        self.memory_plan = memory_plan
+        if (
+            self.memory_plan is not None
+            and self.memory_plan.bytes_per_block != self._bytes_per_block()
+        ):
+            raise ValueError("KV memory plan uses an incompatible block layout")
         self._prefix_matches: dict[int, tuple[tuple[int, ...], PrefixMatch]] = {}
         self._prefix_lock = RLock()
         self.layer_to_slot = {
@@ -173,6 +182,20 @@ class PagedKVCache:
         block = self.block_manager.capacity()
         prefix = None if self.prefix_cache is None else self.prefix_cache.stats()
         values: dict[str, int | float] = {
+            "requested_physical_blocks": (
+                block.physical_total_blocks
+                if self.memory_plan is None
+                else self.memory_plan.requested_blocks
+            ),
+            "memory_planned_blocks": block.physical_total_blocks,
+            "memory_clamped": int(
+                self.memory_plan is not None and self.memory_plan.was_clamped
+            ),
+            "memory_reserved_bytes": (
+                0 if self.memory_plan is None else self.memory_plan.reserved_bytes
+            ),
+            "physical_cache_bytes": self._bytes_per_block()
+            * block.physical_total_blocks,
             "physical_total_blocks": block.physical_total_blocks,
             "physical_free_blocks": block.physical_free_blocks,
             "usable_total_blocks": block.total_blocks,

@@ -13,6 +13,10 @@ def test_presets_have_architecture_driven_state_sizes() -> None:
     assert model.num_full_attention_layers == 8
     assert model.kv_bytes_per_token_bf16 == 32 * 1024
     assert 53_000_000 < model.recurrent_state_bytes < 54_000_000
+    assert model.conv_state_bytes > 0
+    assert model.decode_state_transaction_bytes == (
+        model.recurrent_state_bytes * 2 + model.conv_state_bytes
+    )
 
 
 def test_loads_arbitrary_size_from_nested_hf_config(tmp_path) -> None:

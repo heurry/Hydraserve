@@ -174,6 +174,10 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         def cache_stats(self):
             return {
                 "physical_total_blocks": 12,
+                "requested_physical_blocks": 20,
+                "physical_cache_bytes": 6144,
+                "memory_reserved_bytes": 2048,
+                "memory_clamped": 1,
                 "physical_free_blocks": 8,
                 "usable_total_blocks": 10,
                 "allocatable_free_blocks": 6,
@@ -254,6 +258,8 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         )
         assert 'hydraserve_route_cost_profile_drift{route="collocated"} 1' in metrics
         assert 'hydraserve_kv_cache_blocks{state="headroom"} 2' in metrics
+        assert 'hydraserve_kv_cache_blocks{state="requested"} 20' in metrics
+        assert "hydraserve_kv_cache_memory_clamped 1" in metrics
         assert "hydraserve_kv_allocation_failures_total 3" in metrics
         assert "hydraserve_recurrent_state_workspace_slots 4" in metrics
         assert (

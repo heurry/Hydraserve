@@ -9,6 +9,7 @@ from hydraserve.cache import (
     KVBlockManager,
     PagedKVCache,
     PrefixCache,
+    PagedKVMemoryPlan,
 )
 from hydraserve.kernels.paged_attention import paged_prefill_attention
 from hydraserve.kernels.reference import causal_gqa_attention
@@ -44,6 +45,24 @@ def test_paged_kv_write_and_batch_metadata(tiny_model, device: str) -> None:
     assert prefix_lengths.tolist() == [2, 5]
     with pytest.raises(ValueError, match="exceeds"):
         cache.read(1, layer, num_tokens=7)
+
+
+def test_paged_kv_reports_memory_clamping(tiny_model) -> None:
+    manager = KVBlockManager(5, block_size=4)
+    plan = PagedKVMemoryPlan(20, 5, 512, 10_000, 7_000)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        memory_plan=plan,
+    )
+    stats = cache.stats()
+    assert stats["requested_physical_blocks"] == 20
+    assert stats["memory_planned_blocks"] == 5
+    assert stats["memory_clamped"] == 1
+    assert stats["memory_reserved_bytes"] == 7_000
+    assert stats["physical_cache_bytes"] == 5 * 512
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

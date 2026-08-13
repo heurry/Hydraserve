@@ -528,3 +528,25 @@ a materialized BF16 oracle. On one RTX 3090, the final tiled kernel measured
 one-token prefill plus pooled decode with finite 248,320-way logits; peak
 allocation was 22.099 GiB. This is an Ampere compatibility
 path, not a claim of native Hopper FP8 Tensor Core throughput.
+
+## 2026-08-14 — memory-planned KV capacity and Paged PD prefill
+
+Implemented and validated:
+
+- `cache_tokens` is a requested upper bound converted into physical pages only
+  after model weights have been placed and actual free CUDA memory is known;
+- the planner reserves a complete recurrent-state transaction, the state-pool
+  fraction constraint, 512 MiB hard CUDA headroom, and a 64 MiB allocator guard;
+- requested/planned blocks, allocated bytes, reserved bytes, and clamp state are
+  exported through health and Prometheus;
+- the FP8 placement planner receives the requested cache size and offloads the
+  minimum additional large projections needed to preserve it when possible;
+- persistent prefill workers now use self-managed Paged KV for both the first
+  and continuation chunks and free all pages after transfer, replacing dense KV
+  concatenation in the PD prefill process.
+
+On the 24 GB RTX 3090, Qwen3.6-27B-FP8 now honors the default 65,536-token target
+with all 4,096 physical 1 MiB pages (4 GiB), then allocates the default pooled
+transactional state and completes prefill plus decode. A real two-GPU
+Qwen3.5-4B persistent PD generation also passed after switching the prefill
+worker to Paged KV.

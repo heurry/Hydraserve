@@ -240,6 +240,7 @@ def main() -> int:
                 KVBlockManager,
                 PagedKVCache,
                 PrefixCache,
+                plan_paged_kv_blocks,
             )
             from hydraserve.engine import RuntimeGenerationBackend
             from hydraserve.model import QwenTextRuntime
@@ -250,8 +251,21 @@ def main() -> int:
                 dtype=torch.bfloat16,
                 use_triton=True,
                 use_flash_attention=not args.no_flash_attention,
+                requested_cache_tokens=args.cache_tokens,
             )
-            blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+            requested_blocks = (
+                args.cache_tokens + args.block_size - 1
+            ) // args.block_size
+            memory_plan = plan_paged_kv_blocks(
+                runtime.config,
+                requested_blocks,
+                block_size=args.block_size,
+                dtype=torch.bfloat16,
+                device=args.device,
+            )
+            blocks = memory_plan.planned_blocks
+            if args.kv_headroom_blocks >= blocks:
+                parser.error("KV headroom consumes the memory-planned cache")
             cache = PagedKVCache(
                 runtime.config,
                 KVBlockManager(
@@ -277,6 +291,7 @@ def main() -> int:
                     tokenizer_revision=str(args.model.resolve()),
                     model_revision=str(args.model.resolve()),
                 ),
+                memory_plan=memory_plan,
             )
             backend = RuntimeGenerationBackend(
                 runtime,
@@ -405,6 +420,7 @@ def main() -> int:
                 KVBlockManager,
                 PagedKVCache,
                 PrefixCache,
+                plan_paged_kv_blocks,
             )
             from hydraserve.engine import RuntimeGenerationBackend
             from hydraserve.model import QwenTextRuntime
@@ -415,8 +431,21 @@ def main() -> int:
                 dtype=torch.bfloat16,
                 use_triton=True,
                 use_flash_attention=not args.no_flash_attention,
+                requested_cache_tokens=args.cache_tokens,
             )
-            blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+            requested_blocks = (
+                args.cache_tokens + args.block_size - 1
+            ) // args.block_size
+            memory_plan = plan_paged_kv_blocks(
+                runtime.config,
+                requested_blocks,
+                block_size=args.block_size,
+                dtype=torch.bfloat16,
+                device=args.device,
+            )
+            blocks = memory_plan.planned_blocks
+            if args.kv_headroom_blocks >= blocks:
+                parser.error("KV headroom consumes the memory-planned cache")
             cache = PagedKVCache(
                 runtime.config,
                 KVBlockManager(
@@ -442,6 +471,7 @@ def main() -> int:
                     tokenizer_revision=str(args.model.resolve()),
                     model_revision=str(args.model.resolve()),
                 ),
+                memory_plan=memory_plan,
             )
             backend = RuntimeGenerationBackend(
                 runtime,

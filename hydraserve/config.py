@@ -154,6 +154,14 @@ class ModelConfig:
         elements = _product(self.ssm_state_shape) + _product(self.conv_state_shape)
         return elements * 4
 
+    @property
+    def conv_state_bytes(self) -> int:
+        return _product(self.conv_state_shape) * 4
+
+    @property
+    def decode_state_transaction_bytes(self) -> int:
+        return self.recurrent_state_bytes * 2 + self.conv_state_bytes
+
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any], *, name: str | None = None) -> "ModelConfig":
         layers = int(_required(data, "num_hidden_layers", "n_layer"))

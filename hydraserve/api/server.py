@@ -605,6 +605,7 @@ class _Handler(BaseHTTPRequestHandler):
                             f"{stats.get(key, 0)}"
                             for state, key in (
                                 ("physical_total", "physical_total_blocks"),
+                                ("requested", "requested_physical_blocks"),
                                 ("physical_free", "physical_free_blocks"),
                                 ("usable_total", "usable_total_blocks"),
                                 ("allocatable_free", "allocatable_free_blocks"),
@@ -614,6 +615,14 @@ class _Handler(BaseHTTPRequestHandler):
                                 ("high_watermark", "high_watermark_blocks"),
                             )
                         ),
+                        "# TYPE hydraserve_kv_cache_memory_bytes gauge",
+                        'hydraserve_kv_cache_memory_bytes{kind="allocated"} '
+                        f"{stats.get('physical_cache_bytes', 0)}",
+                        'hydraserve_kv_cache_memory_bytes{kind="reserved"} '
+                        f"{stats.get('memory_reserved_bytes', 0)}",
+                        "# TYPE hydraserve_kv_cache_memory_clamped gauge",
+                        "hydraserve_kv_cache_memory_clamped "
+                        f"{stats.get('memory_clamped', 0)}",
                         "# TYPE hydraserve_kv_allocation_failures_total counter",
                         f"hydraserve_kv_allocation_failures_total {stats.get('allocation_failures', 0)}",
                         "# TYPE hydraserve_kv_internal_fragmentation_tokens gauge",
