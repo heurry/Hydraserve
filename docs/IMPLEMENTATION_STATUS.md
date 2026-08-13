@@ -57,8 +57,25 @@ not claimed as a real hardware result.
 
 Next implementation slice:
 
-1. persistent multi-process serving loop and worker supervision;
-2. OpenAI-compatible streaming API;
-3. tokenizer-aware benchmark workload generation and latency/throughput metrics;
-4. chunked-prefill history integration;
-5. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.
+## 2026-08-13 — serving and benchmark slice
+
+Implemented:
+
+- persistent admission/decode loop with dynamic Continuous Batching, cancellation,
+  EOS/length termination, and failure cleanup;
+- direct `tokenizer.json` loading and incremental byte-safe decoding;
+- `/v1/completions`, `/v1/chat/completions`, `/v1/models`, `/health`, and SSE;
+- tokenizer-aware concurrent benchmark runner with TTFT, TPOT, latency,
+  request throughput, output-token throughput, and P50/P95/P99;
+- command-line `serve`, `benchmark`, and `inspect-datasets` entry points.
+
+Real validation: Qwen3.5-4B returned ` Paris.` for a two-token completion through
+the HTTP API. A two-request GSM8K CLI smoke completed successfully. These tiny,
+cold-start samples validate integration and are not performance claims.
+
+Next implementation slice:
+
+1. connect the tested two-process PD workers to the persistent API coordinator;
+2. chunked-prefill history integration;
+3. full B-vs-D dataset experiments with warmup and controlled arrival traces;
+4. 9B/27B runtime validation and P2P/NVLink validation on capable hardware.

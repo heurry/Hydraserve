@@ -31,8 +31,10 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
 - 完整块粒度的 full-attention prefix radix cache（不错误缓存 GDN 状态）；
 - ShareGPT、HumanEval、LongBench、WikiText-103、GSM8K 低内存数据适配器。
 
-OpenAI-compatible API、持续运行的多进程 serving loop 和 benchmark 指标采集仍待实现。
-P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
+当前还包括驻留式 Continuous Batching 生成循环、直接读取 `tokenizer.json` 的文本
+tokenizer、OpenAI-compatible completions/chat/SSE API，以及 TTFT/TPOT/P50/P95/P99
+benchmark runner。HTTP CLI 当前接单 GPU runtime；已实测的双进程双 GPU PD worker
+尚待接入长期驻留 API 编排。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
 真实 P2P 实测；层级流水线也只完成协议和单测，不宣称已在 NVLink/P2P 上验证。
 
 ## 模型兼容性
@@ -81,6 +83,27 @@ python -m hydraserve inspect-datasets /mnt/nvme-data/datasets/benchmark --limit 
 当前目录中 `wikitext-103-raw.tar.gz` 和 `wikitext-103-test.csv` 是 0 字节，
 加载器固定使用有效的 `wikitext-103-test.jsonl`。
 
+启动文本 API（模型执行只使用 HydraServe runtime；`tokenizers` 仅用于文本编解码）：
+
+```bash
+python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  --device cuda:0 --port 8000
+
+curl http://127.0.0.1:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"Qwen3.5-4B","prompt":"The capital of France is","max_tokens":8,"temperature":0}'
+```
+
+当前采样器只支持 greedy `temperature=0`，API 只处理文本。运行本机 benchmark：
+
+```bash
+python -m hydraserve benchmark \
+  /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  /mnt/nvme-data/datasets/benchmark \
+  --dataset gsm8k --limit 100 --concurrency 8 \
+  --output benchmark_output/gsm8k.json
+```
+
 ## 代码结构
 
 ```text
@@ -92,7 +115,8 @@ hydraserve/
 ├── transfer/                 # 描述符、后端、双状态 pipeline
 ├── engine/                   # chunked prefill、continuous batching、状态机
 ├── router/                   # 自适应 PD 路由
-└── benchmark/                # 流式数据集适配器
+├── api/                      # OpenAI-compatible JSON/SSE HTTP 层
+└── benchmark/                # 流式数据适配器、延迟与吞吐统计
 ```
 
 设计目标、硬件数据和完整里程碑见 [`main.md`](main.md)。

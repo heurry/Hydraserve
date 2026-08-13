@@ -13,6 +13,13 @@ from hydraserve.engine.pd_worker import (
     PrefillWorker,
 )
 from hydraserve.engine.scheduler import CentralScheduler, Request, RequestState
+from hydraserve.engine.serving_loop import (
+    ContinuousGenerationLoop,
+    GenerationEvent,
+    GenerationHandle,
+    RuntimeGenerationBackend,
+    ServingRequest,
+)
 
 __all__ = [
     "CentralScheduler",
@@ -30,4 +37,9 @@ __all__ = [
     "PrefillOutput",
     "Request",
     "RequestState",
+    "ContinuousGenerationLoop",
+    "GenerationEvent",
+    "GenerationHandle",
+    "RuntimeGenerationBackend",
+    "ServingRequest",
 ]
