@@ -419,3 +419,23 @@ def test_backend_capacity_uses_most_constrained_resource() -> None:
     capacity = BackendCapacity(100, 80, 10, 2)
     assert capacity.decode_load == pytest.approx(0.8)
     assert capacity.has_request_slot
+
+
+def test_prefill_queue_prediction_uses_running_future_remaining_work() -> None:
+    from time import monotonic
+
+    class RunningFuture:
+        def done(self):
+            return False
+
+        def running(self):
+            return True
+
+    request = ServingRequest(99, (1,), 1)
+    request.route = "collocated"
+    request.route_collocated_cost_ms = 100.0
+    request.prefill_started_at = monotonic() - 0.04
+    predicted = ContinuousGenerationLoop._prefill_queue_ahead_ms(
+        {99: (request, RunningFuture())}
+    )
+    assert 40.0 <= predicted <= 70.0

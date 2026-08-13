@@ -15,6 +15,7 @@ from hydraserve.benchmark.datasets import BenchmarkSample
 @dataclass(frozen=True, slots=True)
 class RequestMetrics:
     sample_id: str
+    request_id: int | None
     prompt_tokens: int
     completion_tokens: int
     ttft_ms: float | None
@@ -30,6 +31,10 @@ class RequestMetrics:
     route_estimated_savings_ms: float | None = None
     route_cost_confidence: float | None = None
     route_decode_load: float | None = None
+    route_prefill_queue_ahead_ms: float = 0.0
+    route_observed_prefill_service_ms: float | None = None
+    admission_wait_ms: float | None = None
+    observed_prefill_queue_wait_ms: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,6 +137,12 @@ def run_benchmark(
                 f"warmup request {sample.sample_id} failed: "
                 f"{None if terminal is None else terminal.error}"
             )
+    if warmups:
+        reset_calibration = getattr(
+            generation_loop.backend, "reset_routing_calibration", None
+        )
+        if reset_calibration is not None:
+            reset_calibration()
 
     def run_one(item) -> tuple[int, RequestMetrics]:
         index, sample = item
@@ -161,23 +172,57 @@ def run_benchmark(
         tpot_ms = None
         if first_token_at is not None and completion_tokens > 1:
             tpot_ms = (ended - first_token_at) * 1000 / (completion_tokens - 1)
+        admission_wait_ms = (
+            None if handle is None else handle.request.admission_wait_ms
+        )
+        observed_service_ms = (
+            None
+            if handle is None
+            else handle.request.route_observed_prefill_service_ms
+        )
+        observed_queue_ms = (
+            None
+            if handle is None
+            else handle.request.observed_prefill_queue_wait_ms
+        )
         return index, RequestMetrics(
-            sample.sample_id,
-            len(token_ids),
-            completion_tokens,
-            ttft_ms,
-            tpot_ms,
-            latency_ms,
-            finish_reason,
-            error,
-            None if handle is None else (handle.request.route or "collocated"),
-            None if handle is None else handle.request.route_reason,
-            None if handle is None else handle.request.worker_id,
-            None if handle is None else handle.request.route_collocated_cost_ms,
-            None if handle is None else handle.request.route_pd_cost_ms,
-            None if handle is None else handle.request.route_estimated_savings_ms,
-            None if handle is None else handle.request.route_cost_confidence,
-            None if handle is None else handle.request.route_decode_load,
+            sample_id=sample.sample_id,
+            request_id=None if handle is None else handle.request_id,
+            prompt_tokens=len(token_ids),
+            completion_tokens=completion_tokens,
+            ttft_ms=ttft_ms,
+            tpot_ms=tpot_ms,
+            latency_ms=latency_ms,
+            finish_reason=finish_reason,
+            error=error,
+            route=None if handle is None else (handle.request.route or "collocated"),
+            route_reason=None if handle is None else handle.request.route_reason,
+            worker_id=None if handle is None else handle.request.worker_id,
+            route_collocated_cost_ms=(
+                None if handle is None else handle.request.route_collocated_cost_ms
+            ),
+            route_pd_cost_ms=(
+                None if handle is None else handle.request.route_pd_cost_ms
+            ),
+            route_estimated_savings_ms=(
+                None
+                if handle is None
+                else handle.request.route_estimated_savings_ms
+            ),
+            route_cost_confidence=(
+                None if handle is None else handle.request.route_cost_confidence
+            ),
+            route_decode_load=(
+                None if handle is None else handle.request.route_decode_load
+            ),
+            route_prefill_queue_ahead_ms=(
+                0.0
+                if handle is None
+                else handle.request.route_prefill_queue_ahead_ms
+            ),
+            route_observed_prefill_service_ms=observed_service_ms,
+            admission_wait_ms=admission_wait_ms,
+            observed_prefill_queue_wait_ms=observed_queue_ms,
         )
 
     offsets: list[float] = []

@@ -81,6 +81,27 @@ worker 0 and its admission load (0.0, 0.25, 0.5, or 0.75). This run validates
 route metadata and load capture, not a comparison with the earlier 16-output-
 token throughput matrix.
 
+### Corrected adaptive-path calibration
+
+The initial load fit above used standalone collocated TTFT as a proxy for the
+adaptive worker path and therefore mixed admission queue, executor queue,
+decode/event-loop interference, and model service. That diagnostic is retained
+above because it motivated the correction, but it is not the final profile.
+
+The corrected runner records internal request order, submission-to-admission
+wait, predicted and directly measured executor queue wait, and directly timed
+backend prefill service. Warmup compiles kernels, then resets only online EWMA
+and hysteresis so cold compilation cannot contaminate measured route costs.
+Both collocated and PD calibration traces now run through the same adaptive
+coordinator; a temporary force-PD profile was used only to collect the PD arm.
+
+After the warmup reset, C4 predicted-queue MAE was 56.7 ms collocated and
+69.9 ms PD, down from 107.8 and 681.1 ms respectively. The final checked-in
+direct-service curves use 17 collocated and 18 PD observations spanning
+26–9,000 tokens. Their RMSE is 22.37 ms and 64.15 ms. These values supersede the
+earlier TTFT/load fit for routing; admission and event-loop waits remain
+separate SLO diagnostics.
+
 ## OOM found and fixed
 
 The first 9K adaptive run failed 0/2 on the decode worker with an attempted

@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from itertools import count
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
+from time import monotonic
 from typing import Protocol
 from secrets import randbits
 
@@ -119,6 +120,13 @@ class ServingRequest:
     route_estimated_savings_ms: float | None = None
     route_cost_confidence: float | None = None
     route_decode_load: float | None = None
+    route_prefill_queue_ahead_ms: float = 0.0
+    route_observed_prefill_service_ms: float | None = None
+    prefill_started_at: float | None = None
+    submitted_at: float = field(default_factory=monotonic)
+    admitted_at: float | None = None
+    admission_wait_ms: float | None = None
+    observed_prefill_queue_wait_ms: float | None = None
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0
@@ -342,6 +350,9 @@ class ContinuousGenerationLoop:
                 self._finish(request, "cancelled", active=active, release=False)
                 did_work = True
                 continue
+            request.route_prefill_queue_ahead_ms = self._prefill_queue_ahead_ms(
+                pending
+            )
             decision = self._admission_decision(request)
             if not decision.admitted:
                 if decision.retryable:
@@ -357,14 +368,55 @@ class ContinuousGenerationLoop:
                 )
                 did_work = True
                 continue
+            self._record_admission(request)
             self._pending_done(request)
             pending[request.request_id] = (
                 request,
-                executor.submit(self.backend.prefill, request),
+                executor.submit(self._execute_prefill, request),
             )
             available_slots -= 1
             did_work = True
         return did_work
+
+    @staticmethod
+    def _prefill_queue_ahead_ms(pending) -> float:
+        now = monotonic()
+        total = 0.0
+        for request, future in pending.values():
+            if future.done():
+                continue
+            if request.route == "pd_disaggregated":
+                predicted = request.route_pd_cost_ms
+            else:
+                predicted = request.route_collocated_cost_ms
+            if predicted is not None:
+                service_ms = max(
+                    0.0,
+                    predicted - request.route_prefill_queue_ahead_ms,
+                )
+                if future.running() and request.prefill_started_at is not None:
+                    service_ms = max(
+                        0.0,
+                        service_ms - (now - request.prefill_started_at) * 1000.0,
+                    )
+                total += service_ms
+        return total
+
+    def _execute_prefill(self, request: ServingRequest):
+        request.prefill_started_at = monotonic()
+        if request.admitted_at is not None:
+            request.observed_prefill_queue_wait_ms = max(
+                0.0, (request.prefill_started_at - request.admitted_at) * 1000.0
+            )
+        return self.backend.prefill(request)
+
+    @staticmethod
+    def _record_admission(request: ServingRequest) -> None:
+        if request.admission_wait_ms is None:
+            request.admitted_at = monotonic()
+            request.admission_wait_ms = max(
+                0.0, (request.admitted_at - request.submitted_at) * 1000.0
+            )
 
     def _collect_async_prefill(self, active, pending, *, wait: bool = False) -> bool:
         completed = []
@@ -421,6 +473,7 @@ class ContinuousGenerationLoop:
                 )
                 did_work = True
                 continue
+            self._record_admission(request)
             self._pending_done(request)
             available_slots -= 1
             did_work = True

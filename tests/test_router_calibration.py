@@ -49,6 +49,23 @@ def test_curve_fit_separates_decode_load_externality() -> None:
     assert fitted.diagnostics.rmse_ms < 1e-8
 
 
+def test_curve_fit_subtracts_common_prefill_queue_work() -> None:
+    baseline = _points(20, 0.1, 0.0001)
+    queued = tuple(
+        CalibrationPoint(
+            point.prompt_tokens,
+            point.ttft_ms + 500,
+            0.0,
+            500,
+        )
+        for point in baseline
+    )
+    fitted = fit_latency_curve((*baseline, *queued))
+    assert fitted.curve.fixed_ms == pytest.approx(20, rel=1e-7)
+    assert fitted.curve.linear_ms_per_token == pytest.approx(0.1, rel=1e-7)
+    assert fitted.diagnostics.rmse_ms < 1e-8
+
+
 def test_curve_fit_requires_prompt_length_coverage() -> None:
     with pytest.raises(ValueError, match="three distinct"):
         fit_latency_curve((CalibrationPoint(32, 10), CalibrationPoint(64, 20)))

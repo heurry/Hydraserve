@@ -187,7 +187,9 @@ python -m hydraserve fit-router-profile \
 减少边界附近抖动。在线 EWMA 修正连续达到 `drift_min_observations` 且偏离 profile 超过
 `drift_ratio_threshold` 时，默认 fail closed 到 collocated；`/health` 变为 degraded，
 `hydraserve_route_cost_profile_drift` 置 1。benchmark 每条结果同时记录 admission
-decode load，便于重放与重新拟合。
+decode load、内部 request/admission 顺序、submission→admission wait、预测与实测
+prefill queue wait、以及 executor 内直接测得的 prefill service time，便于重放和重新
+拟合。profile fitter 优先使用直接 service 观测；旧 JSON 才回退到 TTFT−queue。
 
 1P+ND 使用一个 prefill worker 和多个各自持有 KV/GDN 容量的 decode worker：
 
@@ -226,7 +228,8 @@ python -m hydraserve benchmark \
 冷启动烟测已打通 collocated 与 PD；这种短 prompt 小样本中 PD 更慢，不能作为
 crossover 或吞吐结论。
 
-runner 支持 `--warmup` 排除首次 kernel 编译，并支持 `burst`、固定速率和 seeded
+runner 支持 `--warmup` 排除首次 kernel 编译，并在 warmup 后清空在线路由 EWMA/迟滞
+状态，避免把 CUDA/Triton 冷编译误学成 profile drift；模型与 kernel 保持热驻留。它还支持 `burst`、固定速率和 seeded
 Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让 GPU1 继续
 推进已有 decode；GPU1 安装新请求的重算阶段仍需与 decode 串行。
 benchmark 结果会记录每个请求的实际 route、route reason、worker binding、两条预测

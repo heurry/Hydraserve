@@ -39,6 +39,7 @@ class RouteDecision:
     pd_cost_ms: float | None = None
     estimated_savings_ms: float | None = None
     cost_model_confidence: float | None = None
+    prefill_queue_ahead_ms: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,19 +65,28 @@ class AdaptiveRouter:
         prompt_tokens: int,
         decode_load: float,
         decode_has_slot: bool = True,
+        prefill_queue_ahead_ms: float = 0.0,
     ) -> Route:
-        return self.decide(prompt_tokens, decode_load, decode_has_slot).route
+        return self.decide(
+            prompt_tokens,
+            decode_load,
+            decode_has_slot,
+            prefill_queue_ahead_ms,
+        ).route
 
     def decide(
         self,
         prompt_tokens: int,
         decode_load: float,
         decode_has_slot: bool = True,
+        prefill_queue_ahead_ms: float = 0.0,
     ) -> RouteDecision:
         if prompt_tokens <= 0:
             raise ValueError("prompt_tokens must be positive")
         if not 0 <= decode_load <= 1:
             raise ValueError("decode_load must be in [0, 1]")
+        if prefill_queue_ahead_ms < 0:
+            raise ValueError("prefill queue cost cannot be negative")
         if prompt_tokens >= self.config.force_pd_tokens:
             route, reason = Route.PD_DISAGGREGATED, RouteReason.FORCED_LONG_PROMPT
         elif prompt_tokens < self.config.short_prompt_tokens:
@@ -98,6 +108,7 @@ class AdaptiveRouter:
             prompt_tokens=prompt_tokens,
             decode_load=decode_load,
             decode_has_slot=decode_has_slot,
+            prefill_queue_ahead_ms=prefill_queue_ahead_ms,
         )
 
 
@@ -171,16 +182,16 @@ class CostRouterConfig:
 
         return cls(
             collocated=LatencyCurve(
-                16.767807395778988,
-                0.775929730019134,
-                0.00026724709023354896,
-                1.0836663196165324,
+                28.075501691917207,
+                0.3720540365424588,
+                0.00043369855004635356,
+                0.1571279209918884,
             ),
             pd_disaggregated=LatencyCurve(
-                264.67172221148587,
-                0.6056289161730537,
-                0.00045792580777039157,
-                1.8343988443004484,
+                216.26650429730614,
+                1.478002962857347,
+                0.00036159295511324613,
+                0.0,
             ),
             minimum_pd_prompt_tokens=256,
             minimum_savings_ms=5.0,
@@ -245,26 +256,39 @@ class CostAwareRouter:
         prompt_tokens: int,
         decode_load: float,
         decode_has_slot: bool = True,
+        prefill_queue_ahead_ms: float = 0.0,
     ) -> Route:
-        return self.decide(prompt_tokens, decode_load, decode_has_slot).route
+        return self.decide(
+            prompt_tokens,
+            decode_load,
+            decode_has_slot,
+            prefill_queue_ahead_ms,
+        ).route
 
     def decide(
         self,
         prompt_tokens: int,
         decode_load: float,
         decode_has_slot: bool = True,
+        prefill_queue_ahead_ms: float = 0.0,
     ) -> RouteDecision:
         if prompt_tokens <= 0:
             raise ValueError("prompt_tokens must be positive")
         if not 0 <= decode_load <= 1:
             raise ValueError("decode_load must be in [0, 1]")
-        collocated = self._predict(Route.COLLOCATED, prompt_tokens, decode_load)
-        pd = self._predict(Route.PD_DISAGGREGATED, prompt_tokens, decode_load)
-        risk_adjusted_pd = pd * self.config.pd_uncertainty_multiplier
-        savings = collocated - risk_adjusted_pd
+        if prefill_queue_ahead_ms < 0:
+            raise ValueError("prefill queue cost cannot be negative")
+        collocated_service = self._predict(
+            Route.COLLOCATED, prompt_tokens, decode_load
+        )
+        pd_service = self._predict(Route.PD_DISAGGREGATED, prompt_tokens, decode_load)
+        risk_adjusted_pd_service = (
+            pd_service * self.config.pd_uncertainty_multiplier
+        )
+        savings = collocated_service - risk_adjusted_pd_service
         required_savings = max(
             self.config.minimum_savings_ms,
-            collocated * self.config.minimum_savings_ratio,
+            collocated_service * self.config.minimum_savings_ratio,
         )
         bucket = self._bucket(prompt_tokens)
         if not decode_has_slot:
@@ -277,7 +301,7 @@ class CostAwareRouter:
                 previous = self._last_routes.get(bucket)
                 hysteresis = max(
                     self.config.hysteresis_ms,
-                    collocated * self.config.hysteresis_ratio,
+                    collocated_service * self.config.hysteresis_ratio,
                 )
                 if drifted and self.config.fail_closed_on_drift:
                     route, reason = Route.COLLOCATED, RouteReason.COST_MODEL_DRIFT
@@ -307,10 +331,11 @@ class CostAwareRouter:
             prompt_tokens,
             decode_load,
             decode_has_slot,
-            collocated,
-            risk_adjusted_pd,
+            collocated_service + prefill_queue_ahead_ms,
+            risk_adjusted_pd_service + prefill_queue_ahead_ms,
             savings,
             self._confidence(prompt_tokens),
+            prefill_queue_ahead_ms,
         )
 
     def observe(
@@ -319,12 +344,20 @@ class CostAwareRouter:
         prompt_tokens: int,
         elapsed_ms: float,
         decode_load: float,
+        prefill_queue_ahead_ms: float = 0.0,
     ) -> None:
         route = Route(route)
-        if prompt_tokens <= 0 or elapsed_ms <= 0 or not 0 <= decode_load <= 1:
+        if (
+            prompt_tokens <= 0
+            or elapsed_ms <= 0
+            or not 0 <= decode_load <= 1
+            or prefill_queue_ahead_ms < 0
+        ):
             raise ValueError("invalid route-cost observation")
         curve = self._curve(route)
         baseline = curve.predict(prompt_tokens, decode_load)
+        # Backend timing begins when its executor task starts; it is already
+        # queue-free. The queue estimate is only for end-to-end TTFT attribution.
         ratio = min(4.0, max(0.25, elapsed_ms / max(baseline, 1e-6)))
         key = (route, self._bucket(prompt_tokens))
         with self._lock:
@@ -363,6 +396,13 @@ class CostAwareRouter:
                 collocated_drift,
                 pd_drift,
             )
+
+    def reset_online_state(self) -> None:
+        """Drop learned corrections/hysteresis without changing the profile."""
+
+        with self._lock:
+            self._observations.clear()
+            self._last_routes.clear()
 
     def _predict(self, route: Route, prompt_tokens: int, decode_load: float) -> float:
         baseline = self._curve(route).predict(prompt_tokens, decode_load)

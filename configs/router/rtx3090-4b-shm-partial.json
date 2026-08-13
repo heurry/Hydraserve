@@ -1,15 +1,15 @@
 {
   "collocated": {
-    "fixed_ms": 16.767807395778988,
-    "linear_ms_per_token": 0.775929730019134,
-    "quadratic_ms_per_token2": 0.00026724709023354896,
-    "decode_load_scale": 1.0836663196165324
+    "fixed_ms": 28.075501691917207,
+    "linear_ms_per_token": 0.3720540365424588,
+    "quadratic_ms_per_token2": 0.00043369855004635356,
+    "decode_load_scale": 0.1571279209918884
   },
   "pd_disaggregated": {
-    "fixed_ms": 264.67172221148587,
-    "linear_ms_per_token": 0.6056289161730537,
-    "quadratic_ms_per_token2": 0.00045792580777039157,
-    "decode_load_scale": 1.8343988443004484
+    "fixed_ms": 216.26650429730614,
+    "linear_ms_per_token": 1.478002962857347,
+    "quadratic_ms_per_token2": 0.00036159295511324613,
+    "decode_load_scale": 0.0
   },
   "minimum_pd_prompt_tokens": 256,
   "minimum_savings_ms": 5.0,
@@ -24,11 +24,11 @@
   "metadata": {
     "fit": {
       "collocated": {
-        "samples": 18,
+        "samples": 17,
         "unique_prompt_lengths": 9,
         "minimum_prompt_tokens": 26,
         "maximum_prompt_tokens": 9000,
-        "rmse_ms": 58.22010689163022,
+        "rmse_ms": 22.372673218650508,
         "loaded_samples": 7
       },
       "pd_disaggregated": {
@@ -36,11 +36,11 @@
         "unique_prompt_lengths": 9,
         "minimum_prompt_tokens": 26,
         "maximum_prompt_tokens": 9000,
-        "rmse_ms": 246.30469620297816,
+        "rmse_ms": 64.15298113559754,
         "loaded_samples": 7
       }
     },
-    "latency_metric": "ttft_ms",
+    "latency_metric": "route_observed_prefill_service_ms (TTFT-minus-queue fallback for legacy inputs)",
     "recommended_input": "warmed C1 baselines plus optional loaded traces carrying route_decode_load"
   }
 }

@@ -771,6 +771,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 len(request.token_ids),
                 capacity.decode_load,
                 capacity.has_request_slot,
+                request.route_prefill_queue_ahead_ms,
             )
         else:
             decision = RouteDecision(
@@ -792,6 +793,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 request.route_estimated_savings_ms = bound.estimated_savings_ms
                 request.route_cost_confidence = bound.cost_model_confidence
                 request.route_decode_load = bound.decode_load
+                request.route_prefill_queue_ahead_ms = bound.prefill_queue_ahead_ms
         return admitted
 
     def prefill(self, request: ServingRequest) -> int | TokenSample:
@@ -802,7 +804,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
         started = monotonic()
         if decision.route is Route.COLLOCATED:
             token_id = self._prefill_collocated(request)
-            self._observe_route_cost(decision, started)
+            self._observe_route_cost(request, decision, started)
             with self._route_lock:
                 self._collocated_count += 1
             return token_id
@@ -813,19 +815,27 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 self._pd_failures += 1
                 self._prefill_healthy = False
             raise
-        self._observe_route_cost(decision, started)
+        self._observe_route_cost(request, decision, started)
         with self._route_lock:
             self._pd_count += 1
         return token_id
 
-    def _observe_route_cost(self, decision: RouteDecision, started: float) -> None:
+    def _observe_route_cost(
+        self,
+        request: ServingRequest,
+        decision: RouteDecision,
+        started: float,
+    ) -> None:
+        elapsed_ms = (monotonic() - started) * 1000.0
+        request.route_observed_prefill_service_ms = elapsed_ms
         observe = getattr(self.router, "observe", None)
         if observe is not None:
             observe(
                 decision.route,
                 decision.prompt_tokens,
-                (monotonic() - started) * 1000.0,
+                elapsed_ms,
                 decision.decode_load,
+                decision.prefill_queue_ahead_ms,
             )
 
     def route_for(self, request_id: int) -> RouteDecision:
@@ -854,3 +864,8 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
     def routing_cost_stats(self):
         stats = getattr(self.router, "stats", None)
         return None if stats is None else stats()
+
+    def reset_routing_calibration(self) -> None:
+        reset = getattr(self.router, "reset_online_state", None)
+        if reset is not None:
+            reset()

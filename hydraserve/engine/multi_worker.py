@@ -251,7 +251,10 @@ class MultiWorkerGenerationBackend:
             with self._state_lock:
                 if self._prefill_healthy:
                     decision = self.router.decide(
-                        len(request.token_ids), candidate.decode_load, True
+                        len(request.token_ids),
+                        candidate.decode_load,
+                        True,
+                        request.route_prefill_queue_ahead_ms,
                     )
                 else:
                     decision = RouteDecision(
@@ -269,6 +272,9 @@ class MultiWorkerGenerationBackend:
                 request.route_estimated_savings_ms = decision.estimated_savings_ms
                 request.route_cost_confidence = decision.cost_model_confidence
                 request.route_decode_load = decision.decode_load
+                request.route_prefill_queue_ahead_ms = (
+                    decision.prefill_queue_ahead_ms
+                )
             return AdmissionDecision.accept()
         return AdmissionDecision.defer(
             last_retryable or "all decode workers rejected the reservation"
@@ -283,7 +289,7 @@ class MultiWorkerGenerationBackend:
         started = monotonic()
         if decision.route is Route.COLLOCATED:
             token_id = self._collocated_prefill(worker_id, request)
-            self._observe_route_cost(decision, started)
+            self._observe_route_cost(request, decision, started)
             with self._state_lock:
                 self._collocated_count += 1
             return token_id
@@ -315,20 +321,28 @@ class MultiWorkerGenerationBackend:
         if not prepared.get("replay_consistent", True):
             with self._state_lock:
                 self._replay_mismatches += 1
-        self._observe_route_cost(decision, started)
+        self._observe_route_cost(request, decision, started)
         with self._state_lock:
             self._pd_count += 1
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
 
-    def _observe_route_cost(self, decision: RouteDecision, started: float) -> None:
+    def _observe_route_cost(
+        self,
+        request: ServingRequest,
+        decision: RouteDecision,
+        started: float,
+    ) -> None:
+        elapsed_ms = (monotonic() - started) * 1000.0
+        request.route_observed_prefill_service_ms = elapsed_ms
         observe = getattr(self.router, "observe", None)
         if observe is not None:
             observe(
                 decision.route,
                 decision.prompt_tokens,
-                (monotonic() - started) * 1000.0,
+                elapsed_ms,
                 decision.decode_load,
+                decision.prefill_queue_ahead_ms,
             )
 
     def decode(
@@ -429,6 +443,11 @@ class MultiWorkerGenerationBackend:
     def routing_cost_stats(self):
         stats = getattr(self.router, "stats", None)
         return None if stats is None else stats()
+
+    def reset_routing_calibration(self) -> None:
+        reset = getattr(self.router, "reset_online_state", None)
+        if reset is not None:
+            reset()
 
     def recovery_stats(self) -> WorkerRecoveryStats:
         snapshots = self.registry.snapshots()

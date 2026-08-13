@@ -52,7 +52,34 @@ def test_benchmark_collects_concurrent_latency_and_throughput() -> None:
     assert summary.to_dict()["results"][0]["sample_id"] == "1"
     assert "route_estimated_savings_ms" in summary.to_dict()["results"][0]
     assert "route_decode_load" in summary.to_dict()["results"][0]
+    assert "route_prefill_queue_ahead_ms" in summary.to_dict()["results"][0]
+    assert "route_observed_prefill_service_ms" in summary.to_dict()["results"][0]
+    assert "admission_wait_ms" in summary.to_dict()["results"][0]
+    assert "observed_prefill_queue_wait_ms" in summary.to_dict()["results"][0]
+    assert "request_id" in summary.to_dict()["results"][0]
     assert backend.live == set()
+
+
+def test_benchmark_resets_online_router_state_after_warmup() -> None:
+    class CalibratedBackend(Backend):
+        def __init__(self):
+            super().__init__()
+            self.reset_count = 0
+
+        def reset_routing_calibration(self):
+            self.reset_count += 1
+
+    backend = CalibratedBackend()
+    loop = ContinuousGenerationLoop(backend)
+    run_benchmark(
+        loop,
+        Tokenizer(),
+        [BenchmarkSample("toy", str(index), "x") for index in range(2)],
+        max_new_tokens=1,
+        warmup_requests=1,
+    )
+    loop.close()
+    assert backend.reset_count == 1
 
 
 def test_benchmark_records_request_error() -> None:

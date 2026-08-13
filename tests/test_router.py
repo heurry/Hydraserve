@@ -144,3 +144,26 @@ def test_profile_drift_fails_closed_and_is_reported() -> None:
     assert decision.route is Route.COLLOCATED
     assert decision.reason is RouteReason.COST_MODEL_DRIFT
     assert router.stats().collocated_drifted_buckets == (10,)
+
+
+def test_common_prefill_queue_cost_does_not_change_route_savings_or_calibration() -> None:
+    router = CostAwareRouter(
+        CostRouterConfig(
+            collocated=LatencyCurve(100, 0),
+            pd_disaggregated=LatencyCurve(50, 0),
+            minimum_pd_prompt_tokens=1,
+            minimum_savings_ms=1,
+            minimum_savings_ratio=0,
+            pd_uncertainty_multiplier=1,
+        )
+    )
+    clear = router.decide(1024, 0, prefill_queue_ahead_ms=0)
+    queued = router.decide(1024, 0, prefill_queue_ahead_ms=300)
+    assert clear.route is queued.route is Route.PD_DISAGGREGATED
+    assert queued.collocated_cost_ms == pytest.approx(clear.collocated_cost_ms + 300)
+    assert queued.pd_cost_ms == pytest.approx(clear.pd_cost_ms + 300)
+    assert queued.estimated_savings_ms == clear.estimated_savings_ms
+    router.observe(Route.PD_DISAGGREGATED, 1024, 50, 0, 300)
+    assert router.stats().pd_correction == pytest.approx(1)
+    router.reset_online_state()
+    assert router.stats().pd_observations == 0

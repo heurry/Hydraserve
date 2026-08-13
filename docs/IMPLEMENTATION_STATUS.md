@@ -272,3 +272,28 @@ Adding 8 C4 observations per route produced load scales of 1.08 collocated and
 partial-PD RMSE increased to 246.30 ms. The latter is retained as evidence that
 decode load alone is insufficient: serial prefill queue position and in-flight
 prompt work must be explicit features in the next routing model.
+
+## 2026-08-14 — queue/service latency decomposition
+
+The first loaded profile incorrectly treated end-to-end TTFT as model service
+time. Production instrumentation now records, per request:
+
+- submission-to-admission wait;
+- predicted work ahead at route binding;
+- directly timed executor queue wait;
+- directly timed backend prefill service;
+- end-to-end TTFT and internal request/admission order.
+
+The router adds common queue work to both TTFT predictions but compares only
+route-specific service cost. Online EWMA consumes direct backend service time,
+not TTFT-minus-an-estimate. Running futures contribute only predicted remaining
+work. Benchmark warmup now resets online correction and hysteresis state after
+kernel compilation while keeping workers and kernels resident; this prevents a
+cold compile from applying the 4x correction cap to measured requests.
+
+On clean C4 traces, predicted executor-queue MAE fell from 107.8 to 56.7 ms for
+adaptive collocated and from 681.1 to 69.9 ms for adaptive partial PD. The final
+direct-service profile uses 17 collocated and 18 PD samples over 26–9,000
+tokens; RMSE is 22.37 ms collocated and 64.15 ms PD. Admission wait and event-
+loop/decode interference remain separately visible instead of contaminating
+the service curve.

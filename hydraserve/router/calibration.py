@@ -19,6 +19,8 @@ class CalibrationPoint:
     prompt_tokens: int
     ttft_ms: float
     decode_load: float = 0.0
+    prefill_queue_ahead_ms: float = 0.0
+    observed_prefill_service_ms: float | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -26,8 +28,19 @@ class CalibrationPoint:
             or self.ttft_ms <= 0
             or not isfinite(self.ttft_ms)
             or not 0 <= self.decode_load <= 1
+            or self.prefill_queue_ahead_ms < 0
+            or (
+                self.observed_prefill_service_ms is not None
+                and self.observed_prefill_service_ms <= 0
+            )
         ):
             raise ValueError("calibration points require positive finite values")
+
+    @property
+    def service_ms(self) -> float:
+        if self.observed_prefill_service_ms is not None:
+            return self.observed_prefill_service_ms
+        return max(1e-6, self.ttft_ms - self.prefill_queue_ahead_ms)
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +76,12 @@ def load_calibration_points(paths: Iterable[str | Path]) -> tuple[CalibrationPoi
                     int(result["prompt_tokens"]),
                     float(result["ttft_ms"]),
                     float(result.get("route_decode_load") or 0.0),
+                    float(result.get("route_prefill_queue_ahead_ms") or 0.0),
+                    (
+                        None
+                        if result.get("route_observed_prefill_service_ms") is None
+                        else float(result["route_observed_prefill_service_ms"])
+                    ),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"invalid benchmark result in {path}: {exc}") from exc
@@ -78,7 +97,12 @@ def fit_latency_curve(points: Iterable[CalibrationPoint]) -> FittedLatencyCurve:
     lengths = np.asarray(
         [point.prompt_tokens for point in baseline_values], dtype=np.float64
     )
-    latency = np.asarray([point.ttft_ms for point in baseline_values], dtype=np.float64)
+    latency = np.asarray(
+        [
+            point.service_ms for point in baseline_values
+        ],
+        dtype=np.float64,
+    )
     unique_lengths = np.unique(lengths)
     if unique_lengths.size < 3:
         raise ValueError(
@@ -108,7 +132,7 @@ def fit_latency_curve(points: Iterable[CalibrationPoint]) -> FittedLatencyCurve:
     all_predictions = np.asarray(
         [curve.predict(point.prompt_tokens, point.decode_load) for point in values]
     )
-    all_latency = np.asarray([point.ttft_ms for point in values])
+    all_latency = np.asarray([point.service_ms for point in values])
     rmse = float(np.sqrt(np.mean(np.square(all_predictions - all_latency))))
     return FittedLatencyCurve(
         curve,
@@ -158,7 +182,10 @@ def build_router_profile(
                 "collocated": asdict(collocated.diagnostics),
                 "pd_disaggregated": asdict(pd.diagnostics),
             },
-            "latency_metric": "ttft_ms",
+            "latency_metric": (
+                "route_observed_prefill_service_ms "
+                "(TTFT-minus-queue fallback for legacy inputs)"
+            ),
             "recommended_input": (
                 "warmed C1 baselines plus optional loaded traces carrying "
                 "route_decode_load"
@@ -202,6 +229,8 @@ def _fit_decode_load_scale(
     estimates = []
     for point in points:
         baseline = curve.predict(point.prompt_tokens, 0.0)
-        estimate = (point.ttft_ms / max(baseline, 1e-6) - 1.0) / point.decode_load
+        estimate = (
+            point.service_ms / max(baseline, 1e-6) - 1.0
+        ) / point.decode_load
         estimates.append(max(0.0, estimate))
     return min(10.0, float(np.median(np.asarray(estimates, dtype=np.float64))))
