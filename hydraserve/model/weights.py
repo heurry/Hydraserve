@@ -3,9 +3,25 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock
 from typing import Any, Iterator
+
+
+@dataclass(frozen=True, slots=True)
+class PackedInt4Weight:
+    """Compressed-tensors asymmetric grouped INT4 linear weight."""
+
+    packed: Any
+    scale: Any
+    zero_point: Any
+    original_shape: tuple[int, int]
+    group_size: int = 128
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.original_shape
 
 
 class ShardedSafeTensorLoader:

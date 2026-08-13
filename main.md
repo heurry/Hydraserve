@@ -530,19 +530,19 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | Phase | 内容 | 时间 | 状态 |
 |-------|------|------|------|
 | 0 | 环境搭建 + 模型加载 + 硬件实测 | 1 周 | 完成 |
-| 1 | 推理引擎 + Triton kernels | 2.5 周 | 4B 真实 GPU smoke + kernel 对照完成；9B/27B 待实跑 |
+| 1 | 推理引擎 + Triton kernels | 2.5 周 | 4B/9B BF16 + 27B AWQ 真实 GPU smoke 完成 |
 | 2 | 双状态内存管理 + ModelAdapter | 2 周 | 动态配置、Paged KV、协议完成；GPU state pool 待接入 worker |
 | 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM/P2P + 层级协议完成；P2P 待可用硬件实测 |
 | 4 | PD 分离核心 + N-1 truncation | 2 周 | 4B 真实 GPU 双进程 SHM PARTIAL 完成 |
 | 5 | Continuous batching + chunked prefill | 2 周 | 完成：batched decode + Paged 历史与 causal offset |
-| 6 | 自适应路由 + 多模型适配 | 1.5 周 | 路由和动态 config 完成；9B/27B runtime 待实跑 |
+| 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
 1. 用本机数据集实测 B vs D crossover point
-2. 实跑 9B/27B runtime
+2. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
 
 ---

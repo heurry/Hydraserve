@@ -107,6 +107,18 @@ def test_whole_prefill_matches_token_by_token_decode(tiny_model) -> None:
         torch.testing.assert_close(state.convolution[layer], full_state.convolution[layer])
 
 
+def test_independent_lm_head_is_used_for_logits(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    weights["lm_head.weight"] = torch.zeros_like(
+        weights[f"{LANGUAGE_PREFIX}.embed_tokens.weight"]
+    )
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    logits, _ = runtime.forward(torch.tensor([[3, 7]]))
+    assert torch.count_nonzero(logits) == 0
+
+
 def test_chunked_prefill_with_paged_history_matches_whole_prefill(tiny_model) -> None:
     weights = make_weights(tiny_model)
     runtime = QwenTextRuntime(

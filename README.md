@@ -26,6 +26,9 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
   continuation chunk（或禁用 Flash 时）走自写 Triton Paged online-softmax；
 - 支持异构上下文长度的 Continuous Batching decode executor；
 - Qwen3.5-4B BF16 真实 32 层 prefill/decode GPU smoke。
+- Qwen3.5-9B BF16（独立 lm_head）真实 32 层 chunked prefill smoke；
+- Qwen3.6-27B compressed-tensors AWQ/INT4 真实 64 层 prefill + decode smoke；
+- 自写 Triton grouped asymmetric INT4 GEMM（packed weight/zero-point，group=128）；
 - 独立 prefill/decode worker、N-1 truncation 与首 token 一致性校验；
 - 真实双进程、双 GPU 的 SHM PARTIAL_TRANSFER 端到端链路；
 - FULL/INT4 QUANTIZED KV 安装路径与真实物理页读取；
@@ -58,6 +61,16 @@ python -m hydraserve inspect-models /mnt/nvme-data/models/LLM_model
 当前机器上的 4B、9B、27B BF16、27B FP8 和 27B AWQ/INT4 配置均已通过检查。
 同架构的其他参数规模可以直接通过其 `config.json` 接入；若内部维度不同，缓存和
 循环状态形状会自动跟随配置变化。
+
+“配置可识别”与“该权重格式已能执行”分开记录：BF16 runtime 已实跑 4B/9B；
+compressed-tensors AWQ/INT4 已实跑 27B。27B BF16 约 52 GB，不能放入单张 24 GB
+3090；本机 27B FP8 语言权重本身约 25.08 GiB，也超过可用显存，且 block-scaled
+FP8 GEMM 尚未实现，loader 会明确拒绝而不是静默转 BF16 或调用外部后端。
+
+27B AWQ 的 checkpoint 保留 GDN 投影为 BF16、量化 MLP/full-attention linear。
+HydraServe 将只做 token lookup 的 embedding 留在 CPU，把独立 lm_head 和执行权重
+放在 GPU，以约 22.02 GiB PyTorch allocation 完成 64 层 forward；INT4 权重在
+GEMM 中即时解包/去零点/缩放，不生成完整反量化矩阵。
 
 注意：真实 Qwen GDN recurrent state 按 value heads 保存，conv state 保存完整
 Q/K/V depthwise-conv 通道。因此 FP32 双状态是 4B/9B 约 53.48 MB/请求，27B

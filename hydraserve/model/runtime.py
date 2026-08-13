@@ -20,7 +20,12 @@ from hydraserve.kernels.reference import (
     rms_norm as reference_rms_norm,
     silu,
 )
-from hydraserve.model.weights import LANGUAGE_PREFIX, ShardedSafeTensorLoader, layer_prefix
+from hydraserve.model.weights import (
+    LANGUAGE_PREFIX,
+    PackedInt4Weight,
+    ShardedSafeTensorLoader,
+    layer_prefix,
+)
 
 
 @dataclass(slots=True)
@@ -52,11 +57,13 @@ class QwenTextRuntime:
         *,
         use_triton: bool = True,
         use_flash_attention: bool = True,
+        device: str | Any | None = None,
     ) -> None:
         self.config = config
         self.weights = weights
         self.use_triton = use_triton
         self.use_flash_attention = use_flash_attention
+        self._runtime_device = device
         self._validate_weight_shapes()
 
     @classmethod
@@ -75,23 +82,59 @@ class QwenTextRuntime:
         loader = ShardedSafeTensorLoader(model_dir)
         dtype = dtype or torch.bfloat16
         names = loader.keys(f"{LANGUAGE_PREFIX}.")
-        weights = {
-            name: loader.tensor(
+        if any(name.endswith(".weight_scale_inv") for name in names):
+            raise NotImplementedError(
+                "block-scaled FP8 checkpoints require the HydraServe FP8 GEMM, "
+                "which is not implemented yet; use BF16 or compressed-tensors INT4"
+            )
+        if "lm_head.weight" in loader:
+            names += ("lm_head.weight",)
+        packed_names = tuple(name for name in names if name.endswith(".weight_packed"))
+        packed_parts = (".weight_packed", ".weight_scale", ".weight_zero_point", ".weight_shape")
+        weights: dict[str, Any] = {}
+        for name in names:
+            if name.endswith(packed_parts):
+                continue
+            weight_device = (
+                "cpu"
+                if packed_names and name == f"{LANGUAGE_PREFIX}.embed_tokens.weight"
+                else device
+            )
+            weights[name] = loader.tensor(
                 name,
-                device=device,
+                device=weight_device,
                 dtype=torch.float32 if name.endswith((".A_log", ".dt_bias")) else dtype,
             )
-            for name in names
-        }
+        for packed_name in packed_names:
+            base_name = packed_name.removesuffix("_packed")
+            shape = tuple(
+                int(value)
+                for value in loader.tensor(f"{base_name}_shape", device="cpu").tolist()
+            )
+            weights[base_name] = PackedInt4Weight(
+                packed=loader.tensor(packed_name, device=device).contiguous(),
+                scale=loader.tensor(
+                    f"{base_name}_scale", device=device, dtype=dtype
+                ).contiguous(),
+                zero_point=loader.tensor(
+                    f"{base_name}_zero_point", device=device
+                ).contiguous(),
+                original_shape=shape,
+            )
         return cls(
             config,
             weights,
             use_triton=use_triton,
             use_flash_attention=use_flash_attention,
+            device=device,
         )
 
     @property
     def device(self):
+        if self._runtime_device is not None:
+            import torch
+
+            return torch.device(self._runtime_device)
         return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").device
 
     @property
@@ -117,7 +160,7 @@ class QwenTextRuntime:
         start = state.sequence_length
         positions = torch.arange(start, start + sequence, device=self.device)
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
-        hidden = embedding[input_ids]
+        hidden = self._embedding(input_ids, embedding)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
             residual = hidden
@@ -142,7 +185,7 @@ class QwenTextRuntime:
 
         hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
         state.sequence_length += sequence
-        logits = hidden.float() @ embedding.float().transpose(0, 1)
+        logits = self._linear(hidden, self._output_weight()).float()
         return logits, state
 
     def prefill(
@@ -186,7 +229,7 @@ class QwenTextRuntime:
             dtype=torch.long,
         )
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
-        hidden = embedding[input_ids]
+        hidden = self._embedding(input_ids, embedding)
         combined = RuntimeState()
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
@@ -218,7 +261,7 @@ class QwenTextRuntime:
         hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
         for state in states:
             state.sequence_length += 1
-        return hidden.float() @ embedding.float().transpose(0, 1), states
+        return self._linear(hidden, self._output_weight()).float(), states
 
     def _full_attention_batch_decode(
         self, layer_index: int, hidden, positions, paged_cache, request_ids
@@ -458,7 +501,16 @@ class QwenTextRuntime:
 
     @staticmethod
     def _linear(hidden, weight):
+        if isinstance(weight, PackedInt4Weight):
+            from hydraserve.kernels.awq import awq_linear
+
+            return awq_linear(hidden, weight)
         return hidden @ weight.transpose(0, 1)
+
+    def _embedding(self, input_ids, embedding):
+        if embedding.device == input_ids.device:
+            return embedding[input_ids]
+        return embedding[input_ids.cpu()].to(self.device, non_blocking=True)
 
     def _weight(self, name: str):
         try:
@@ -466,12 +518,20 @@ class QwenTextRuntime:
         except KeyError as exc:
             raise KeyError(f"runtime weight is missing: {name}") from exc
 
+    def _output_weight(self):
+        return self.weights.get(
+            "lm_head.weight",
+            self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight"),
+        )
+
     def _validate_weight_shapes(self) -> None:
         config = self.config
         required = {
             f"{LANGUAGE_PREFIX}.embed_tokens.weight": (config.vocab_size, config.hidden_size),
             f"{LANGUAGE_PREFIX}.norm.weight": (config.hidden_size,),
         }
+        if "lm_head.weight" in self.weights:
+            required["lm_head.weight"] = (config.vocab_size, config.hidden_size)
         for layer_index, kind in enumerate(config.layer_types):
             prefix = layer_prefix(layer_index)
             required.update(

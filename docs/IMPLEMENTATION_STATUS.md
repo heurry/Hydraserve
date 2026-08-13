@@ -130,6 +130,28 @@ coordinator, but does not offset state transfer plus KV recomputation.
 
 Next implementation slice:
 
+## 2026-08-13 — 9B BF16 and 27B AWQ execution
+
+Implemented and real-GPU validated:
+
+- independent top-level `lm_head.weight` loading (9B/27B are not tied like 4B);
+- Qwen3.5-9B BF16 32-layer, 2-token-chunk Paged prefill;
+- compressed-tensors packed asymmetric INT4 loading;
+- HydraServe Triton group-128 INT4 GEMM with packed weights and zero-points;
+- CPU-resident embedding lookup for the memory-bound 27B AWQ layout;
+- Qwen3.6-27B AWQ complete 64-layer prefill followed by one decode token.
+
+The first 27B attempt reached the end of all layers but exposed a 4.74 GiB
+temporary caused by converting the entire BF16 lm_head to FP32. The corrected
+path performs BF16 GEMM and converts only logits to FP32. The full prefill+decode
+test then passed. Model weights used about 22.02 GiB of PyTorch allocation.
+
+Block-scaled 27B FP8 is explicitly rejected until a HydraServe FP8 GEMM exists;
+it is not silently expanded to BF16. The local FP8 language tensors total about
+25.08 GiB and do not fit one 24 GB card regardless.
+
+Next implementation slice:
+
 1. broaden B-vs-D across prompt lengths, concurrency, and arrival rates;
-2. 9B/27B runtime validation;
+2. optimize and benchmark the new INT4 kernel;
 3. P2P/NVLink validation on capable hardware.
