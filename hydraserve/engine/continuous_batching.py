@@ -53,6 +53,17 @@ class ContinuousBatchScheduler:
                 raise ValueError(f"duplicate request {request.request_id}")
             if request.state is not RequestState.WAITING:
                 raise ValueError("only waiting requests can enter continuous batching")
+            total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
+            try:
+                self.block_manager.get(request.request_id)
+            except KeyError:
+                self.block_manager.allocate(
+                    request.request_id,
+                    len(request.token_ids),
+                    reserve_tokens=total_tokens,
+                )
+            else:
+                self.block_manager.reserve(request.request_id, total_tokens)
             self._requests[request.request_id] = request
             self._waiting.append(request.request_id)
             self._prefill_offsets[request.request_id] = 0
@@ -122,19 +133,17 @@ class ContinuousBatchScheduler:
                 else request.token_ids[-1]
                 for request in selected
             )
-            grown: list[int] = []
             try:
-                for request in selected:
-                    self.block_manager.grow(request.request_id, 1)
-                    grown.append(request.request_id)
+                self.block_manager.grow_many(
+                    (request.request_id for request in selected),
+                    additional_tokens=1,
+                )
             except Exception:
-                # A full rollback would need shrinking allocations. Preempt the
-                # requests already grown so capacity accounting remains correct.
-                for request_id in grown:
-                    request = self._running.pop(request_id)
+                for request in selected:
+                    self._running.pop(request.request_id, None)
                     request.transition(RequestState.PREEMPTED)
-                    self.block_manager.free(request_id)
-                    self._preempted.append(request_id)
+                    self.block_manager.free(request.request_id)
+                    self._preempted.append(request.request_id)
                 raise
             self._inflight = DecodeBatch(tuple(r.request_id for r in selected), token_ids)
             return self._inflight
@@ -185,7 +194,12 @@ class ContinuousBatchScheduler:
             if request.state is not RequestState.PREEMPTED:
                 raise RuntimeError("request is not preempted")
             required_tokens = len(request.token_ids) + len(request.generated_token_ids)
-            self.block_manager.allocate(request_id, required_tokens)
+            total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
+            self.block_manager.allocate(
+                request_id,
+                required_tokens,
+                reserve_tokens=max(required_tokens, total_tokens),
+            )
             request.transition(RequestState.READY)
             try:
                 self._preempted.remove(request_id)

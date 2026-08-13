@@ -97,18 +97,34 @@ class DecodeWorker:
         self.paged_cache = paged_cache
 
     def receive_and_prepare(
-        self, request: Request, *, timeout: float | None = None
+        self,
+        request: Request,
+        *,
+        timeout: float | None = None,
+        preallocated: bool = False,
     ) -> DecodePrepared:
         import torch
 
         if request.state is not RequestState.TRANSFER_PENDING:
             raise RuntimeError("request is not awaiting a PD transfer")
-        descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
-        self.paged_cache.allocate(request.request_id, len(request.token_ids))
-        token_ids = torch.tensor(
-            [request.token_ids], device=self.runtime.device, dtype=torch.long
-        )
         try:
+            total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
+            if preallocated:
+                allocation = self.paged_cache.block_manager.get(request.request_id)
+                if allocation.num_tokens != len(request.token_ids):
+                    raise RuntimeError("preallocated KV logical length does not match prompt")
+                if allocation.reserved_tokens < total_tokens:
+                    raise RuntimeError("preallocated KV capacity does not cover maximum output")
+            else:
+                self.paged_cache.allocate(
+                    request.request_id,
+                    len(request.token_ids),
+                    reserve_tokens=total_tokens,
+                )
+            descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
+            token_ids = torch.tensor(
+                [request.token_ids], device=self.runtime.device, dtype=torch.long
+            )
             if descriptor.mode is TransferMode.PARTIAL_TRANSFER:
                 with torch.inference_mode():
                     self.runtime.forward(

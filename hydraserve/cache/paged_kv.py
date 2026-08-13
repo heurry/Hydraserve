@@ -38,8 +38,16 @@ class PagedKVCache:
         self.key = torch.empty(shape, device=self.device, dtype=dtype)
         self.value = torch.empty_like(self.key)
 
-    def allocate(self, request_id: int, num_tokens: int):
-        return self.block_manager.allocate(request_id, num_tokens)
+    def allocate(
+        self,
+        request_id: int,
+        num_tokens: int,
+        *,
+        reserve_tokens: int | None = None,
+    ):
+        return self.block_manager.allocate(
+            request_id, num_tokens, reserve_tokens=reserve_tokens
+        )
 
     def reserve_append(self, request_id: int, additional_tokens: int = 1):
         return self.block_manager.grow(request_id, additional_tokens)

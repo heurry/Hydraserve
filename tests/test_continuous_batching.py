@@ -1,5 +1,6 @@
 from hydraserve.cache import KVBlockManager
 from hydraserve.engine import CentralScheduler, ContinuousBatchScheduler, RequestState
+import pytest
 
 
 def test_new_requests_join_between_decode_iterations() -> None:
@@ -46,3 +47,14 @@ def test_preempt_releases_blocks_and_resume_reallocates() -> None:
     scheduler.resume(request.request_id)
     assert request.state is RequestState.READY
     assert blocks.num_free_blocks == 14
+
+
+def test_scheduler_rejects_request_that_cannot_reserve_full_decode() -> None:
+    blocks = KVBlockManager(1, block_size=4)
+    request = CentralScheduler().submit([1, 2, 3, 4], max_new_tokens=2)
+    scheduler = ContinuousBatchScheduler(blocks)
+    with pytest.raises(MemoryError):
+        scheduler.add(request)
+    assert request.state is RequestState.WAITING
+    assert scheduler.active_count == 0
+    assert blocks.num_free_blocks == 1

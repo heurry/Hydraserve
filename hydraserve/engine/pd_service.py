@@ -8,7 +8,11 @@ from queue import Empty
 from threading import Lock
 from uuid import uuid4
 
-from hydraserve.engine.serving_loop import ServingRequest
+from hydraserve.engine.serving_loop import (
+    AdmissionDecision,
+    BackendCapacity,
+    ServingRequest,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -20,6 +24,7 @@ class PDWorkerConfig:
     block_size: int = 16
     use_flash_attention: bool = True
     prefill_chunk_size: int = 4096
+    max_state_slots: int = 64
 
 
 def _request(request_id: int, token_ids, max_new_tokens: int, *, transferred: bool):
@@ -135,17 +140,83 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
         )
         requests = {}
         states = {}
+        reservations = set()
         responses.put({"op": "ready", "model_name": runtime.config.name})
         while True:
             command = commands.get()
             operation = command["op"]
             if operation == "shutdown":
-                for request_id in tuple(states):
+                for request_id in tuple(set(states) | reservations):
                     cache.free(request_id)
                 responses.put({"op": "shutdown"})
                 return
             try:
-                if operation == "prepare":
+                if operation == "reserve":
+                    request_id = command["request_id"]
+                    total_tokens = len(command["token_ids"]) + max(
+                        0, command["max_new_tokens"] - 1
+                    )
+                    required = cache.block_manager.blocks_required(total_tokens)
+                    live_requests = set(states) | reservations
+                    if required > cache.block_manager.num_blocks:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": False,
+                                "retryable": False,
+                                "reason": (
+                                    f"request needs {required} KV blocks, worker capacity "
+                                    f"is {cache.block_manager.num_blocks}"
+                                ),
+                            }
+                        )
+                    elif request_id in live_requests:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": True,
+                            }
+                        )
+                    elif len(live_requests) >= config.max_state_slots:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": False,
+                                "retryable": True,
+                                "reason": "recurrent-state slots are exhausted",
+                            }
+                        )
+                    elif required > cache.block_manager.num_free_blocks:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": False,
+                                "retryable": True,
+                                "reason": (
+                                    f"request needs {required} KV blocks, only "
+                                    f"{cache.block_manager.num_free_blocks} are free"
+                                ),
+                            }
+                        )
+                    else:
+                        cache.allocate(
+                            request_id,
+                            len(command["token_ids"]),
+                            reserve_tokens=total_tokens,
+                        )
+                        reservations.add(request_id)
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": True,
+                            }
+                        )
+                elif operation == "prepare":
                     request_id = command["request_id"]
                     request = _request(
                         request_id,
@@ -154,7 +225,9 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
                         transferred=True,
                     )
                     prepared = worker.receive_and_prepare(
-                        request, timeout=command.get("timeout")
+                        request,
+                        timeout=command.get("timeout"),
+                        preallocated=request_id in reservations,
                     )
                     requests[request_id] = request
                     states[request_id] = prepared.state
@@ -189,6 +262,7 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
                     )
                 elif operation == "release":
                     request_id = command["request_id"]
+                    reservations.discard(request_id)
                     states.pop(request_id, None)
                     requests.pop(request_id, None)
                     cache.free(request_id)
@@ -196,6 +270,8 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
                 else:
                     raise ValueError(f"unknown decode-worker operation {operation!r}")
             except Exception as exc:
+                if operation == "prepare":
+                    reservations.discard(command.get("request_id"))
                 responses.put(
                     {
                         "op": "error",
@@ -223,7 +299,12 @@ class DisaggregatedGenerationBackend:
     ) -> None:
         if config.prefill_device == config.decode_device:
             raise ValueError("PD serving requires distinct prefill and decode devices")
-        if min(config.cache_tokens, config.block_size, config.prefill_chunk_size) <= 0:
+        if min(
+            config.cache_tokens,
+            config.block_size,
+            config.prefill_chunk_size,
+            config.max_state_slots,
+        ) <= 0:
             raise ValueError("cache limits must be positive")
         self.config = config
         self.supports_async_prefill = True
@@ -246,6 +327,8 @@ class DisaggregatedGenerationBackend:
         )
         self._closed = False
         self._decode_lock = Lock()
+        self._admitted_requests: set[int] = set()
+        self._reserved_blocks: dict[int, int] = {}
         self._decode.start()
         self._prefill.start()
         try:
@@ -260,7 +343,37 @@ class DisaggregatedGenerationBackend:
             self.close(force=True)
             raise
 
+    def admit(self, request: ServingRequest) -> AdmissionDecision:
+        total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
+        required_blocks = (total_tokens + self.config.block_size - 1) // self.config.block_size
+        command = {
+            "op": "reserve",
+            "request_id": request.request_id,
+            "token_ids": request.token_ids,
+            "max_new_tokens": request.max_new_tokens,
+        }
+        with self._decode_lock:
+            if request.request_id in self._admitted_requests:
+                return AdmissionDecision.accept()
+            self._decode_commands.put(command)
+            result = self._get(self._decode_responses, self.operation_timeout)
+            self._check(result, "admission", request.request_id)
+            if result.get("admitted"):
+                self._admitted_requests.add(request.request_id)
+                self._reserved_blocks[request.request_id] = required_blocks
+                return AdmissionDecision.accept()
+            if result.get("retryable"):
+                return AdmissionDecision.defer(
+                    result.get("reason", "decode worker is temporarily full")
+                )
+            return AdmissionDecision.reject(
+                result.get("reason", "request exceeds decode worker capacity")
+            )
+
     def prefill(self, request: ServingRequest) -> int:
+        decision = self.admit(request)
+        if not decision.admitted:
+            raise MemoryError(decision.reason or "request cannot be admitted")
         command = {
             "op": "prefill",
             "request_id": request.request_id,
@@ -300,7 +413,23 @@ class DisaggregatedGenerationBackend:
         with self._decode_lock:
             self._decode_commands.put({"op": "release", "request_id": request_id})
             result = self._get(self._decode_responses, self.operation_timeout)
+            self._admitted_requests.discard(request_id)
+            self._reserved_blocks.pop(request_id, None)
         self._check(result, "release", request_id)
+
+    def capacity(self) -> BackendCapacity:
+        total_blocks = (
+            self.config.cache_tokens + self.config.block_size - 1
+        ) // self.config.block_size
+        with self._decode_lock:
+            allocated_blocks = sum(self._reserved_blocks.values())
+            allocated_slots = len(self._admitted_requests)
+        return BackendCapacity(
+            kv_total_blocks=total_blocks,
+            kv_free_blocks=max(0, total_blocks - allocated_blocks),
+            state_total_slots=self.config.max_state_slots,
+            state_free_slots=max(0, self.config.max_state_slots - allocated_slots),
+        )
 
     def close(self, *, force: bool = False) -> None:
         if self._closed:

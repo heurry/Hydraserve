@@ -39,6 +39,8 @@ def main() -> int:
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
+    serve_parser.add_argument("--max-queue-size", type=int, default=1024)
+    serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     serve_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser = subparsers.add_parser(
@@ -77,8 +79,14 @@ def main() -> int:
         )
         from hydraserve.model import QwenTokenizer
 
-        if args.cache_tokens <= 0 or args.block_size <= 0:
-            parser.error("cache limits must be positive")
+        if min(
+            args.cache_tokens,
+            args.block_size,
+            args.max_batch_size,
+            args.max_queue_size,
+            args.max_queue_tokens,
+        ) <= 0:
+            parser.error("cache, batch, and queue limits must be positive")
         tokenizer = QwenTokenizer(args.model)
         if args.pd:
             backend = DisaggregatedGenerationBackend(
@@ -90,6 +98,7 @@ def main() -> int:
                     block_size=args.block_size,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
+                    max_state_slots=args.max_batch_size,
                 )
             )
             model_name = backend.model_name
@@ -115,12 +124,17 @@ def main() -> int:
                 dtype=torch.bfloat16,
             )
             backend = RuntimeGenerationBackend(
-                runtime, cache, prefill_chunk_size=args.prefill_chunk_size
+                runtime,
+                cache,
+                prefill_chunk_size=args.prefill_chunk_size,
+                max_state_slots=args.max_batch_size,
             )
             model_name = runtime.config.name
         loop = ContinuousGenerationLoop(
             backend,
             max_batch_size=args.max_batch_size,
+            max_queue_size=args.max_queue_size,
+            max_queue_tokens=args.max_queue_tokens,
             eos_token_id=tokenizer.eos_token_id,
         )
         server = create_server(
@@ -167,6 +181,7 @@ def main() -> int:
                     block_size=args.block_size,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
+                    max_state_slots=args.concurrency,
                 )
             )
         else:
@@ -191,7 +206,10 @@ def main() -> int:
                 dtype=torch.bfloat16,
             )
             backend = RuntimeGenerationBackend(
-                runtime, cache, prefill_chunk_size=args.prefill_chunk_size
+                runtime,
+                cache,
+                prefill_chunk_size=args.prefill_chunk_size,
+                max_state_slots=args.concurrency,
             )
         loop = ContinuousGenerationLoop(
             backend,

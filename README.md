@@ -1,7 +1,7 @@
 # HydraServe
 
 HydraServe 是一个面向 Qwen3.5/Qwen3.6 混合注意力模型（GDN + GQA）的
-Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md) 从零实现，
+Prefill–Decode 分离推理引擎。当前主线按 [`main.md`](main.md) 从零实现，
 不复用仓库此前的引擎代码；旧仓库完整内容保存在
 `archive/pre-implementation-2026-08-13` 分支。
 
@@ -12,6 +12,8 @@ Prefill–Decode 分离推理引擎原型。当前主线按 [`main.md`](main.md)
 - 从 Hugging Face `config.json` 动态解析混合层布局和所有状态维度；
 - 4B/9B/27B 只是预置，不是模型规模白名单；
 - Paged KV block allocator 与固定槽 FP32 recurrent-state pool；
+- 请求在 prefill 前原子预留最大输出所需 KV 页和 GDN state slot，避免流式输出中途
+  才因容量不足失败；decode batch 的 KV 长度推进也是单事务；
 - 真正的两值/byte grouped symmetric INT4 KV codec；
 - 强校验的双状态传输描述符；
 - `FULL`、`QUANTIZED`、`PARTIAL` 三种不同传输语义；
@@ -41,6 +43,13 @@ tokenizer、OpenAI-compatible completions/chat/SSE API，以及 TTFT/TPOT/P50/P9
 benchmark runner。HTTP 和 benchmark CLI 可在单 GPU collocated 与双进程双 GPU
 PARTIAL PD 间切换。P2P 后端已实现，但当前两卡拓扑不支持 CUDA peer access，因此不能在本机伪装为
 真实 P2P 实测；层级流水线也只完成协议和单测，不宣称已在 NVLink/P2P 上验证。
+
+服务入口具有有界 admission queue（请求数与 token 双上限）。临时 KV/state 容量不足
+会保持排队，单请求永久超过 worker 容量会单独失败，入口过载返回 HTTP 429。统一的
+KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
+
+这里的“已实现”仍不等于整个系统已经达到生产完成态。逐请求 Collocated/PD 混合路由、
+1P+ND、成本感知 Prefix Cache、完整抢占重算、故障恢复、压力与长稳验证仍在生产化路线中。
 
 ## 模型兼容性
 
@@ -102,7 +111,8 @@ python -m hydraserve inspect-datasets /mnt/nvme-data/datasets/benchmark --limit 
 
 ```bash
 python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
-  --device cuda:0 --port 8000
+  --device cuda:0 --port 8000 \
+  --max-batch-size 64 --max-queue-size 1024 --max-queue-tokens 1048576
 
 curl http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \

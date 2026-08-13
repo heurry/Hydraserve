@@ -8,6 +8,7 @@ from time import time
 from typing import Any
 from uuid import uuid4
 
+from hydraserve.engine.serving_loop import OverloadedError
 from hydraserve.model.tokenizer import IncrementalTextDecoder
 
 
@@ -82,6 +83,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self._complete(handle, prompt_ids, chat=chat)
         except (ValueError, json.JSONDecodeError) as exc:
             self._error(400, "invalid_request_error", str(exc))
+        except OverloadedError as exc:
+            self._error(429, "overloaded_error", str(exc))
         except Exception as exc:
             self._error(500, "server_error", str(exc))
 

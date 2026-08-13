@@ -14,15 +14,20 @@ from hydraserve.engine.pd_worker import (
 )
 from hydraserve.engine.scheduler import CentralScheduler, Request, RequestState
 from hydraserve.engine.serving_loop import (
+    AdmissionDecision,
+    BackendCapacity,
     ContinuousGenerationLoop,
     GenerationEvent,
     GenerationHandle,
+    OverloadedError,
     RuntimeGenerationBackend,
     ServingRequest,
 )
 from hydraserve.engine.pd_service import DisaggregatedGenerationBackend, PDWorkerConfig
 
 __all__ = [
+    "AdmissionDecision",
+    "BackendCapacity",
     "CentralScheduler",
     "ContinuousBatchScheduler",
     "ContinuousBatchExecutor",
@@ -41,6 +46,7 @@ __all__ = [
     "ContinuousGenerationLoop",
     "GenerationEvent",
     "GenerationHandle",
+    "OverloadedError",
     "RuntimeGenerationBackend",
     "ServingRequest",
     "DisaggregatedGenerationBackend",

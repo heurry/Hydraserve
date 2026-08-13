@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from threading import Thread
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
 from hydraserve.api import create_server
 from hydraserve.engine import ContinuousGenerationLoop
+from hydraserve.engine import OverloadedError
 
 
 class FakeTokenizer:
@@ -102,3 +104,37 @@ def test_completion_chat_and_sse_protocol() -> None:
         server.server_close()
         thread.join(3)
         loop.close()
+
+
+def test_overload_returns_http_429() -> None:
+    class FullLoop:
+        def submit(self, token_ids, max_tokens):
+            raise OverloadedError("admission queue request limit reached")
+
+    try:
+        server = create_server(
+            "127.0.0.1",
+            0,
+            generation_loop=FullLoop(),
+            tokenizer=FakeTokenizer(),
+            model_name="tiny",
+        )
+    except PermissionError:
+        pytest.skip("sandbox forbids loopback sockets")
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with pytest.raises(HTTPError) as caught:
+            _post(
+                base,
+                "/v1/completions",
+                {"model": "tiny", "prompt": "x", "max_tokens": 1},
+            )
+        assert caught.value.code == 429
+        payload = json.loads(caught.value.read())
+        assert payload["error"]["type"] == "overloaded_error"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(3)

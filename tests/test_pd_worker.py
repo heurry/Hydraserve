@@ -50,7 +50,11 @@ def test_partial_pd_workers_recompute_kv_and_restore_gdn(tiny_model) -> None:
         )
     table, lengths = cache.batch_metadata((request.request_id,))
     assert lengths.tolist() == [len(request.token_ids)]
-    assert table.shape == (1, 1)
+    expected_kv_tokens = len(request.token_ids) + request.max_new_tokens - 1
+    assert table.shape == (
+        1,
+        cache.block_manager.blocks_required(expected_kv_tokens),
+    )
 
 
 def test_quantized_pd_workers_install_kv_without_recompute(tiny_model) -> None:

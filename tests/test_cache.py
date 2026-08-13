@@ -7,6 +7,7 @@ from hydraserve.cache import (
     KVBlockManager,
     LinearState,
     LinearStatePool,
+    RequestStateSlotManager,
     dequantize_int4,
     quantize_int4,
 )
@@ -28,6 +29,42 @@ def test_block_manager_is_transactional_when_exhausted() -> None:
     assert manager.num_free_blocks == 1
 
 
+def test_block_manager_reserves_decode_growth_without_exposing_tokens() -> None:
+    manager = KVBlockManager(num_blocks=5, block_size=4)
+    allocation = manager.allocate(1, 3, reserve_tokens=11)
+    assert allocation.num_tokens == 3
+    assert allocation.reserved_tokens == 11
+    assert allocation.block_ids == (0, 1, 2)
+    assert manager.num_free_blocks == 2
+
+    grown = manager.grow(1, 7)
+    assert grown.num_tokens == 10
+    assert grown.block_ids == allocation.block_ids
+    assert manager.num_free_blocks == 2
+
+    manager.truncate(1, 4)
+    assert manager.get(1).reserved_tokens == 11
+    assert manager.num_free_blocks == 2
+
+
+def test_block_manager_reservation_failure_is_atomic() -> None:
+    manager = KVBlockManager(num_blocks=2, block_size=4)
+    with pytest.raises(MemoryError):
+        manager.allocate(1, 1, reserve_tokens=9)
+    assert manager.capacity().free_blocks == 2
+
+
+def test_decode_batch_growth_is_atomic() -> None:
+    manager = KVBlockManager(num_blocks=2, block_size=4)
+    manager.allocate(1, 4)
+    manager.allocate(2, 4)
+    with pytest.raises(MemoryError, match="decode batch"):
+        manager.grow_many((1, 2))
+    assert manager.get(1).num_tokens == 4
+    assert manager.get(2).num_tokens == 4
+    assert manager.num_free_blocks == 0
+
+
 def test_linear_state_pool_enforces_fp32(tiny_model) -> None:
     pool = LinearStatePool(1, tiny_model.ssm_state_shape, tiny_model.conv_state_shape)
     pool.allocate(10)
@@ -43,6 +80,16 @@ def test_linear_state_pool_enforces_fp32(tiny_model) -> None:
             np.ones(tiny_model.ssm_state_shape, dtype=np.float16),
             np.ones(tiny_model.conv_state_shape, dtype=np.float32),
         )
+
+
+def test_request_state_slots_are_bounded_and_idempotent() -> None:
+    slots = RequestStateSlotManager(1)
+    assert slots.allocate(1) == slots.allocate(1) == 0
+    with pytest.raises(MemoryError, match="exhausted"):
+        slots.allocate(2)
+    slots.free(1)
+    assert slots.allocate(2) == 0
+    assert slots.capacity().allocated_slots == 1
 
 
 def test_int4_round_trip_and_actual_packing() -> None:

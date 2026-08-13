@@ -2,7 +2,16 @@ from __future__ import annotations
 
 from threading import Event
 
-from hydraserve.engine import ContinuousGenerationLoop
+import pytest
+
+from hydraserve.engine import (
+    AdmissionDecision,
+    BackendCapacity,
+    ContinuousGenerationLoop,
+    OverloadedError,
+    RuntimeGenerationBackend,
+    ServingRequest,
+)
 
 
 class FakeBackend:
@@ -172,3 +181,112 @@ def test_disaggregated_prefill_overlaps_active_decode() -> None:
     assert second_prefill_entered.is_set()
     assert [event.token_id for event in first_events[:-1]] == [3, 4, 5]
     assert [event.token_id for event in second_events[:-1]] == [21, 22]
+
+
+def test_retryable_admission_waits_for_capacity_instead_of_failing() -> None:
+    class CapacityBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.reserved: set[int] = set()
+
+        def admit(self, request):
+            if request.request_id in self.reserved:
+                return AdmissionDecision.accept()
+            if self.reserved:
+                return AdmissionDecision.defer("worker is full")
+            self.reserved.add(request.request_id)
+            return AdmissionDecision.accept()
+
+        def release(self, request_id):
+            super().release(request_id)
+            self.reserved.remove(request_id)
+
+    backend = CapacityBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    first = loop.submit([1], max_new_tokens=2)
+    second = loop.submit([10], max_new_tokens=1)
+    assert [event.token_id for event in _collect(first)[:-1]] == [2, 3]
+    assert [event.token_id for event in _collect(second)[:-1]] == [11]
+    loop.close()
+    assert loop.pending_count == 0
+    assert backend.reserved == set()
+
+
+def test_permanent_admission_rejection_is_request_scoped() -> None:
+    class RejectLargeBackend(FakeBackend):
+        def admit(self, request):
+            if len(request.token_ids) > 2:
+                return AdmissionDecision.reject("request exceeds KV capacity")
+            return AdmissionDecision.accept()
+
+    backend = RejectLargeBackend()
+    loop = ContinuousGenerationLoop(backend)
+    rejected = loop.submit([1, 2, 3], max_new_tokens=1)
+    healthy = loop.submit([4], max_new_tokens=1)
+    assert _collect(rejected)[-1].error == "request exceeds KV capacity"
+    assert [event.token_id for event in _collect(healthy)[:-1]] == [5]
+    loop.close()
+
+
+def test_bounded_admission_queue_applies_backpressure() -> None:
+    entered_prefill = Event()
+    allow_prefill = Event()
+
+    class BlockingPrefillBackend(FakeBackend):
+        def prefill(self, request):
+            if request.token_ids == (1,):
+                entered_prefill.set()
+                assert allow_prefill.wait(2)
+            return super().prefill(request)
+
+    backend = BlockingPrefillBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1, max_queue_size=1)
+    first = loop.submit([1], max_new_tokens=1)
+    assert entered_prefill.wait(2)
+    second = loop.submit([2], max_new_tokens=1)
+    with pytest.raises(OverloadedError, match="request limit"):
+        loop.submit([3], max_new_tokens=1)
+    allow_prefill.set()
+    assert [event.token_id for event in _collect(first)[:-1]] == [2]
+    assert [event.token_id for event in _collect(second)[:-1]] == [3]
+    loop.close()
+
+
+def test_runtime_admission_reserves_kv_and_recurrent_state_together() -> None:
+    from hydraserve.cache import KVBlockManager
+
+    class FakePagedCache:
+        def __init__(self):
+            self.block_manager = KVBlockManager(8, block_size=4)
+
+        def allocate(self, request_id, num_tokens, *, reserve_tokens=None):
+            return self.block_manager.allocate(
+                request_id, num_tokens, reserve_tokens=reserve_tokens
+            )
+
+        def free(self, request_id):
+            self.block_manager.free(request_id)
+
+    cache = FakePagedCache()
+    backend = RuntimeGenerationBackend(object(), cache, max_state_slots=1)
+    first = ServingRequest(1, (1, 2, 3), 6)
+    second = ServingRequest(2, (4,), 1)
+    assert backend.admit(first).admitted
+    allocation = cache.block_manager.get(1)
+    assert allocation.num_tokens == 3
+    assert allocation.reserved_tokens == 8
+    assert backend.capacity() == BackendCapacity(8, 6, 1, 0)
+    assert backend.capacity().decode_load == 1.0
+    deferred = backend.admit(second)
+    assert not deferred.admitted and deferred.retryable
+    assert "state" in deferred.reason
+    backend.release(1)
+    assert backend.admit(second).admitted
+    backend.release(2)
+    assert cache.block_manager.num_free_blocks == cache.block_manager.num_blocks
+
+
+def test_backend_capacity_uses_most_constrained_resource() -> None:
+    capacity = BackendCapacity(100, 80, 10, 2)
+    assert capacity.decode_load == pytest.approx(0.8)
+    assert capacity.has_request_slot

@@ -6,6 +6,57 @@ from threading import RLock
 import numpy as np
 
 
+@dataclass(frozen=True, slots=True)
+class StateSlotCapacity:
+    total_slots: int
+    free_slots: int
+
+    @property
+    def allocated_slots(self) -> int:
+        return self.total_slots - self.free_slots
+
+
+class RequestStateSlotManager:
+    """Atomic ownership for fixed-size per-request GPU recurrent states."""
+
+    def __init__(self, capacity: int) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self._capacity = capacity
+        self._free = list(range(capacity))
+        self._request_to_slot: dict[int, int] = {}
+        self._lock = RLock()
+
+    def allocate(self, request_id: int) -> int:
+        with self._lock:
+            if request_id in self._request_to_slot:
+                return self._request_to_slot[request_id]
+            if not self._free:
+                raise MemoryError("recurrent-state slots are exhausted")
+            slot = self._free.pop(0)
+            self._request_to_slot[request_id] = slot
+            return slot
+
+    def get(self, request_id: int) -> int:
+        with self._lock:
+            try:
+                return self._request_to_slot[request_id]
+            except KeyError as exc:
+                raise KeyError(f"request {request_id} has no recurrent-state slot") from exc
+
+    def free(self, request_id: int) -> None:
+        with self._lock:
+            slot = self._request_to_slot.pop(request_id, None)
+            if slot is None:
+                return
+            self._free.append(slot)
+            self._free.sort()
+
+    def capacity(self) -> StateSlotCapacity:
+        with self._lock:
+            return StateSlotCapacity(self._capacity, len(self._free))
+
+
 @dataclass(slots=True)
 class LinearState:
     ssm_state: np.ndarray
