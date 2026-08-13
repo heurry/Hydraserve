@@ -245,8 +245,10 @@ PARTIAL 模式下，静态 8K 阈值会错误偏向 PD，后续路由必须纳�
 服务循环可分别配置同时驻留请求数与单步 decode batch 大小。batch 选择使用优先级加权
 公平分数，并通过等待老化防止低优先级请求饿死；临时容量不足的请求会回到候选队列，
 不会阻塞后续可准入请求。decode 子进程退出或 RPC 超时后会先从路由摘除，重建进程与
-IPC 队列，并在模型名和容量握手通过后重新加入。`/health` 和 `/metrics` 暴露 worker
-健康数、恢复中列表及重启计数。
+IPC 队列，并在模型名和容量握手通过后重新加入。故障 worker 上的全部旧绑定会原子
+失效；在途请求保留已输出历史，等待健康 worker 后重新绑定并用精确 replay 恢复，而
+不是因为设备状态丢失直接向客户端报错。健康 worker 同批已成功的 token 不受影响。
+`/health` 和 `/metrics` 暴露 worker 健康数、恢复中列表、重启计数及 fault suspension 数。
 
 `--max-active-requests` 控制已准入并持有 KV/GDN 容量的请求数，必须不小于
 `--max-batch-size`；后者只控制单步真正进入 decode kernel 的数量。两者分离后，调度器

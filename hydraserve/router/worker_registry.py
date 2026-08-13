@@ -160,6 +160,23 @@ class DecodeWorkerRegistry:
             )
             return worker_id
 
+    def release_worker(self, worker_id: int) -> tuple[int, ...]:
+        """Atomically invalidate every request bound to one failed worker."""
+        with self._lock:
+            worker = self._worker(worker_id)
+            request_ids = tuple(
+                request_id
+                for request_id, bound_worker in self._bindings.items()
+                if bound_worker == worker_id
+            )
+            for request_id in request_ids:
+                self._bindings.pop(request_id)
+            self._workers[worker_id] = replace(
+                worker,
+                active_requests=max(0, worker.active_requests - len(request_ids)),
+            )
+            return request_ids
+
     def snapshots(self) -> tuple[DecodeWorkerSnapshot, ...]:
         with self._lock:
             return tuple(self._workers[key] for key in sorted(self._workers))

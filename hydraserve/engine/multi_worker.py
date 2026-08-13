@@ -99,6 +99,10 @@ class WorkerUnavailableError(RuntimeError):
     """A decode worker exited before completing its RPC."""
 
 
+class WorkerStateLostError(RuntimeError):
+    """A request lost device-local state when its decode worker failed."""
+
+
 @dataclass(frozen=True, slots=True)
 class WorkerRecoveryStats:
     total_workers: int
@@ -186,6 +190,7 @@ class MultiWorkerGenerationBackend:
             {} for _ in range(worker_count)
         ]
         self._route_decisions: dict[int, RouteDecision] = {}
+        self._lost_requests: set[int] = set()
         self._state_lock = RLock()
         self._prefill_healthy = True
         self._closed = False
@@ -361,8 +366,19 @@ class MultiWorkerGenerationBackend:
         if not requests:
             return ()
         groups: dict[int, list[tuple[int, ServingRequest]]] = {}
+        failures: dict[int, BaseException] = {}
         for position, request in enumerate(requests):
-            worker_id = self.registry.worker_for(request.request_id)
+            try:
+                worker_id = self.registry.worker_for(request.request_id)
+            except KeyError:
+                with self._state_lock:
+                    lost = request.request_id in self._lost_requests
+                if not lost:
+                    raise
+                failures[request.request_id] = WorkerStateLostError(
+                    f"request {request.request_id} lost decode-worker state"
+                )
+                continue
             groups.setdefault(worker_id, []).append((position, request))
         output: list[int | TokenSample] = [0] * len(requests)
 
@@ -380,9 +396,8 @@ class MultiWorkerGenerationBackend:
                 return indexed_requests, tuple(samples)
             return indexed_requests, tuple(int(token) for token in result["token_ids"])
 
-        failures: dict[int, BaseException] = {}
         successes: dict[int, int | TokenSample] = {}
-        with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, len(groups))) as executor:
             futures = {
                 executor.submit(execute, worker_id, tuple(indexed)): tuple(indexed)
                 for worker_id, indexed in groups.items()
@@ -409,6 +424,9 @@ class MultiWorkerGenerationBackend:
     def release(self, request_id: int) -> None:
         worker_id = self.registry.release(request_id)
         if worker_id is None:
+            with self._state_lock:
+                self._lost_requests.discard(request_id)
+                self._route_decisions.pop(request_id, None)
             return
         try:
             self._decode_rpc(
@@ -421,6 +439,27 @@ class MultiWorkerGenerationBackend:
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
+                self._lost_requests.discard(request_id)
+
+    def abandon(self, request_id: int) -> None:
+        """Forget host-side ownership after device-local state is known lost."""
+        worker_id = self.registry.release(request_id)
+        with self._state_lock:
+            if worker_id is not None:
+                self._reserved_blocks[worker_id].pop(request_id, None)
+            else:
+                for reservations in self._reserved_blocks:
+                    reservations.pop(request_id, None)
+            self._route_decisions.pop(request_id, None)
+            self._lost_requests.discard(request_id)
+
+    def is_recoverable_decode_error(
+        self, request_id: int, error: BaseException
+    ) -> bool:
+        if isinstance(error, (TimeoutError, WorkerUnavailableError, WorkerStateLostError)):
+            return True
+        with self._state_lock:
+            return request_id in self._lost_requests
 
     def preempt(self, request_id: int) -> None:
         self.release(request_id)
@@ -596,12 +635,22 @@ class MultiWorkerGenerationBackend:
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc
         if failure is not None:
-            self.registry.set_health(worker_id, False)
+            self._invalidate_worker(worker_id)
             self._schedule_decode_recovery(worker_id)
             raise failure
         self._check(result, expected_op, request_id)
         self._update_worker_capacity(worker_id, result)
         return result
+
+    def _invalidate_worker(self, worker_id: int) -> tuple[int, ...]:
+        self.registry.set_health(worker_id, False)
+        request_ids = self.registry.release_worker(worker_id)
+        with self._state_lock:
+            self._lost_requests.update(request_ids)
+            self._reserved_blocks[worker_id].clear()
+            for request_id in request_ids:
+                self._route_decisions.pop(request_id, None)
+        return request_ids
 
     def _get_decode_response(self, worker_id: int, timeout: float):
         deadline = monotonic() + timeout

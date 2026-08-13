@@ -367,6 +367,28 @@ an uninterrupted run, proving sampling-step continuity. The multi-worker test
 covered coordinator rebinding and local recovery RPC. Both ended with zero live
 allocations and all physical KV blocks free.
 
+## 2026-08-14 — active-request survival across worker loss
+
+Implemented and validated:
+
+- a decode-worker timeout or exit atomically marks the worker unhealthy and
+  invalidates every request binding owned by that worker, including requests
+  outside the failing decode batch;
+- host-side reservation and route ownership are cleared together, while request
+  token history remains in the serving coordinator;
+- partial decode results from healthy workers are committed normally; only
+  requests whose device-local state was lost enter fault suspension;
+- suspended requests retry admission while the replacement process loads, then
+  may rebind to any healthy capacity and use the same exact replay recovery path;
+- an explicit fault-suspension counter distinguishes hardware/process recovery
+  from policy-driven priority preemption.
+
+An opt-in real test emitted the first token from Qwen3.5-4B, terminated the bound
+decode subprocess at the next decode boundary, waited for automatic model reload
+and capacity handshake, then recovered the active request. Its seeded sampled
+token stream exactly matched an uninterrupted baseline, with one worker restart,
+one fault suspension, and one successful request recovery.
+
 ## 2026-08-14 — KV safety headroom, audit, and observability
 
 Implemented and validated:

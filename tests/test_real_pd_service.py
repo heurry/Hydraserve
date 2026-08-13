@@ -344,6 +344,74 @@ def test_real_cluster_recovers_a_crashed_decode_worker() -> None:
         loop.close()
 
 
+def test_real_active_request_survives_decode_worker_crash_and_rebinds() -> None:
+    from threading import Event
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    inner = MultiWorkerGenerationBackend(
+        PDClusterConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            ("cuda:1",),
+            cache_tokens_per_worker=128,
+            max_state_slots_per_worker=1,
+            use_flash_attention=False,
+        ),
+        startup_timeout=180,
+        operation_timeout=30,
+        worker_restart_backoff_s=0.1,
+    )
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class CrashBoundaryBackend:
+        supports_async_prefill = True
+
+        def __init__(self):
+            self.blocked = False
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(30)
+            return inner.decode(requests)
+
+    loop = ContinuousGenerationLoop(CrashBoundaryBackend(), max_batch_size=1)
+    prompt = [1, 42, 17, 9]
+    sampling = SamplingParams(temperature=0.8, top_k=16, seed=314159)
+    try:
+        handle = loop.submit(prompt, max_new_tokens=3, sampling_params=sampling)
+        first = handle.get(timeout=120)
+        assert first.token_id is not None
+        assert decode_entered.wait(120)
+        crashed = inner._decode_processes[0]
+        crashed.terminate()
+        crashed.join(10)
+        assert not crashed.is_alive()
+        allow_decode.set()
+
+        recovered_events = [first, *list(handle)]
+        reference_events = list(
+            loop.submit(prompt, max_new_tokens=3, sampling_params=sampling)
+        )
+        stats = inner.recovery_stats()
+    finally:
+        loop.close(timeout=120)
+
+    recovered = [event.token_id for event in recovered_events if event.token_id is not None]
+    reference = [event.token_id for event in reference_events if event.token_id is not None]
+    assert recovered == reference
+    assert recovered_events[-1].finish_reason == "length"
+    assert loop.fault_suspensions_total == 1
+    assert loop.recoveries_total == 1
+    assert stats.successes == 1
+    assert stats.healthy_workers == 1
+
+
 def test_real_decode_worker_retains_and_reuses_full_attention_prefix_pages() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required")

@@ -14,6 +14,7 @@ from hydraserve.engine import (
     PDClusterConfig,
     ServingRequest,
     WorkerUnavailableError,
+    WorkerStateLostError,
 )
 from hydraserve.router import (
     AdaptiveRouter,
@@ -48,6 +49,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         )
         self._reserved_blocks = [dict(), dict()]
         self._route_decisions = {}
+        self._lost_requests = set()
         self._state_lock = RLock()
         self._prefill_healthy = True
         self._collocated_count = 0
@@ -187,6 +189,39 @@ def test_dead_decode_worker_is_removed_and_recovery_is_scheduled() -> None:
         )
     assert not backend.registry.snapshots()[0].healthy
     assert scheduled == [0]
+
+
+def test_failed_worker_invalidates_all_bindings_and_marks_state_recoverable() -> None:
+    backend = FakeMultiWorkerBackend()
+    requests = (ServingRequest(20, (1,), 3), ServingRequest(21, (2,), 3))
+    for request in requests:
+        backend.registry.bind(request.request_id, 0)
+        backend._reserved_blocks[0][request.request_id] = 1
+    invalidated = backend._invalidate_worker(0)
+
+    assert invalidated == (20, 21)
+    assert backend.registry.snapshots()[0].active_requests == 0
+    assert not backend.registry.snapshots()[0].healthy
+    assert backend._reserved_blocks[0] == {}
+    for request in requests:
+        with pytest.raises(KeyError):
+            backend.registry.worker_for(request.request_id)
+        error = WorkerStateLostError("lost")
+        assert backend.is_recoverable_decode_error(request.request_id, error)
+
+
+def test_decode_reports_previously_invalidated_request_as_partial_failure() -> None:
+    backend = FakeMultiWorkerBackend()
+    healthy = ServingRequest(30, (1,), 3)
+    lost = ServingRequest(31, (2,), 3)
+    backend.registry.bind(healthy.request_id, 1)
+    backend._lost_requests.add(lost.request_id)
+
+    with pytest.raises(PartialDecodeError) as raised:
+        backend.decode((healthy, lost))
+
+    assert raised.value.token_ids == {healthy.request_id: healthy.request_id}
+    assert isinstance(raised.value.errors[lost.request_id], WorkerStateLostError)
 
 
 def test_worker_recovery_retries_with_backoff_and_restores_health() -> None:

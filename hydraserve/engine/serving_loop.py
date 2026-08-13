@@ -233,6 +233,7 @@ class ContinuousGenerationLoop:
         self._preemption_failures_total = 0
         self._recoveries_total = 0
         self._recovery_failures_total = 0
+        self._fault_suspensions_total = 0
         self._handles: dict[int, GenerationHandle] = {}
         self._handles_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -804,7 +805,10 @@ class ContinuousGenerationLoop:
             for request in batch:
                 error = exc.errors.get(request.request_id)
                 if error is not None:
-                    self._fail(request, error, active=active, release=True)
+                    if not self._suspend_recoverable_failure(
+                        request, error, active
+                    ):
+                        self._fail(request, error, active=active, release=True)
                 else:
                     self._accept_decode_sample(
                         request, exc.samples[request.request_id], active
@@ -812,10 +816,39 @@ class ContinuousGenerationLoop:
             return
         except Exception as exc:
             for request in batch:
-                self._fail(request, exc, active=active, release=True)
+                if not self._suspend_recoverable_failure(request, exc, active):
+                    self._fail(request, exc, active=active, release=True)
             return
         for request, token_id in zip(batch, token_ids, strict=True):
             self._accept_decode_sample(request, token_id, active)
+
+    def _suspend_recoverable_failure(
+        self,
+        request: ServingRequest,
+        error: BaseException,
+        active: OrderedDict[int, ServingRequest],
+    ) -> bool:
+        checker = getattr(self.backend, "is_recoverable_decode_error", None)
+        abandon = getattr(self.backend, "abandon", None)
+        recover = getattr(self.backend, "recover", None)
+        if (
+            not callable(checker)
+            or not callable(abandon)
+            or not callable(recover)
+            or not checker(request.request_id, error)
+        ):
+            return False
+        try:
+            abandon(request.request_id)
+        except Exception:
+            return False
+        active.pop(request.request_id, None)
+        self._decode_scheduler.forget(request.request_id)
+        self._preempted.append(request)
+        with self._stats_lock:
+            self._fault_suspensions_total += 1
+            self._preempted_count += 1
+        return True
 
     def _accept_decode_sample(
         self,
@@ -1056,6 +1089,11 @@ class ContinuousGenerationLoop:
     def recovery_failures_total(self) -> int:
         with self._stats_lock:
             return self._recovery_failures_total
+
+    @property
+    def fault_suspensions_total(self) -> int:
+        with self._stats_lock:
+            return self._fault_suspensions_total
 
     def _publish_scheduler_depth(self, active: int, prefill_pending: int) -> None:
         with self._stats_lock:

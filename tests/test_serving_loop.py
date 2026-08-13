@@ -840,3 +840,55 @@ def test_async_recovery_retries_transient_capacity_deferral() -> None:
     assert loop.recoveries_total == 1
     assert loop.recovery_failures_total == 0
     assert loop.preempted_count == 0
+
+
+def test_recoverable_worker_loss_replays_without_failing_client_request() -> None:
+    class RecoveringWorkerBackend(FakeBackend):
+        supports_async_prefill = True
+
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+            self.recovery_attempts = 0
+            self.abandoned = []
+
+        def decode(self, requests):
+            if not self.failed:
+                self.failed = True
+                raise PartialDecodeError(
+                    {},
+                    {
+                        request.request_id: RuntimeError("decode worker state lost")
+                        for request in requests
+                    },
+                )
+            return super().decode(requests)
+
+        def is_recoverable_decode_error(self, request_id, error):
+            return "worker state lost" in str(error)
+
+        def abandon(self, request_id):
+            self.abandoned.append(request_id)
+            self.live.discard(request_id)
+
+        def recover(self, request):
+            self.recovery_attempts += 1
+            if self.recovery_attempts == 1:
+                return AdmissionDecision.defer("replacement worker is starting")
+            self.live.add(request.request_id)
+            return AdmissionDecision.accept()
+
+    backend = RecoveringWorkerBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    handle = loop.submit([1], max_new_tokens=4)
+    events = list(handle)
+    loop.close()
+
+    assert [event.token_id for event in events[:-1]] == [2, 3, 4, 5]
+    assert events[-1].finish_reason == "length"
+    assert backend.abandoned == [handle.request_id]
+    assert backend.recovery_attempts == 2
+    assert loop.fault_suspensions_total == 1
+    assert loop.preemptions_total == 0
+    assert loop.recoveries_total == 1
+    assert backend.live == set()

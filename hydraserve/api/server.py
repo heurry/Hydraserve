@@ -47,6 +47,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "preemption_failures_total": loop.preemption_failures_total,
                     "recoveries_total": loop.recoveries_total,
                     "recovery_failures_total": loop.recovery_failures_total,
+                    "fault_suspensions_total": loop.fault_suspensions_total,
                 },
             }
             capacity = getattr(self.hydra.generation_loop.backend, "capacity", None)
@@ -547,6 +548,8 @@ class _Handler(BaseHTTPRequestHandler):
             "# TYPE hydraserve_scheduler_recoveries_total counter",
             f'hydraserve_scheduler_recoveries_total{{outcome="success"}} {loop.recoveries_total}',
             f'hydraserve_scheduler_recoveries_total{{outcome="failure"}} {loop.recovery_failures_total}',
+            "# TYPE hydraserve_scheduler_fault_suspensions_total counter",
+            f"hydraserve_scheduler_fault_suspensions_total {loop.fault_suspensions_total}",
         ]
         capacity = getattr(backend, "capacity", None)
         if capacity is not None:

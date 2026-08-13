@@ -51,3 +51,16 @@ def test_request_worker_binding_is_immutable_and_accounted() -> None:
     assert registry.release(10) == 1
     assert registry.release(10) is None
     assert registry.snapshots()[1].active_requests == 0
+
+
+def test_release_worker_invalidates_all_bindings_atomically() -> None:
+    registry = DecodeWorkerRegistry((_worker(0), _worker(1)))
+    registry.bind(10, 0)
+    registry.bind(11, 0)
+    registry.bind(12, 1)
+
+    assert registry.release_worker(0) == (10, 11)
+    assert registry.snapshots()[0].active_requests == 0
+    assert registry.worker_for(12) == 1
+    with pytest.raises(KeyError):
+        registry.worker_for(10)
