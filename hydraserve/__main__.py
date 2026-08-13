@@ -35,6 +35,7 @@ def main() -> int:
     serve_parser.add_argument("--port", type=int, default=8000)
     serve_parser.add_argument("--device", default="cuda:0")
     serve_parser.add_argument("--decode-device", default="cuda:1")
+    serve_parser.add_argument("--decode-devices", nargs="+")
     serve_mode = serve_parser.add_mutually_exclusive_group()
     serve_mode.add_argument("--pd", action="store_true")
     serve_mode.add_argument("--adaptive", action="store_true")
@@ -64,6 +65,7 @@ def main() -> int:
     benchmark_parser.add_argument("--seed", type=int, default=0)
     benchmark_parser.add_argument("--device", default="cuda:0")
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
+    benchmark_parser.add_argument("--decode-devices", nargs="+")
     benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
     benchmark_mode.add_argument("--pd", action="store_true")
     benchmark_mode.add_argument("--adaptive", action="store_true")
@@ -80,6 +82,8 @@ def main() -> int:
             AdaptiveGenerationBackend,
             ContinuousGenerationLoop,
             DisaggregatedGenerationBackend,
+            MultiWorkerGenerationBackend,
+            PDClusterConfig,
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
@@ -93,7 +97,23 @@ def main() -> int:
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
         tokenizer = QwenTokenizer(args.model)
-        if args.pd or args.adaptive:
+        if args.decode_devices and not args.adaptive:
+            parser.error("--decode-devices requires --adaptive")
+        if args.adaptive and args.decode_devices:
+            backend = MultiWorkerGenerationBackend(
+                PDClusterConfig(
+                    str(args.model),
+                    tuple(args.decode_devices),
+                    prefill_device=args.device,
+                    cache_tokens_per_worker=args.cache_tokens,
+                    block_size=args.block_size,
+                    max_state_slots_per_worker=args.max_batch_size,
+                    use_flash_attention=not args.no_flash_attention,
+                    prefill_chunk_size=args.prefill_chunk_size,
+                )
+            )
+            model_name = backend.model_name
+        elif args.pd or args.adaptive:
             backend_type = (
                 AdaptiveGenerationBackend
                 if args.adaptive
@@ -156,7 +176,7 @@ def main() -> int:
         )
         print(
             f"HydraServe model={model_name} "
-            f"mode={'adaptive' if args.adaptive else ('pd' if args.pd else 'collocated')} "
+            f"mode={'adaptive-1p' + str(len(args.decode_devices)) + 'd' if args.decode_devices else ('adaptive' if args.adaptive else ('pd' if args.pd else 'collocated'))} "
             "listening on "
             f"http://{args.host}:{args.port}"
         )
@@ -177,6 +197,8 @@ def main() -> int:
             AdaptiveGenerationBackend,
             ContinuousGenerationLoop,
             DisaggregatedGenerationBackend,
+            MultiWorkerGenerationBackend,
+            PDClusterConfig,
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
@@ -184,7 +206,22 @@ def main() -> int:
         if args.cache_tokens <= 0 or args.block_size <= 0:
             parser.error("cache limits must be positive")
         tokenizer = QwenTokenizer(args.model)
-        if args.pd or args.adaptive:
+        if args.decode_devices and not args.adaptive:
+            parser.error("--decode-devices requires --adaptive")
+        if args.adaptive and args.decode_devices:
+            backend = MultiWorkerGenerationBackend(
+                PDClusterConfig(
+                    str(args.model),
+                    tuple(args.decode_devices),
+                    prefill_device=args.device,
+                    cache_tokens_per_worker=args.cache_tokens,
+                    block_size=args.block_size,
+                    max_state_slots_per_worker=args.concurrency,
+                    use_flash_attention=not args.no_flash_attention,
+                    prefill_chunk_size=args.prefill_chunk_size,
+                )
+            )
+        elif args.pd or args.adaptive:
             backend_type = (
                 AdaptiveGenerationBackend
                 if args.adaptive

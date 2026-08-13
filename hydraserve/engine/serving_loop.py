@@ -87,6 +87,7 @@ class ServingRequest:
     cancelled: Event = field(default_factory=Event)
     route: str | None = None
     route_reason: str | None = None
+    worker_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

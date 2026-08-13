@@ -29,6 +29,10 @@ from hydraserve.engine.pd_service import (
     PDWorkerConfig,
     RoutingStats,
 )
+from hydraserve.engine.multi_worker import (
+    MultiWorkerGenerationBackend,
+    PDClusterConfig,
+)
 
 __all__ = [
     "AdmissionDecision",
@@ -53,6 +57,8 @@ __all__ = [
     "GenerationEvent",
     "GenerationHandle",
     "OverloadedError",
+    "MultiWorkerGenerationBackend",
+    "PDClusterConfig",
     "RuntimeGenerationBackend",
     "ServingRequest",
     "DisaggregatedGenerationBackend",

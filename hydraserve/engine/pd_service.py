@@ -49,8 +49,13 @@ def _request(
     return request
 
 
-def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses) -> None:
-    backend = None
+def _prefill_worker(
+    config: PDWorkerConfig,
+    namespace: str | tuple[str, ...],
+    commands,
+    responses,
+) -> None:
+    backends = []
     try:
         import torch
 
@@ -67,8 +72,21 @@ def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses)
             use_triton=True,
             use_flash_attention=config.use_flash_attention,
         )
-        backend = SharedMemoryTransferBackend(namespace=namespace)
-        worker = PrefillWorker(runtime, TransferPipeline(backend, src_gpu=0, dst_gpu=1))
+        namespaces = (namespace,) if isinstance(namespace, str) else tuple(namespace)
+        if not namespaces:
+            raise ValueError("prefill worker requires at least one decode namespace")
+        workers = []
+        for worker_index, worker_namespace in enumerate(namespaces):
+            backend = SharedMemoryTransferBackend(namespace=worker_namespace)
+            backends.append(backend)
+            workers.append(
+                PrefillWorker(
+                    runtime,
+                    TransferPipeline(
+                        backend, src_gpu=0, dst_gpu=worker_index + 1
+                    ),
+                )
+            )
         responses.put({"op": "ready", "model_name": runtime.config.name})
         while True:
             command = commands.get()
@@ -77,13 +95,16 @@ def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses)
                 return
             request_id = command["request_id"]
             try:
+                worker_index = int(command.get("worker_index", 0))
+                if not 0 <= worker_index < len(workers):
+                    raise ValueError(f"unknown decode worker {worker_index}")
                 request = _request(
                     request_id,
                     command["token_ids"],
                     command["max_new_tokens"],
                     transferred=False,
                 )
-                result = worker.process(
+                result = workers[worker_index].process(
                     request,
                     n_minus_one=True,
                     chunk_size=config.prefill_chunk_size,
@@ -92,6 +113,7 @@ def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses)
                     {
                         "op": "prefill",
                         "request_id": request_id,
+                        "worker_index": worker_index,
                         "token_id": result.first_token_id,
                     }
                 )
@@ -106,11 +128,17 @@ def _prefill_worker(config: PDWorkerConfig, namespace: str, commands, responses)
     except Exception as exc:
         responses.put({"op": "startup_error", "message": repr(exc)})
     finally:
-        if backend is not None:
+        for backend in backends:
             backend.close()
 
 
-def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) -> None:
+def _decode_worker(
+    config: PDWorkerConfig,
+    namespace: str,
+    commands,
+    responses,
+    worker_index: int = 0,
+) -> None:
     backend = None
     try:
         import torch
@@ -142,7 +170,7 @@ def _decode_worker(config: PDWorkerConfig, namespace: str, commands, responses) 
         backend = SharedMemoryTransferBackend(namespace=namespace)
         worker = DecodeWorker(
             runtime,
-            TransferPipeline(backend, src_gpu=0, dst_gpu=1),
+            TransferPipeline(backend, src_gpu=0, dst_gpu=worker_index + 1),
             cache,
         )
         requests = {}

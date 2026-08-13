@@ -146,6 +146,20 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
 collocated，不对同一请求进行可能重复执行的盲重试。`/health` 暴露容量，`/metrics`
 输出 Prometheus 文本格式的队列、KV、state slot、路由和 worker 健康指标。
 
+1P+ND 使用一个 prefill worker 和多个各自持有 KV/GDN 容量的 decode worker：
+
+```bash
+python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  --adaptive --device cuda:0 \
+  --decode-devices cuda:1 cuda:2 cuda:3 --port 8000
+```
+
+worker registry 先过滤不健康或容量不足的目标，再联合 decode load、Prefix Cache
+匹配长度和链路带宽/跳数评分；预留成功后 worker binding 不再改变。一个 continuous
+decode batch 跨多个 worker 时，各 GPU RPC 并行发起，结果按原请求顺序归并。本机仅有
+两张 GPU，已真实验证新集群后端的 1P+1D 纵切片；1P+ND 的选择、绑定、分组和并发协议
+已单测，N>1 真实硬件验证仍是明确门禁。
+
 `--prefill-chunk-size` 控制 prompt 分块。Paged KV 会预留容量，但 attention 的逻辑
 长度只推进到当前已写入 token，不会读取未来未初始化页。最后一个单 token chunk 与
 多 token chunk 共用同一套 Paged 历史语义。
