@@ -75,6 +75,20 @@ class _Handler(BaseHTTPRequestHandler):
                 }
                 if recovery.healthy_workers < recovery.total_workers:
                     payload["status"] = "degraded"
+            prefill_recovery_stats = getattr(
+                self.hydra.generation_loop.backend, "prefill_recovery_stats", None
+            )
+            if prefill_recovery_stats is not None:
+                recovery = prefill_recovery_stats()
+                payload["prefill_worker"] = {
+                    "healthy": recovery.healthy,
+                    "recovering": recovery.recovering,
+                    "restart_attempts": recovery.attempts,
+                    "restart_successes": recovery.successes,
+                    "restart_failures": recovery.failures,
+                }
+                if not recovery.healthy:
+                    payload["status"] = "degraded"
             cache_stats = getattr(
                 self.hydra.generation_loop.backend, "cache_stats", None
             )
@@ -680,6 +694,22 @@ class _Handler(BaseHTTPRequestHandler):
                     f'hydraserve_worker_restarts_total{{outcome="attempt"}} {stats.attempts}',
                     f'hydraserve_worker_restarts_total{{outcome="success"}} {stats.successes}',
                     f'hydraserve_worker_restarts_total{{outcome="failure"}} {stats.failures}',
+                ]
+            )
+        prefill_recovery_stats = getattr(backend, "prefill_recovery_stats", None)
+        if prefill_recovery_stats is not None:
+            stats = prefill_recovery_stats()
+            lines.extend(
+                [
+                    "# TYPE hydraserve_prefill_worker_recovering gauge",
+                    f"hydraserve_prefill_worker_recovering {1 if stats.recovering else 0}",
+                    "# TYPE hydraserve_prefill_worker_restarts_total counter",
+                    'hydraserve_prefill_worker_restarts_total{outcome="attempt"} '
+                    f"{stats.attempts}",
+                    'hydraserve_prefill_worker_restarts_total{outcome="success"} '
+                    f"{stats.successes}",
+                    'hydraserve_prefill_worker_restarts_total{outcome="failure"} '
+                    f"{stats.failures}",
                 ]
             )
         validation_stats = getattr(backend, "transfer_validation_stats", None)

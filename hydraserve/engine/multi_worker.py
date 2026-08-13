@@ -113,6 +113,15 @@ class WorkerRecoveryStats:
     recovering_workers: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class PrefillRecoveryStats:
+    healthy: bool
+    attempts: int
+    successes: int
+    failures: int
+    recovering: bool
+
+
 class MultiWorkerGenerationBackend:
     """Persistent 1P+ND backend with immutable per-request worker binding."""
 
@@ -146,6 +155,7 @@ class MultiWorkerGenerationBackend:
         self._context = mp.get_context("spawn")
         self._prefill_commands = self._context.Queue()
         self._prefill_responses = self._context.Queue()
+        self._prefill_lock = Lock()
         self._decode_commands = [self._context.Queue() for _ in range(worker_count)]
         self._decode_responses = [self._context.Queue() for _ in range(worker_count)]
         self._decode_locks = [Lock() for _ in range(worker_count)]
@@ -153,16 +163,7 @@ class MultiWorkerGenerationBackend:
             self._new_decode_process(index)
             for index in range(worker_count)
         ]
-        self._prefill = self._context.Process(
-            target=_prefill_worker,
-            args=(
-                config.worker_config(0),
-                self._namespaces,
-                self._prefill_commands,
-                self._prefill_responses,
-            ),
-            name="hydraserve-prefill",
-        )
+        self._prefill = self._new_prefill_process()
         total_blocks = (
             config.cache_tokens_per_worker + config.block_size - 1
         ) // config.block_size - config.kv_headroom_blocks
@@ -203,6 +204,11 @@ class MultiWorkerGenerationBackend:
         self._recovery_attempts = 0
         self._recovery_successes = 0
         self._recovery_failures = 0
+        self._prefill_recovery_thread: Thread | None = None
+        self._prefill_recovering = False
+        self._prefill_recovery_attempts = 0
+        self._prefill_recovery_successes = 0
+        self._prefill_recovery_failures = 0
         self._replay_mismatches = 0
 
         for process in self._decode_processes:
@@ -250,6 +256,7 @@ class MultiWorkerGenerationBackend:
             return AdmissionDecision.defer("all decode workers are temporarily full")
 
         last_retryable = None
+        prefill_available = self._prefill_available()
         for candidate in candidates:
             try:
                 admitted = self._reserve_on(candidate.worker_id, request)
@@ -264,7 +271,7 @@ class MultiWorkerGenerationBackend:
             self.registry.bind(request.request_id, candidate.worker_id)
             request.worker_id = candidate.worker_id
             with self._state_lock:
-                if self._prefill_healthy:
+                if prefill_available:
                     decision = self.router.decide(
                         len(request.token_ids),
                         candidate.decode_load,
@@ -310,17 +317,9 @@ class MultiWorkerGenerationBackend:
             return token_id
         command = self._request_command("prefill", request)
         command["worker_index"] = worker_id
-        self._prefill_commands.put(command)
-        try:
-            result = self._get(self._prefill_responses, self.operation_timeout)
-            self._check(result, "prefill", request.request_id)
-            if result.get("worker_index") != worker_id:
-                raise RuntimeError("prefill worker returned a different decode target")
-        except TimeoutError:
-            with self._state_lock:
-                self._prefill_healthy = False
-                self._pd_failures += 1
-            raise
+        result = self._prefill_rpc(command, request.request_id)
+        if result.get("worker_index") != worker_id:
+            raise RuntimeError("prefill worker returned a different decode target")
         prepared = self._decode_rpc(
             worker_id,
             {
@@ -551,6 +550,17 @@ class MultiWorkerGenerationBackend:
                 tuple(sorted(self._recovering_workers)),
             )
 
+    def prefill_recovery_stats(self) -> PrefillRecoveryStats:
+        self._prefill_available()
+        with self._state_lock:
+            return PrefillRecoveryStats(
+                self._prefill_healthy,
+                self._prefill_recovery_attempts,
+                self._prefill_recovery_successes,
+                self._prefill_recovery_failures,
+                self._prefill_recovering,
+            )
+
     def transfer_validation_stats(self):
         from hydraserve.engine.pd_service import TransferValidationStats
 
@@ -562,7 +572,8 @@ class MultiWorkerGenerationBackend:
             return
         self._closed = True
         self._recovery_stop.set()
-        self._prefill_commands.put({"op": "shutdown"})
+        with self._prefill_lock:
+            self._prefill_commands.put({"op": "shutdown"})
         for commands in self._decode_commands:
             commands.put({"op": "shutdown"})
         if not force:
@@ -642,6 +653,113 @@ class MultiWorkerGenerationBackend:
         self._update_worker_capacity(worker_id, result)
         return result
 
+    def _prefill_rpc(self, command: dict, request_id: int) -> dict:
+        failure = None
+        with self._prefill_lock:
+            try:
+                if not self._prefill.is_alive():
+                    raise WorkerUnavailableError("prefill worker is not running")
+                self._prefill_commands.put(command)
+                result = self._get_prefill_response(self.operation_timeout)
+            except (TimeoutError, WorkerUnavailableError) as exc:
+                failure = exc
+        if failure is not None:
+            with self._state_lock:
+                if self._prefill_healthy:
+                    self._pd_failures += 1
+                self._prefill_healthy = False
+            self._schedule_prefill_recovery()
+            raise failure
+        self._check(result, "prefill", request_id)
+        return result
+
+    def _prefill_available(self) -> bool:
+        with self._state_lock:
+            healthy = self._prefill_healthy
+            closed = self._closed
+        process = getattr(self, "_prefill", None)
+        if not healthy or closed or process is None:
+            return healthy and not closed
+        if process.is_alive():
+            return True
+        with self._state_lock:
+            if self._prefill_healthy:
+                self._prefill_healthy = False
+                self._pd_failures += 1
+        self._schedule_prefill_recovery()
+        return False
+
+    def _get_prefill_response(self, timeout: float):
+        deadline = monotonic() + timeout
+        while True:
+            if not self._prefill.is_alive():
+                raise WorkerUnavailableError("prefill worker exited during RPC")
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for prefill worker")
+            try:
+                return self._prefill_responses.get(timeout=min(0.1, remaining))
+            except Empty:
+                continue
+
+    def _schedule_prefill_recovery(self) -> None:
+        with self._state_lock:
+            if self._closed or self._prefill_recovering:
+                return
+            self._prefill_recovering = True
+            thread = Thread(
+                target=self._recover_prefill_worker,
+                name="hydraserve-recover-prefill",
+                daemon=True,
+            )
+            self._prefill_recovery_thread = thread
+        thread.start()
+
+    def _recover_prefill_worker(self) -> None:
+        try:
+            for attempt in range(self.max_worker_restarts):
+                if self._recovery_stop.is_set():
+                    return
+                with self._state_lock:
+                    self._prefill_recovery_attempts += 1
+                try:
+                    self._restart_prefill_worker_once()
+                except Exception:
+                    with self._state_lock:
+                        self._prefill_recovery_failures += 1
+                    delay = self.worker_restart_backoff_s * (2**attempt)
+                    if self._recovery_stop.wait(delay):
+                        return
+                    continue
+                if self._recovery_stop.is_set():
+                    return
+                with self._state_lock:
+                    self._prefill_healthy = True
+                    self._prefill_recovery_successes += 1
+                return
+        finally:
+            with self._state_lock:
+                self._prefill_recovering = False
+                self._prefill_recovery_thread = None
+
+    def _restart_prefill_worker_once(self) -> None:
+        with self._prefill_lock:
+            if self._recovery_stop.is_set():
+                return
+            previous = self._prefill
+            if previous.is_alive():
+                previous.terminate()
+            previous.join(10)
+            self._prefill_commands = self._context.Queue()
+            self._prefill_responses = self._context.Queue()
+            process = self._new_prefill_process()
+            self._prefill = process
+            process.start()
+            result = self._get_prefill_response(self.startup_timeout)
+            self._check(result, "ready")
+            if result.get("model_name") != self.model_name:
+                raise RuntimeError("restarted prefill worker loaded a different model")
+
     def _invalidate_worker(self, worker_id: int) -> tuple[int, ...]:
         self.registry.set_health(worker_id, False)
         request_ids = self.registry.release_worker(worker_id)
@@ -699,6 +817,8 @@ class MultiWorkerGenerationBackend:
                     if self._recovery_stop.wait(delay):
                         return
                     continue
+                if self._recovery_stop.is_set():
+                    return
                 with self._state_lock:
                     self._recovery_successes += 1
                 return
@@ -740,6 +860,18 @@ class MultiWorkerGenerationBackend:
                 worker_id,
             ),
             name=f"hydraserve-decode-{worker_id}",
+        )
+
+    def _new_prefill_process(self):
+        return self._context.Process(
+            target=_prefill_worker,
+            args=(
+                self.config.worker_config(0),
+                self._namespaces,
+                self._prefill_commands,
+                self._prefill_responses,
+            ),
+            name="hydraserve-prefill",
         )
 
     def _prefix_match(self, request: ServingRequest, worker_id: int) -> int:

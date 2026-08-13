@@ -37,6 +37,7 @@ from hydraserve.engine.pd_service import (
 from hydraserve.engine.multi_worker import (
     MultiWorkerGenerationBackend,
     PDClusterConfig,
+    PrefillRecoveryStats,
     WorkerRecoveryStats,
     WorkerStateLostError,
     WorkerUnavailableError,
@@ -74,6 +75,7 @@ __all__ = [
     "PartialDecodeError",
     "MultiWorkerGenerationBackend",
     "PDClusterConfig",
+    "PrefillRecoveryStats",
     "WorkerRecoveryStats",
     "WorkerStateLostError",
     "WorkerUnavailableError",

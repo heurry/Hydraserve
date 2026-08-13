@@ -389,6 +389,27 @@ and capacity handshake, then recovered the active request. Its seeded sampled
 token stream exactly matched an uninterrupted baseline, with one worker restart,
 one fault suspension, and one successful request recovery.
 
+## 2026-08-14 — prefill-worker liveness and route restoration
+
+Implemented for the adaptive 1P+ND coordinator:
+
+- admission probes prefill-process liveness before choosing a route, so a worker
+  that died while idle cannot consume one sacrificial PD request or wait for the
+  full operation timeout;
+- in-flight RPC polling checks process liveness every 100 ms and quarantines the
+  PD route on exit or timeout;
+- while unhealthy or reloading, new requests are explicitly routed collocated
+  with `prefill_unavailable`, preserving service availability;
+- recovery replaces both IPC queues, starts a new prefill process, validates the
+  model-name handshake, uses bounded exponential-backoff retries, and only then
+  re-enables PD decisions;
+- health and Prometheus expose prefill health, recovering state, and restart
+  attempt/success/failure counts separately from decode-worker recovery.
+
+The real two-GPU test terminated an idle Qwen3.5-4B prefill process. The very
+first subsequent long request completed on the collocated route, and after one
+successful background restart the same prompt returned to PD and completed.
+
 ## 2026-08-14 — KV safety headroom, audit, and observability
 
 Implemented and validated:

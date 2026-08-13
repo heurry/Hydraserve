@@ -56,6 +56,12 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._pd_count = 0
         self._pd_failures = 0
         self._closed = False
+        self._prefill_lock = Lock()
+        self._prefill_recovery_thread = None
+        self._prefill_recovering = False
+        self._prefill_recovery_attempts = 0
+        self._prefill_recovery_successes = 0
+        self._prefill_recovery_failures = 0
         self._recovery_stop = Event()
         self._recovering_workers = set()
         self._recovery_threads = {}
@@ -247,3 +253,60 @@ def test_worker_recovery_retries_with_backoff_and_restores_health() -> None:
     assert stats.failures == 1
     assert stats.healthy_workers == 2
     assert stats.recovering_workers == ()
+
+
+def test_dead_prefill_worker_fails_fast_and_schedules_recovery() -> None:
+    class DeadProcess:
+        def is_alive(self):
+            return False
+
+    backend = FakeMultiWorkerBackend()
+    backend._prefill = DeadProcess()
+    backend._prefill_commands = Queue()
+    backend._prefill_responses = Queue()
+    backend.operation_timeout = 30
+    scheduled = []
+    backend._schedule_prefill_recovery = lambda: scheduled.append(True)
+
+    with pytest.raises(WorkerUnavailableError, match="prefill worker is not running"):
+        backend._prefill_rpc({"op": "prefill"}, 1)
+
+    assert not backend.routing_stats().prefill_healthy
+    assert backend.routing_stats().pd_failures == 1
+    assert scheduled == [True]
+
+
+def test_prefill_recovery_retries_and_restores_pd_routing_health() -> None:
+    class RecoveringPrefill(FakeMultiWorkerBackend):
+        def __init__(self):
+            super().__init__()
+            self.restart_calls = 0
+
+        def _restart_prefill_worker_once(self):
+            self.restart_calls += 1
+            if self.restart_calls == 1:
+                raise RuntimeError("prefill startup failed")
+
+    backend = RecoveringPrefill()
+    backend._prefill_healthy = False
+    backend._prefill_recovering = True
+    backend._recover_prefill_worker()
+    stats = backend.prefill_recovery_stats()
+
+    assert backend.restart_calls == 2
+    assert stats.healthy
+    assert stats.attempts == 2
+    assert stats.successes == 1
+    assert stats.failures == 1
+    assert not stats.recovering
+
+
+def test_unhealthy_prefill_worker_forces_new_request_to_collocated_route() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend._prefill_healthy = False
+    request = ServingRequest(88, tuple(range(20)), 2)
+
+    assert backend.admit(request).admitted
+    assert request.route == "collocated"
+    assert request.route_reason == "prefill_unavailable"
+    backend.release(request.request_id)

@@ -151,7 +151,11 @@ def test_overload_returns_http_429() -> None:
 
 
 def test_health_and_prometheus_metrics_expose_capacity() -> None:
-    from hydraserve.engine import BackendCapacity, WorkerRecoveryStats
+    from hydraserve.engine import (
+        BackendCapacity,
+        PrefillRecoveryStats,
+        WorkerRecoveryStats,
+    )
     from hydraserve.router import RouteCostStats
 
     class CapacityBackend(FakeBackend):
@@ -160,6 +164,9 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
 
         def recovery_stats(self):
             return WorkerRecoveryStats(2, 1, 3, 1, 2, (1,))
+
+        def prefill_recovery_stats(self):
+            return PrefillRecoveryStats(False, 4, 2, 2, True)
 
         def routing_cost_stats(self):
             return RouteCostStats(7, 3, 0.9, 1.2, (5,), ())
@@ -211,6 +218,8 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert health["scheduler"]["fault_suspensions_total"] == 0
         assert health["status"] == "degraded"
         assert health["decode_workers"]["recovering"] == [1]
+        assert health["prefill_worker"]["recovering"] is True
+        assert health["prefill_worker"]["restart_attempts"] == 4
         assert health["routing_cost_model"]["pd_observations"] == 3
         assert health["routing_cost_model"]["collocated_drifted_buckets"] == [5]
         assert health["kv_cache"]["headroom_blocks"] == 2
@@ -227,6 +236,11 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert "hydraserve_scheduler_fault_suspensions_total 0" in metrics
         assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
         assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
+        assert "hydraserve_prefill_worker_recovering 1" in metrics
+        assert (
+            'hydraserve_prefill_worker_restarts_total{outcome="success"} 2'
+            in metrics
+        )
         assert (
             'hydraserve_route_cost_observations_total{route="collocated"} 7'
             in metrics

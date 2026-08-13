@@ -248,7 +248,10 @@ PARTIAL 模式下，静态 8K 阈值会错误偏向 PD，后续路由必须纳�
 IPC 队列，并在模型名和容量握手通过后重新加入。故障 worker 上的全部旧绑定会原子
 失效；在途请求保留已输出历史，等待健康 worker 后重新绑定并用精确 replay 恢复，而
 不是因为设备状态丢失直接向客户端报错。健康 worker 同批已成功的 token 不受影响。
-`/health` 和 `/metrics` 暴露 worker 健康数、恢复中列表、重启计数及 fault suspension 数。
+adaptive 1P+ND coordinator 也会在 admission 和 RPC 等待期间检查 prefill 子进程；故障
+时新请求立即 fail-closed 到 collocated，后台用新 IPC 队列重载模型，握手成功后自动恢复
+PD 路由。`/health` 和 `/metrics` 暴露 decode/prefill 健康、恢复中状态、重启计数及 fault
+suspension 数。
 
 `--max-active-requests` 控制已准入并持有 KV/GDN 容量的请求数，必须不小于
 `--max-batch-size`；后者只控制单步真正进入 decode kernel 的数量。两者分离后，调度器
