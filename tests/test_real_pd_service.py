@@ -108,3 +108,31 @@ def test_real_cluster_backend_single_decode_worker_vertical_slice() -> None:
     assert long.request.route == Route.PD_DISAGGREGATED.value
     assert short.request.worker_id == 0
     loop.close()
+
+
+def test_real_decode_worker_retains_and_reuses_full_attention_prefix_pages() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = AdaptiveGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=64,
+            block_size=4,
+            prefix_cache_blocks=4,
+            prefix_cache_min_frequency=1,
+            use_flash_attention=False,
+        ),
+        router=AdaptiveRouter(
+            RouterConfig(short_prompt_tokens=16, long_prompt_tokens=32, force_pd_tokens=64)
+        ),
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    prompt = [1, 42, 17, 9, 5, 6, 7, 8]
+    first = loop.submit(prompt, max_new_tokens=1)
+    first_tokens = [event.token_id for event in list(first) if event.token_id is not None]
+    assert backend.prefix_match_tokens(prompt) == 8
+    second = loop.submit(prompt, max_new_tokens=1)
+    second_tokens = [event.token_id for event in list(second) if event.token_id is not None]
+    assert first_tokens == second_tokens
+    assert backend.prefix_match_tokens(prompt) == 8
+    loop.close()

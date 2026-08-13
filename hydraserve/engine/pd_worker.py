@@ -43,7 +43,11 @@ class PrefillWorker:
         use_n_minus_one = n_minus_one and len(request.token_ids) > 1
         split = len(request.token_ids) - 1 if use_n_minus_one else len(request.token_ids)
         if self.paged_cache is not None:
-            self.paged_cache.allocate(request.request_id, len(request.token_ids))
+            self.paged_cache.allocate(
+                request.request_id,
+                len(request.token_ids),
+                token_ids=request.token_ids,
+            )
         if (
             self.pipeline.backend.transfer_mode is not TransferMode.PARTIAL_TRANSFER
             and self.paged_cache is None
@@ -120,6 +124,7 @@ class DecodeWorker:
                     request.request_id,
                     len(request.token_ids),
                     reserve_tokens=total_tokens,
+                    token_ids=request.token_ids,
                 )
             descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
             token_ids = torch.tensor(
@@ -166,6 +171,7 @@ class DecodeWorker:
                         f"N-1 replay token mismatch: prefill={descriptor.first_token_id}, "
                         f"decode={replay_token}"
                     )
+            self.paged_cache.publish_prefix(request.request_id, request.token_ids)
         except Exception:
             self.paged_cache.free(request.request_id)
             request.transition(RequestState.FAILED)

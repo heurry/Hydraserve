@@ -589,6 +589,7 @@ class RuntimeGenerationBackend:
                     request.request_id,
                     len(request.token_ids),
                     reserve_tokens=total_tokens,
+                    token_ids=request.token_ids,
                 )
             except MemoryError:
                 self.state_slots.free(request.request_id)
@@ -620,6 +621,7 @@ class RuntimeGenerationBackend:
                     paged_cache=self.paged_cache,
                     request_id=request.request_id,
                 )
+            self.paged_cache.publish_prefix(request.request_id, request.token_ids)
             self.states[request.request_id] = state
             return int(logits[0, -1].argmax())
         except Exception:

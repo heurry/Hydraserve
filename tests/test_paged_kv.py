@@ -4,7 +4,12 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from hydraserve.cache import KVBlockManager, PagedKVCache
+from hydraserve.cache import (
+    CostAwarePrefixPolicy,
+    KVBlockManager,
+    PagedKVCache,
+    PrefixCache,
+)
 from hydraserve.kernels.paged_attention import paged_prefill_attention
 from hydraserve.kernels.reference import causal_gqa_attention
 
@@ -76,3 +81,88 @@ def test_paged_prefill_attention_preserves_chunk_history(tiny_model, device: str
         query, key.unsqueeze(0), value.unsqueeze(0), query_start=2
     )
     torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+
+
+def test_paged_kv_prefix_lifecycle_shares_and_reclaims_physical_pages(tiny_model) -> None:
+    manager = KVBlockManager(8, block_size=2)
+    prefix = PrefixCache(
+        block_size=2,
+        max_blocks=2,
+        policy=CostAwarePrefixPolicy(minimum_frequency=1),
+    )
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    tokens = (1, 2, 3, 4)
+    first = cache.allocate(1, 4, reserve_tokens=5, token_ids=tokens)
+    published = cache.publish_prefix(1, tokens)
+    assert published.inserted_block_ids == first.block_ids[:2]
+    shared = first.block_ids[:2]
+    cache.free(1)
+    assert all(manager.block_refcount(block) == 1 for block in shared)
+
+    second = cache.allocate(2, 4, reserve_tokens=5, token_ids=tokens)
+    assert second.block_ids[:2] == shared
+    assert second.prefix_blocks == 2
+    assert cache.matched_prefix_tokens(2) == 4
+    assert all(manager.block_refcount(block) == 2 for block in shared)
+    cache.free(2)
+    assert all(manager.block_refcount(block) == 1 for block in shared)
+
+    evicted = prefix.evict(2)
+    manager.release_blocks(evicted)
+    assert manager.num_free_blocks == manager.num_blocks
+
+
+def test_paged_kv_does_not_overwrite_shared_prefix_pages(tiny_model) -> None:
+    manager = KVBlockManager(6, block_size=2)
+    prefix = PrefixCache(block_size=2, max_blocks=1)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    tokens = (1, 2, 3)
+    first = cache.allocate(1, 3, token_ids=tokens)
+    layer = tiny_model.full_attention_layer_indices[0]
+    key = torch.ones(3, tiny_model.num_kv_heads, tiny_model.head_dim)
+    cache.write(1, layer, torch.arange(3), key, key)
+    cache.publish_prefix(1, tokens)
+    cache.free(1)
+
+    second = cache.allocate(2, 3, token_ids=tokens)
+    replacement = torch.full_like(key, 9)
+    cache.write(2, layer, torch.arange(3), replacement, replacement)
+    gathered, _ = cache.read(2, layer)
+    torch.testing.assert_close(gathered[:2], key[:2])
+    torch.testing.assert_close(gathered[2:], replacement[2:])
+    cache.free(2)
+
+
+def test_active_admission_evicts_unreferenced_prefix_pages_under_pressure(tiny_model) -> None:
+    manager = KVBlockManager(3, block_size=2)
+    prefix = PrefixCache(block_size=2, max_blocks=2)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    tokens = (1, 2, 3, 4)
+    cache.allocate(1, 4, token_ids=tokens)
+    cache.publish_prefix(1, tokens)
+    cache.free(1)
+    assert manager.num_free_blocks == 1
+
+    allocation = cache.allocate(2, 4, token_ids=(8, 9, 10, 11))
+    assert len(allocation.block_ids) == 2
+    assert prefix.stats().evictions == 1
+    assert manager.num_free_blocks == 0
+    cache.free(2)

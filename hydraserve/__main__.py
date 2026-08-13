@@ -45,6 +45,8 @@ def main() -> int:
     serve_parser.add_argument("--max-queue-size", type=int, default=1024)
     serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
+    serve_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
+    serve_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
     serve_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser = subparsers.add_parser(
         "benchmark", help="run local datasets through the HydraServe runtime"
@@ -72,6 +74,8 @@ def main() -> int:
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
+    benchmark_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
+    benchmark_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -94,8 +98,11 @@ def main() -> int:
             args.max_batch_size,
             args.max_queue_size,
             args.max_queue_tokens,
+            args.prefix_cache_min_frequency,
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
+        if args.prefix_cache_blocks < 0:
+            parser.error("prefix cache blocks cannot be negative")
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
@@ -110,6 +117,8 @@ def main() -> int:
                     max_state_slots_per_worker=args.max_batch_size,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
+                    prefix_cache_blocks=args.prefix_cache_blocks,
+                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 )
             )
             model_name = backend.model_name
@@ -129,13 +138,21 @@ def main() -> int:
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
                     max_state_slots=args.max_batch_size,
+                    prefix_cache_blocks=args.prefix_cache_blocks,
+                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 )
             )
             model_name = backend.model_name
         else:
             import torch
 
-            from hydraserve.cache import KVBlockManager, PagedKVCache
+            from hydraserve.cache import (
+                CacheNamespace,
+                CostAwarePrefixPolicy,
+                KVBlockManager,
+                PagedKVCache,
+                PrefixCache,
+            )
             from hydraserve.engine import RuntimeGenerationBackend
             from hydraserve.model import QwenTextRuntime
 
@@ -152,6 +169,22 @@ def main() -> int:
                 KVBlockManager(blocks, block_size=args.block_size),
                 device=args.device,
                 dtype=torch.bfloat16,
+                prefix_cache=(
+                    PrefixCache(
+                        args.block_size,
+                        max_blocks=args.prefix_cache_blocks,
+                        policy=CostAwarePrefixPolicy(
+                            minimum_frequency=args.prefix_cache_min_frequency
+                        ),
+                    )
+                    if args.prefix_cache_blocks
+                    else None
+                ),
+                cache_namespace=CacheNamespace(
+                    model=runtime.config.name,
+                    tokenizer_revision=str(args.model.resolve()),
+                    model_revision=str(args.model.resolve()),
+                ),
             )
             backend = RuntimeGenerationBackend(
                 runtime,
@@ -203,8 +236,14 @@ def main() -> int:
         )
         from hydraserve.model import QwenTokenizer
 
-        if args.cache_tokens <= 0 or args.block_size <= 0:
+        if min(
+            args.cache_tokens,
+            args.block_size,
+            args.prefix_cache_min_frequency,
+        ) <= 0:
             parser.error("cache limits must be positive")
+        if args.prefix_cache_blocks < 0:
+            parser.error("prefix cache blocks cannot be negative")
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
@@ -219,6 +258,8 @@ def main() -> int:
                     max_state_slots_per_worker=args.concurrency,
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
+                    prefix_cache_blocks=args.prefix_cache_blocks,
+                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 )
             )
         elif args.pd or args.adaptive:
@@ -237,12 +278,20 @@ def main() -> int:
                     use_flash_attention=not args.no_flash_attention,
                     prefill_chunk_size=args.prefill_chunk_size,
                     max_state_slots=args.concurrency,
+                    prefix_cache_blocks=args.prefix_cache_blocks,
+                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 )
             )
         else:
             import torch
 
-            from hydraserve.cache import KVBlockManager, PagedKVCache
+            from hydraserve.cache import (
+                CacheNamespace,
+                CostAwarePrefixPolicy,
+                KVBlockManager,
+                PagedKVCache,
+                PrefixCache,
+            )
             from hydraserve.engine import RuntimeGenerationBackend
             from hydraserve.model import QwenTextRuntime
 
@@ -259,6 +308,22 @@ def main() -> int:
                 KVBlockManager(blocks, block_size=args.block_size),
                 device=args.device,
                 dtype=torch.bfloat16,
+                prefix_cache=(
+                    PrefixCache(
+                        args.block_size,
+                        max_blocks=args.prefix_cache_blocks,
+                        policy=CostAwarePrefixPolicy(
+                            minimum_frequency=args.prefix_cache_min_frequency
+                        ),
+                    )
+                    if args.prefix_cache_blocks
+                    else None
+                ),
+                cache_namespace=CacheNamespace(
+                    model=runtime.config.name,
+                    tokenizer_revision=str(args.model.resolve()),
+                    model_revision=str(args.model.resolve()),
+                ),
             )
             backend = RuntimeGenerationBackend(
                 runtime,

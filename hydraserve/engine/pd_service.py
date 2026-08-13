@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import multiprocessing as mp
+from pathlib import Path
 from queue import Empty
 from threading import Lock, RLock
 from uuid import uuid4
@@ -26,6 +27,8 @@ class PDWorkerConfig:
     use_flash_attention: bool = True
     prefill_chunk_size: int = 4096
     max_state_slots: int = 64
+    prefix_cache_blocks: int = 0
+    prefix_cache_min_frequency: int = 2
 
 
 def _request(
@@ -143,7 +146,13 @@ def _decode_worker(
     try:
         import torch
 
-        from hydraserve.cache import KVBlockManager, PagedKVCache
+        from hydraserve.cache import (
+            CacheNamespace,
+            CostAwarePrefixPolicy,
+            KVBlockManager,
+            PagedKVCache,
+            PrefixCache,
+        )
         from hydraserve.engine.pd_worker import DecodeWorker
         from hydraserve.engine.scheduler import RequestState
         from hydraserve.model.runtime import QwenTextRuntime
@@ -161,11 +170,29 @@ def _decode_worker(
             use_flash_attention=False,
         )
         blocks = (config.cache_tokens + config.block_size - 1) // config.block_size
+        prefix_cache = (
+            PrefixCache(
+                config.block_size,
+                max_blocks=config.prefix_cache_blocks,
+                policy=CostAwarePrefixPolicy(
+                    minimum_frequency=config.prefix_cache_min_frequency
+                ),
+            )
+            if config.prefix_cache_blocks
+            else None
+        )
+        revision = str(Path(config.model_dir).resolve())
         cache = PagedKVCache(
             runtime.config,
             KVBlockManager(blocks, block_size=config.block_size),
             device=device,
             dtype=torch.bfloat16,
+            prefix_cache=prefix_cache,
+            cache_namespace=CacheNamespace(
+                model=runtime.config.name,
+                tokenizer_revision=revision,
+                model_revision=revision,
+            ),
         )
         backend = SharedMemoryTransferBackend(namespace=namespace)
         worker = DecodeWorker(
@@ -176,7 +203,19 @@ def _decode_worker(
         requests = {}
         states = {}
         reservations = set()
-        responses.put({"op": "ready", "model_name": runtime.config.name})
+        def capacity_payload():
+            capacity = cache.block_manager.capacity()
+            live = len(set(states) | reservations)
+            return {
+                "kv_total_blocks": capacity.total_blocks,
+                "kv_free_blocks": capacity.free_blocks,
+                "state_total_slots": config.max_state_slots,
+                "state_free_slots": max(0, config.max_state_slots - live),
+            }
+
+        responses.put(
+            {"op": "ready", "model_name": runtime.config.name, **capacity_payload()}
+        )
         while True:
             command = commands.get()
             operation = command["op"]
@@ -204,6 +243,7 @@ def _decode_worker(
                                     f"request needs {required} KV blocks, worker capacity "
                                     f"is {cache.block_manager.num_blocks}"
                                 ),
+                                **capacity_payload(),
                             }
                         )
                     elif request_id in live_requests:
@@ -212,6 +252,7 @@ def _decode_worker(
                                 "op": "admission",
                                 "request_id": request_id,
                                 "admitted": True,
+                                **capacity_payload(),
                             }
                         )
                     elif len(live_requests) >= config.max_state_slots:
@@ -222,33 +263,36 @@ def _decode_worker(
                                 "admitted": False,
                                 "retryable": True,
                                 "reason": "recurrent-state slots are exhausted",
-                            }
-                        )
-                    elif required > cache.block_manager.num_free_blocks:
-                        responses.put(
-                            {
-                                "op": "admission",
-                                "request_id": request_id,
-                                "admitted": False,
-                                "retryable": True,
-                                "reason": (
-                                    f"request needs {required} KV blocks, only "
-                                    f"{cache.block_manager.num_free_blocks} are free"
-                                ),
+                                **capacity_payload(),
                             }
                         )
                     else:
-                        cache.allocate(
-                            request_id,
-                            len(command["token_ids"]),
-                            reserve_tokens=total_tokens,
-                        )
+                        try:
+                            cache.allocate(
+                                request_id,
+                                len(command["token_ids"]),
+                                reserve_tokens=total_tokens,
+                                token_ids=command["token_ids"],
+                            )
+                        except MemoryError:
+                            responses.put(
+                                {
+                                    "op": "admission",
+                                    "request_id": request_id,
+                                    "admitted": False,
+                                    "retryable": True,
+                                    "reason": "decode worker KV capacity is exhausted",
+                                    **capacity_payload(),
+                                }
+                            )
+                            continue
                         reservations.add(request_id)
                         responses.put(
                             {
                                 "op": "admission",
                                 "request_id": request_id,
                                 "admitted": True,
+                                **capacity_payload(),
                             }
                         )
                 elif operation == "prepare":
@@ -295,6 +339,7 @@ def _decode_worker(
                             paged_cache=cache,
                             request_id=request_id,
                         )
+                    cache.publish_prefix(request_id, request.token_ids)
                     token_id = int(logits[0, -1].argmax())
                     request.generated_token_ids.append(token_id)
                     requests[request_id] = request
@@ -333,7 +378,19 @@ def _decode_worker(
                     states.pop(request_id, None)
                     requests.pop(request_id, None)
                     cache.free(request_id)
-                    responses.put({"op": "release", "request_id": request_id})
+                    responses.put(
+                        {"op": "release", "request_id": request_id, **capacity_payload()}
+                    )
+                elif operation == "prefix_probe":
+                    match = cache.probe_prefix(command["token_ids"])
+                    responses.put(
+                        {
+                            "op": "prefix_probe",
+                            "request_id": command["request_id"],
+                            "matched_tokens": match.matched_tokens,
+                            **capacity_payload(),
+                        }
+                    )
                 else:
                     raise ValueError(f"unknown decode-worker operation {operation!r}")
             except Exception as exc:
@@ -372,8 +429,11 @@ class DisaggregatedGenerationBackend:
             config.block_size,
             config.prefill_chunk_size,
             config.max_state_slots,
+            config.prefix_cache_min_frequency,
         ) <= 0:
             raise ValueError("cache limits must be positive")
+        if config.prefix_cache_blocks < 0:
+            raise ValueError("prefix cache blocks cannot be negative")
         self.config = config
         self.supports_async_prefill = True
         self.operation_timeout = operation_timeout
@@ -397,6 +457,7 @@ class DisaggregatedGenerationBackend:
         self._decode_lock = Lock()
         self._admitted_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
+        self._last_capacity: BackendCapacity | None = None
         self._decode.start()
         self._prefill.start()
         try:
@@ -407,6 +468,7 @@ class DisaggregatedGenerationBackend:
             if prefill_ready["model_name"] != decode_ready["model_name"]:
                 raise RuntimeError("prefill/decode workers loaded different models")
             self.model_name = prefill_ready["model_name"]
+            self._update_capacity(decode_ready)
         except Exception:
             self.close(force=True)
             raise
@@ -431,6 +493,7 @@ class DisaggregatedGenerationBackend:
             self._decode_commands.put(command)
             result = self._get(self._decode_responses, self.operation_timeout)
             self._check(result, "admission", request.request_id)
+            self._update_capacity(result)
             if result.get("admitted"):
                 self._admitted_requests.add(request.request_id)
                 self._reserved_blocks[request.request_id] = required_blocks
@@ -505,20 +568,46 @@ class DisaggregatedGenerationBackend:
             self._admitted_requests.discard(request_id)
             self._reserved_blocks.pop(request_id, None)
         self._check(result, "release", request_id)
+        self._update_capacity(result)
 
     def capacity(self) -> BackendCapacity:
-        total_blocks = (
-            self.config.cache_tokens + self.config.block_size - 1
-        ) // self.config.block_size
         with self._decode_lock:
+            if self._last_capacity is not None:
+                return self._last_capacity
+            total_blocks = (
+                self.config.cache_tokens + self.config.block_size - 1
+            ) // self.config.block_size
             allocated_blocks = sum(self._reserved_blocks.values())
             allocated_slots = len(self._admitted_requests)
-        return BackendCapacity(
-            kv_total_blocks=total_blocks,
-            kv_free_blocks=max(0, total_blocks - allocated_blocks),
-            state_total_slots=self.config.max_state_slots,
-            state_free_slots=max(0, self.config.max_state_slots - allocated_slots),
+            return BackendCapacity(
+                kv_total_blocks=total_blocks,
+                kv_free_blocks=max(0, total_blocks - allocated_blocks),
+                state_total_slots=self.config.max_state_slots,
+                state_free_slots=max(0, self.config.max_state_slots - allocated_slots),
+            )
+
+    def prefix_match_tokens(self, token_ids) -> int:
+        command = {
+            "op": "prefix_probe",
+            "request_id": -1,
+            "token_ids": tuple(int(token) for token in token_ids),
+        }
+        with self._decode_lock:
+            self._decode_commands.put(command)
+            result = self._get(self._decode_responses, self.operation_timeout)
+        self._check(result, "prefix_probe", -1)
+        self._update_capacity(result)
+        return int(result["matched_tokens"])
+
+    def _update_capacity(self, result: dict) -> None:
+        keys = (
+            "kv_total_blocks",
+            "kv_free_blocks",
+            "state_total_slots",
+            "state_free_slots",
         )
+        if all(key in result for key in keys):
+            self._last_capacity = BackendCapacity(*(int(result[key]) for key in keys))
 
     def close(self, *, force: bool = False) -> None:
         if self._closed:

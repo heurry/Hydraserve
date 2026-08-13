@@ -65,6 +65,35 @@ def test_decode_batch_growth_is_atomic() -> None:
     assert manager.num_free_blocks == 0
 
 
+def test_shared_prefix_blocks_use_reference_counted_ownership() -> None:
+    manager = KVBlockManager(num_blocks=4, block_size=2)
+    first = manager.allocate(1, 4)
+    shared = first.block_ids[0]
+    manager.retain_blocks((shared,))
+    assert manager.block_refcount(shared) == 2
+    second = manager.allocate(2, 3, prefix_block_ids=(shared,))
+    assert second.block_ids[0] == shared
+    assert second.prefix_blocks == 1
+    assert manager.block_refcount(shared) == 3
+    manager.free(1)
+    assert manager.block_refcount(shared) == 2
+    manager.free(2)
+    assert manager.block_refcount(shared) == 1
+    manager.release_blocks((shared,))
+    assert manager.block_refcount(shared) == 0
+    assert manager.num_free_blocks == 4
+
+
+def test_shared_prefix_allocation_rolls_back_without_refcount_change() -> None:
+    manager = KVBlockManager(num_blocks=2, block_size=2)
+    first = manager.allocate(1, 2)
+    shared = first.block_ids[0]
+    manager.retain_blocks((shared,))
+    with pytest.raises(MemoryError):
+        manager.allocate(2, 2, reserve_tokens=5, prefix_block_ids=(shared,))
+    assert manager.block_refcount(shared) == 2
+
+
 def test_linear_state_pool_enforces_fp32(tiny_model) -> None:
     pool = LinearStatePool(1, tiny_model.ssm_state_shape, tiny_model.conv_state_shape)
     pool.allocate(10)

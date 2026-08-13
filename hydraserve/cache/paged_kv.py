@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 from typing import Any, Iterable
+from threading import RLock
 
 from hydraserve.cache.block_manager import KVBlockManager
+from hydraserve.cache.prefix_cache import (
+    DEFAULT_NAMESPACE,
+    CacheNamespace,
+    PrefixCache,
+    PrefixMatch,
+)
 from hydraserve.config import ModelConfig
 
 
@@ -16,6 +23,8 @@ class PagedKVCache:
         *,
         device: str | Any,
         dtype: Any,
+        prefix_cache: PrefixCache | None = None,
+        cache_namespace: CacheNamespace = DEFAULT_NAMESPACE,
     ) -> None:
         import torch
 
@@ -25,6 +34,12 @@ class PagedKVCache:
         self.block_manager = block_manager
         self.device = torch.device(device)
         self.dtype = dtype
+        if prefix_cache is not None and prefix_cache.block_size != block_manager.block_size:
+            raise ValueError("prefix cache and KV allocator block sizes must match")
+        self.prefix_cache = prefix_cache
+        self.cache_namespace = cache_namespace
+        self._prefix_matches: dict[int, tuple[tuple[int, ...], PrefixMatch]] = {}
+        self._prefix_lock = RLock()
         self.layer_to_slot = {
             layer_index: slot for slot, layer_index in enumerate(model.full_attention_layer_indices)
         }
@@ -44,16 +59,111 @@ class PagedKVCache:
         num_tokens: int,
         *,
         reserve_tokens: int | None = None,
+        token_ids: Iterable[int] | None = None,
     ):
-        return self.block_manager.allocate(
-            request_id, num_tokens, reserve_tokens=reserve_tokens
-        )
+        tokens = None if token_ids is None else tuple(int(token) for token in token_ids)
+        if tokens is not None and len(tokens) != num_tokens:
+            raise ValueError("token_ids must match the logical allocation length")
+        with self._prefix_lock:
+            match = PrefixMatch(0, ())
+            if self.prefix_cache is not None and tokens is not None:
+                match = self.prefix_cache.match(
+                    tokens, namespace=self.cache_namespace, acquire=True
+                )
+            try:
+                required = self.block_manager.blocks_required(
+                    num_tokens if reserve_tokens is None else reserve_tokens
+                )
+                new_required = max(0, required - len(match.block_ids))
+                shortage = max(0, new_required - self.block_manager.num_free_blocks)
+                if shortage and self.prefix_cache is not None:
+                    evicted = self.prefix_cache.evict(shortage)
+                    if evicted:
+                        self.block_manager.release_blocks(evicted)
+                allocation = self.block_manager.allocate(
+                    request_id,
+                    num_tokens,
+                    reserve_tokens=reserve_tokens,
+                    prefix_block_ids=match.block_ids,
+                )
+            except Exception:
+                if match.matched_tokens and tokens is not None:
+                    self.prefix_cache.release(
+                        tokens,
+                        match.matched_tokens,
+                        namespace=self.cache_namespace,
+                    )
+                raise
+            if match.matched_tokens and tokens is not None:
+                self._prefix_matches[request_id] = (tokens, match)
+            return allocation
 
     def reserve_append(self, request_id: int, additional_tokens: int = 1):
         return self.block_manager.grow(request_id, additional_tokens)
 
     def free(self, request_id: int) -> None:
-        self.block_manager.free(request_id)
+        with self._prefix_lock:
+            self.block_manager.free(request_id)
+            owner = self._prefix_matches.pop(request_id, None)
+            if owner is not None and self.prefix_cache is not None:
+                tokens, match = owner
+                self.prefix_cache.release(
+                    tokens,
+                    match.matched_tokens,
+                    namespace=self.cache_namespace,
+                )
+
+    def publish_prefix(
+        self,
+        request_id: int,
+        token_ids: Iterable[int],
+        *,
+        recompute_cost_ms: float | None = None,
+    ) -> PrefixMatch:
+        """Publish complete prompt pages and transfer ownership to PrefixCache."""
+        if self.prefix_cache is None:
+            return PrefixMatch(0, (), admitted=False, reason="prefix cache is disabled")
+        tokens = tuple(int(token) for token in token_ids)
+        with self._prefix_lock:
+            allocation = self.block_manager.get(request_id)
+            full_blocks = min(
+                len(tokens) // self.block_manager.block_size,
+                len(allocation.block_ids),
+            )
+            if full_blocks == 0:
+                return PrefixMatch(0, ())
+            blocks = allocation.block_ids[:full_blocks]
+            self.block_manager.retain_blocks(blocks)
+            try:
+                result = self.prefix_cache.insert(
+                    tokens,
+                    blocks,
+                    namespace=self.cache_namespace,
+                    recompute_cost_ms=recompute_cost_ms,
+                    bytes_per_block=self._bytes_per_block(),
+                )
+            except Exception:
+                self.block_manager.release_blocks(blocks)
+                raise
+            inserted = set(result.inserted_block_ids)
+            not_inserted = tuple(block_id for block_id in blocks if block_id not in inserted)
+            if not_inserted:
+                self.block_manager.release_blocks(not_inserted)
+            if result.evicted_block_ids:
+                self.block_manager.release_blocks(result.evicted_block_ids)
+            return result
+
+    def probe_prefix(self, token_ids: Iterable[int]) -> PrefixMatch:
+        if self.prefix_cache is None:
+            return PrefixMatch(0, ())
+        return self.prefix_cache.match(
+            token_ids, namespace=self.cache_namespace, acquire=False
+        )
+
+    def matched_prefix_tokens(self, request_id: int) -> int:
+        with self._prefix_lock:
+            owner = self._prefix_matches.get(request_id)
+            return 0 if owner is None else owner[1].matched_tokens
 
     def write(self, request_id: int, layer_index: int, positions, key, value) -> None:
         import torch
@@ -71,6 +181,14 @@ class PagedKVCache:
             raise ValueError("invalid projected KV shape")
         if positions.numel() and (int(positions.min()) < 0 or int(positions.max()) >= allocation.num_tokens):
             raise IndexError("KV write position is outside the request allocation")
+        matched_tokens = self.matched_prefix_tokens(request_id)
+        if matched_tokens:
+            writable = positions >= matched_tokens
+            if not bool(writable.any()):
+                return
+            positions = positions[writable].contiguous()
+            key = key[writable].contiguous()
+            value = value[writable].contiguous()
         block_ids = torch.tensor(allocation.block_ids, device=self.device, dtype=torch.int32)
         if self.device.type == "cuda":
             from hydraserve.kernels.kv_cache import write_paged_kv
@@ -152,3 +270,16 @@ class PagedKVCache:
             return self.layer_to_slot[layer_index]
         except KeyError as exc:
             raise ValueError(f"layer {layer_index} is not a full-attention layer") from exc
+
+    def _bytes_per_block(self) -> int:
+        import torch
+
+        element_size = torch.empty((), dtype=self.dtype).element_size()
+        return (
+            self.model.num_full_attention_layers
+            * self.block_manager.block_size
+            * self.model.num_kv_heads
+            * self.model.head_dim
+            * 2
+            * element_size
+        )

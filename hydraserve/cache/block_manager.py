@@ -10,6 +10,7 @@ class BlockAllocation:
     block_ids: tuple[int, ...]
     num_tokens: int
     reserved_tokens: int
+    prefix_blocks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,6 +38,7 @@ class KVBlockManager:
         self.num_blocks = num_blocks
         self.block_size = block_size
         self._free = list(range(num_blocks))
+        self._refcounts = [0] * num_blocks
         self._allocations: dict[int, BlockAllocation] = {}
         self._lock = RLock()
 
@@ -61,6 +63,7 @@ class KVBlockManager:
         num_tokens: int,
         *,
         reserve_tokens: int | None = None,
+        prefix_block_ids=(),
     ) -> BlockAllocation:
         """Atomically allocate logical tokens and optional future capacity.
 
@@ -69,17 +72,38 @@ class KVBlockManager:
         positions to attention.
         """
         reservation = num_tokens if reserve_tokens is None else reserve_tokens
+        prefix = tuple(int(block_id) for block_id in prefix_block_ids)
         if reservation < num_tokens:
             raise ValueError("reserve_tokens cannot be smaller than num_tokens")
+        if len(set(prefix)) != len(prefix):
+            raise ValueError("prefix block ids must be unique")
+        if len(prefix) > num_tokens // self.block_size:
+            raise ValueError("only complete logical prefix blocks can be shared")
         required = self.blocks_required(reservation)
         with self._lock:
             if request_id in self._allocations:
                 raise ValueError(f"request {request_id} already owns KV blocks")
-            if required > len(self._free):
-                raise MemoryError(f"need {required} KV blocks, only {len(self._free)} are free")
-            block_ids = tuple(self._free[:required])
-            del self._free[:required]
-            allocation = BlockAllocation(request_id, block_ids, num_tokens, reservation)
+            if any(block_id < 0 or block_id >= self.num_blocks for block_id in prefix):
+                raise ValueError("prefix block id is outside the allocator")
+            if any(self._refcounts[block_id] <= 0 for block_id in prefix):
+                raise ValueError("prefix block is not retained by the cache")
+            new_required = required - len(prefix)
+            if new_required < 0:
+                raise ValueError("prefix contains more blocks than the reservation")
+            if new_required > len(self._free):
+                raise MemoryError(
+                    f"need {new_required} KV blocks, only {len(self._free)} are free"
+                )
+            new_blocks = tuple(self._free[:new_required])
+            del self._free[:new_required]
+            for block_id in prefix:
+                self._refcounts[block_id] += 1
+            for block_id in new_blocks:
+                self._refcounts[block_id] = 1
+            block_ids = prefix + new_blocks
+            allocation = BlockAllocation(
+                request_id, block_ids, num_tokens, reservation, len(prefix)
+            )
             self._allocations[request_id] = allocation
             return allocation
 
@@ -97,11 +121,14 @@ class KVBlockManager:
                 raise MemoryError(f"need {extra} additional KV blocks")
             block_ids = current.block_ids + tuple(self._free[:extra])
             del self._free[:extra]
+            for block_id in block_ids[len(current.block_ids) :]:
+                self._refcounts[block_id] = 1
             allocation = BlockAllocation(
                 request_id,
                 block_ids,
                 current.num_tokens,
                 max(current.reserved_tokens, total_tokens),
+                current.prefix_blocks,
             )
             self._allocations[request_id] = allocation
             return allocation
@@ -147,10 +174,15 @@ class KVBlockManager:
                     current.block_ids + appended,
                     num_tokens,
                     max(current.reserved_tokens, num_tokens),
+                    current.prefix_blocks,
                 )
                 self._allocations[current.request_id] = allocation
                 results.append(allocation)
             del self._free[:cursor]
+            for allocation in results:
+                for block_id in allocation.block_ids:
+                    if self._refcounts[block_id] == 0:
+                        self._refcounts[block_id] = 1
             return tuple(results)
 
     def truncate(self, request_id: int, num_tokens: int) -> BlockAllocation:
@@ -164,6 +196,7 @@ class KVBlockManager:
                 current.block_ids,
                 num_tokens,
                 current.reserved_tokens,
+                current.prefix_blocks,
             )
             self._allocations[request_id] = allocation
             return allocation
@@ -180,8 +213,45 @@ class KVBlockManager:
             allocation = self._allocations.pop(request_id, None)
             if allocation is None:
                 return
-            self._free.extend(allocation.block_ids)
-            self._free.sort()
+            self._release_blocks_locked(allocation.block_ids)
+
+    def retain_blocks(self, block_ids) -> None:
+        """Add an external owner, such as PrefixCache, to physical pages."""
+        blocks = tuple(int(block_id) for block_id in block_ids)
+        if len(set(blocks)) != len(blocks):
+            raise ValueError("retained block ids must be unique")
+        with self._lock:
+            for block_id in blocks:
+                if not 0 <= block_id < self.num_blocks:
+                    raise ValueError("retained block id is outside the allocator")
+                if self._refcounts[block_id] <= 0:
+                    raise ValueError("cannot retain an unallocated block")
+            for block_id in blocks:
+                self._refcounts[block_id] += 1
+
+    def release_blocks(self, block_ids) -> None:
+        with self._lock:
+            self._release_blocks_locked(tuple(int(block_id) for block_id in block_ids))
+
+    def block_refcount(self, block_id: int) -> int:
+        with self._lock:
+            if not 0 <= block_id < self.num_blocks:
+                raise ValueError("block id is outside the allocator")
+            return self._refcounts[block_id]
+
+    def _release_blocks_locked(self, block_ids: tuple[int, ...]) -> None:
+        if len(set(block_ids)) != len(block_ids):
+            raise ValueError("released block ids must be unique")
+        for block_id in block_ids:
+            if not 0 <= block_id < self.num_blocks:
+                raise ValueError("released block id is outside the allocator")
+            if self._refcounts[block_id] <= 0:
+                raise RuntimeError(f"KV block {block_id} reference count would underflow")
+        for block_id in block_ids:
+            self._refcounts[block_id] -= 1
+            if self._refcounts[block_id] == 0:
+                self._free.append(block_id)
+        self._free.sort()
 
     def capacity(self) -> BlockCapacity:
         with self._lock:

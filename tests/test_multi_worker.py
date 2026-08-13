@@ -26,6 +26,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
             block_size=4,
             cache_tokens_per_worker=40,
             max_state_slots_per_worker=4,
+            prefix_cache_blocks=0,
         )
         self.router = AdaptiveRouter(
             RouterConfig(short_prompt_tokens=4, long_prompt_tokens=8, force_pd_tokens=16)

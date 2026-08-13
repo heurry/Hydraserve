@@ -78,6 +78,7 @@ def test_cost_aware_eviction_returns_physical_blocks_to_reclaim() -> None:
     inserted = cache.insert((5, 6), (30,), recompute_cost_ms=10)
     assert inserted.admitted
     assert inserted.evicted_block_ids == (10,)
+    assert inserted.inserted_block_ids == (30,)
     assert cache.match((1, 2)).matched_tokens == 0
     assert cache.match((3, 4)).block_ids == (20,)
     assert cache.match((5, 6)).block_ids == (30,)

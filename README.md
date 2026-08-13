@@ -37,7 +37,8 @@ Prefill–Decode 分离推理引擎。当前主线按 [`main.md`](main.md) 从�
 - CUDA P2P 后端及硬件能力检测（本机 NODE 拓扑无 peer access，自动回退 SHM）；
 - 完整块粒度的 full-attention prefix radix cache（不错误缓存 GDN 状态）：支持
   model/tokenizer/revision/adapter 命名空间、引用保护、频率 doorkeeper、成本/大小/新鲜度
-  淘汰评分、容量上限和有界频率元数据；淘汰页显式返回给物理页管理器回收；
+  淘汰评分、容量上限和有界频率元数据；已接入 PagedKVCache 的物理页引用计数、共享、
+  写保护和回收，活跃请求容量不足时会先淘汰无引用低价值缓存页；
 - ShareGPT、HumanEval、LongBench、WikiText-103、GSM8K 低内存数据适配器。
 
 当前还包括驻留式 Continuous Batching 生成循环、直接读取 `tokenizer.json` 的文本
@@ -52,8 +53,8 @@ decode worker；两条路径共享相同的 KV/GDN 准入与 continuous decode �
 会保持排队，单请求永久超过 worker 容量会单独失败，入口过载返回 HTTP 429。统一的
 KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
 
-这里的“已实现”仍不等于整个系统已经达到生产完成态。1P+ND、Prefix Cache 与真实执行
-路径的复用集成、完整抢占重算、worker 自动恢复、压力与长稳验证
+这里的“已实现”仍不等于整个系统已经达到生产完成态。1P+ND 多卡实测、完整抢占重算、
+worker 自动恢复、压力与长稳验证
 仍在生产化路线中。
 
 ## 模型兼容性
@@ -141,6 +142,18 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
   --adaptive --device cuda:0 --decode-device cuda:1 --port 8000
 ```
 
+启用 full-attention Prefix KV 页缓存（容量以物理 block 数计，频率门禁默认 2）：
+
+```bash
+python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
+  --adaptive --device cuda:0 --decode-device cuda:1 \
+  --prefix-cache-blocks 1024 --prefix-cache-min-frequency 2
+```
+
+命中页只复用 full-attention KV 的物理存储并写保护；GDN recurrent/conv state 不缓存，
+仍逐请求精确重算。由于后续 GDN 层依赖前层输出，当前实现不宣称跳过整个命中 prefix
+的模型计算；这是显存共享与 worker affinity 基础，不虚报为完整 prefix-compute skip。
+
 路由在 admission 成功时绑定，依据 prompt 长度和统一 KV/GDN 容量快照决策，执行中不
 改变归属。RPC 超时属于结果未知：当前请求失败并隔离 prefill 路径，后续请求安全降级到
 collocated，不对同一请求进行可能重复执行的盲重试。`/health` 暴露容量，`/metrics`
@@ -155,7 +168,7 @@ python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
 ```
 
 worker registry 先过滤不健康或容量不足的目标，再联合 decode load、Prefix Cache
-匹配长度和链路带宽/跳数评分；预留成功后 worker binding 不再改变。一个 continuous
+真实探测的匹配长度和链路带宽/跳数评分；预留成功后 worker binding 不再改变。一个 continuous
 decode batch 跨多个 worker 时，各 GPU RPC 并行发起，结果按原请求顺序归并。本机仅有
 两张 GPU，已真实验证新集群后端的 1P+1D 纵切片；1P+ND 的选择、绑定、分组和并发协议
 已单测，N>1 真实硬件验证仍是明确门禁。

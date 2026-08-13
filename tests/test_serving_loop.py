@@ -259,7 +259,7 @@ def test_runtime_admission_reserves_kv_and_recurrent_state_together() -> None:
         def __init__(self):
             self.block_manager = KVBlockManager(8, block_size=4)
 
-        def allocate(self, request_id, num_tokens, *, reserve_tokens=None):
+        def allocate(self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None):
             return self.block_manager.allocate(
                 request_id, num_tokens, reserve_tokens=reserve_tokens
             )

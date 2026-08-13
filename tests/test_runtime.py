@@ -5,7 +5,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from hydraserve.config import LayerKind
-from hydraserve.cache import KVBlockManager, PagedKVCache
+from hydraserve.cache import (
+    CostAwarePrefixPolicy,
+    KVBlockManager,
+    PagedKVCache,
+    PrefixCache,
+)
 from hydraserve.model.runtime import QwenTextRuntime, RuntimeState
 from hydraserve.model.weights import LANGUAGE_PREFIX, layer_prefix
 
@@ -148,6 +153,53 @@ def test_chunked_prefill_with_paged_history_matches_whole_prefill(tiny_model) ->
         torch.testing.assert_close(
             actual_state.convolution[layer], expected_state.convolution[layer]
         )
+
+
+def test_prefix_kv_hit_preserves_runtime_logits_and_gdn_state(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    prefix = PrefixCache(
+        block_size=2,
+        max_blocks=4,
+        policy=CostAwarePrefixPolicy(minimum_frequency=1),
+    )
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(12, block_size=2),
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    first_ids = torch.tensor([[3, 7, 11, 5]])
+    cache.allocate(1, 4, token_ids=first_ids[0].tolist())
+    first_logits, first_state = runtime.prefill(
+        first_ids, chunk_size=2, paged_cache=cache, request_id=1
+    )
+    cache.publish_prefix(1, first_ids[0].tolist())
+    cached_blocks = cache.block_manager.get(1).block_ids[:2]
+    cache.free(1)
+
+    second_ids = torch.tensor([[3, 7, 11, 5, 2]])
+    expected_logits, expected_state = runtime.prefill(
+        second_ids, chunk_size=2
+    )
+    allocation = cache.allocate(2, 5, token_ids=second_ids[0].tolist())
+    assert allocation.block_ids[:2] == cached_blocks
+    assert cache.matched_prefix_tokens(2) == 4
+    actual_logits, actual_state = runtime.prefill(
+        second_ids, chunk_size=2, paged_cache=cache, request_id=2
+    )
+    torch.testing.assert_close(actual_logits, expected_logits, atol=2e-5, rtol=2e-5)
+    for layer in tiny_model.linear_layer_indices:
+        torch.testing.assert_close(
+            actual_state.recurrent[layer], expected_state.recurrent[layer]
+        )
+        torch.testing.assert_close(
+            actual_state.convolution[layer], expected_state.convolution[layer]
+        )
+    cache.free(2)
     assert actual_state.keys == actual_state.values == {}
 
 

@@ -101,6 +101,7 @@ class PrefixMatch:
     block_ids: tuple[int, ...]
     admitted: bool = True
     evicted_block_ids: tuple[int, ...] = ()
+    inserted_block_ids: tuple[int, ...] = ()
     reason: str | None = None
 
 
@@ -262,10 +263,12 @@ class PrefixCache:
                 child.bytes_per_block = bytes_per_block
                 node = child
             self._admissions += 1
+            inserted = blocks[full_blocks - new_blocks : full_blocks]
             return PrefixMatch(
                 full_blocks * self.block_size,
                 blocks[:full_blocks],
                 evicted_block_ids=evicted,
+                inserted_block_ids=inserted,
             )
 
     def match(

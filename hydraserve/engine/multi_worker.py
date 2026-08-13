@@ -42,6 +42,8 @@ class PDClusterConfig:
     max_state_slots_per_worker: int = 64
     use_flash_attention: bool = True
     prefill_chunk_size: int = 4096
+    prefix_cache_blocks: int = 0
+    prefix_cache_min_frequency: int = 2
     topologies: tuple[WorkerTopology, ...] = ()
 
     def __post_init__(self) -> None:
@@ -56,8 +58,11 @@ class PDClusterConfig:
             self.block_size,
             self.max_state_slots_per_worker,
             self.prefill_chunk_size,
+            self.prefix_cache_min_frequency,
         ) <= 0:
             raise ValueError("cluster resource limits must be positive")
+        if self.prefix_cache_blocks < 0:
+            raise ValueError("prefix cache blocks cannot be negative")
         if self.topologies and len(self.topologies) != len(self.decode_devices):
             raise ValueError("topologies must match decode devices")
 
@@ -71,6 +76,8 @@ class PDClusterConfig:
             use_flash_attention=self.use_flash_attention,
             prefill_chunk_size=self.prefill_chunk_size,
             max_state_slots=self.max_state_slots_per_worker,
+            prefix_cache_blocks=self.prefix_cache_blocks,
+            prefix_cache_min_frequency=self.prefix_cache_min_frequency,
         )
 
 
@@ -189,11 +196,7 @@ class MultiWorkerGenerationBackend:
             pass
         required_blocks = self._required_blocks(request)
         prefix_matches = {
-            worker.worker_id: (
-                max(0, int(self.prefix_affinity(request, worker.worker_id)))
-                if self.prefix_affinity is not None
-                else 0
-            )
+            worker.worker_id: self._prefix_match(request, worker.worker_id)
             for worker in self.registry.snapshots()
         }
         candidates = self.registry.candidates(
@@ -223,7 +226,6 @@ class MultiWorkerGenerationBackend:
                 continue
             self.registry.bind(request.request_id, candidate.worker_id)
             request.worker_id = candidate.worker_id
-            self._refresh_capacity(candidate.worker_id)
             with self._state_lock:
                 if self._prefill_healthy:
                     decision = self.router.decide(
@@ -331,7 +333,6 @@ class MultiWorkerGenerationBackend:
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
-                self._refresh_capacity(worker_id)
 
     def capacity(self) -> BackendCapacity:
         snapshots = self.registry.snapshots()
@@ -433,22 +434,41 @@ class MultiWorkerGenerationBackend:
                 self.registry.set_health(worker_id, False)
                 raise
         self._check(result, expected_op, request_id)
+        self._update_worker_capacity(worker_id, result)
         return result
 
-    def _refresh_capacity(self, worker_id: int) -> None:
-        total_blocks = self._total_blocks_per_worker()
-        allocated_blocks = sum(self._reserved_blocks[worker_id].values())
-        snapshot = self.registry.snapshots()[worker_id]
-        active = snapshot.active_requests
-        self.registry.update_capacity(
-            worker_id,
-            BackendCapacity(
-                total_blocks,
-                max(0, total_blocks - allocated_blocks),
-                self.config.max_state_slots_per_worker,
-                max(0, self.config.max_state_slots_per_worker - active),
-            ),
+    def _prefix_match(self, request: ServingRequest, worker_id: int) -> int:
+        if self.prefix_affinity is not None:
+            return max(0, int(self.prefix_affinity(request, worker_id)))
+        if not self.config.prefix_cache_blocks:
+            return 0
+        try:
+            result = self._decode_rpc(
+                worker_id,
+                {
+                    "op": "prefix_probe",
+                    "request_id": request.request_id,
+                    "token_ids": request.token_ids,
+                },
+                "prefix_probe",
+                request.request_id,
+            )
+        except TimeoutError:
+            return 0
+        return max(0, int(result.get("matched_tokens", 0)))
+
+    def _update_worker_capacity(self, worker_id: int, result: dict) -> None:
+        keys = (
+            "kv_total_blocks",
+            "kv_free_blocks",
+            "state_total_slots",
+            "state_free_slots",
         )
+        if all(key in result for key in keys):
+            self.registry.update_capacity(
+                worker_id,
+                BackendCapacity(*(int(result[key]) for key in keys)),
+            )
 
     def _required_blocks(self, request: ServingRequest) -> int:
         total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
