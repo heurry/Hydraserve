@@ -68,6 +68,7 @@ def main() -> int:
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
     serve_parser.add_argument("--max-active-requests", type=int)
+    serve_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     serve_parser.add_argument("--max-queue-size", type=int, default=1024)
     serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
@@ -85,6 +86,7 @@ def main() -> int:
     benchmark_parser.add_argument("--max-new-tokens", type=int, default=32)
     benchmark_parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
+    benchmark_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     benchmark_parser.add_argument("--warmup", type=int, default=0)
     benchmark_parser.add_argument("--request-rate", type=float)
     benchmark_parser.add_argument(
@@ -171,6 +173,8 @@ def main() -> int:
             parser.error("--max-active-requests cannot be below --max-batch-size")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        if args.max_preemptions_per_request < 0:
+            parser.error("--max-preemptions-per-request cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
@@ -286,6 +290,7 @@ def main() -> int:
             max_queue_size=args.max_queue_size,
             max_queue_tokens=args.max_queue_tokens,
             eos_token_id=tokenizer.eos_token_id,
+            max_preemptions_per_request=args.max_preemptions_per_request,
         )
         server = create_server(
             args.host,
@@ -332,6 +337,8 @@ def main() -> int:
             parser.error("cache limits must be positive")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        if args.max_preemptions_per_request < 0:
+            parser.error("--max-preemptions-per-request cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
@@ -441,6 +448,7 @@ def main() -> int:
             backend,
             max_batch_size=args.concurrency,
             eos_token_id=tokenizer.eos_token_id,
+            max_preemptions_per_request=args.max_preemptions_per_request,
         )
         try:
             samples = iter_dataset(

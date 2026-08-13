@@ -42,6 +42,11 @@ class _Handler(BaseHTTPRequestHandler):
                     "active_requests": loop.active_count,
                     "prefill_pending_requests": loop.prefill_pending_count,
                     "admission_pending_requests": loop.pending_count,
+                    "preempted_requests": loop.preempted_count,
+                    "preemptions_total": loop.preemptions_total,
+                    "preemption_failures_total": loop.preemption_failures_total,
+                    "recoveries_total": loop.recoveries_total,
+                    "recovery_failures_total": loop.recovery_failures_total,
                 },
             }
             capacity = getattr(self.hydra.generation_loop.backend, "capacity", None)
@@ -535,6 +540,13 @@ class _Handler(BaseHTTPRequestHandler):
             f'hydraserve_scheduler_requests{{state="active"}} {loop.active_count}',
             f'hydraserve_scheduler_requests{{state="prefill_pending"}} {loop.prefill_pending_count}',
             f'hydraserve_scheduler_requests{{state="admission_pending"}} {loop.pending_count}',
+            f'hydraserve_scheduler_requests{{state="preempted"}} {loop.preempted_count}',
+            "# TYPE hydraserve_scheduler_preemptions_total counter",
+            f'hydraserve_scheduler_preemptions_total{{outcome="success"}} {loop.preemptions_total}',
+            f'hydraserve_scheduler_preemptions_total{{outcome="failure"}} {loop.preemption_failures_total}',
+            "# TYPE hydraserve_scheduler_recoveries_total counter",
+            f'hydraserve_scheduler_recoveries_total{{outcome="success"}} {loop.recoveries_total}',
+            f'hydraserve_scheduler_recoveries_total{{outcome="failure"}} {loop.recovery_failures_total}',
         ]
         capacity = getattr(backend, "capacity", None)
         if capacity is not None:

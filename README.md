@@ -254,8 +254,12 @@ IPC 队列，并在模型名和容量握手通过后重新加入。`/health` 和
 老化防饿死和 deadline urgency。API 的 HydraServe 扩展字段 `timeout_ms` 是从 submit
 开始计算的硬 deadline；在 admission/prefill/decode 边界过期会释放资源，非流式返回
 HTTP 408，SSE 返回 `timeout_error` event。GPU kernel 不可中断，因此 deadline 是 kernel
-边界协作式而非微秒级抢占。`/health` 与 `/metrics` 分别暴露 admission、prefill 和 active
-三层请求深度。
+边界协作式而非微秒级抢占。collocated 主链路会让新到达的更高优先级或更早 deadline
+请求在 decode 迭代边界抢占低紧迫度请求，立即释放其 KV/GDN 容量；受害请求随后用
+`prompt + generated[:-1]` 精确重算，保留已经输出的 token、采样 step 和停止序列状态。
+`--max-preemptions-per-request`（默认 2，设为 0 可关闭）限制反复抢占。
+`/health` 与 `/metrics` 暴露 admission、prefill、active、preempted 四层深度，以及抢占和
+恢复的成功/失败累计值。异步 PD 主链路的跨进程恢复仍是下一阶段，不会伪装成已支持。
 
 `--kv-headroom-blocks` 从 admission 可用容量中永久保留指定物理页，防止工作集逼到最后
 一页时反复准入/失败；默认 0 保持向后兼容。headroom 仍是已分配的 GPU KV tensor，

@@ -131,6 +131,8 @@ class ServingRequest:
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0
+    preemption_count: int = 0
+    recovery_count: int = 0
     sampling_params: SamplingParams = SamplingParams()
 
 
@@ -198,12 +200,14 @@ class ContinuousGenerationLoop:
         max_queue_tokens: int = 1_048_576,
         eos_token_id: int | None = None,
         idle_wait_s: float = 0.01,
+        max_preemptions_per_request: int = 2,
     ) -> None:
         active_limit = max_batch_size if max_active_requests is None else max_active_requests
         if (
             min(max_batch_size, active_limit, max_queue_size, max_queue_tokens) <= 0
             or idle_wait_s <= 0
             or active_limit < max_batch_size
+            or max_preemptions_per_request < 0
         ):
             raise ValueError("invalid serving-loop limits")
         self.backend = backend
@@ -213,15 +217,22 @@ class ContinuousGenerationLoop:
         self.max_queue_tokens = max_queue_tokens
         self.eos_token_id = eos_token_id
         self.idle_wait_s = idle_wait_s
+        self.max_preemptions_per_request = max_preemptions_per_request
         self._ids = count()
         self._incoming: Queue[tuple[ServingRequest, GenerationHandle]] = Queue()
         self._deferred: deque[tuple[ServingRequest, GenerationHandle]] = deque()
+        self._preempted: deque[ServingRequest] = deque()
         self._pending_count = 0
         self._pending_tokens = 0
         self._pending_lock = Lock()
         self._stats_lock = Lock()
         self._active_count = 0
         self._prefill_pending_count = 0
+        self._preempted_count = 0
+        self._preemptions_total = 0
+        self._preemption_failures_total = 0
+        self._recoveries_total = 0
+        self._recovery_failures_total = 0
         self._handles: dict[int, GenerationHandle] = {}
         self._handles_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -481,8 +492,11 @@ class ContinuousGenerationLoop:
         candidates = self._waiting_candidates()
         for index, waiting in enumerate(candidates):
             if available_slots <= 0:
-                self._defer_remaining(candidates[index:])
-                break
+                if self._try_preempt_for(waiting[0], active):
+                    available_slots += 1
+                else:
+                    self._defer_remaining(candidates[index:])
+                    break
             request, handle = waiting
             if request.cancelled.is_set():
                 self._pending_done(request)
@@ -501,6 +515,12 @@ class ContinuousGenerationLoop:
                 continue
             decision = self._admission_decision(request)
             if not decision.admitted:
+                if (
+                    decision.retryable
+                    and self._try_preempt_for(request, active)
+                ):
+                    available_slots += 1
+                    decision = self._admission_decision(request)
                 if decision.retryable:
                     request.admission_age += 1
                     self._deferred.append((request, handle))
@@ -538,6 +558,130 @@ class ContinuousGenerationLoop:
                 self._finish(request, reason, active=active, release=True)
             else:
                 active[request.request_id] = request
+        return self._recover_preempted(active) or did_work
+
+    def _try_preempt_for(
+        self,
+        candidate: ServingRequest,
+        active: OrderedDict[int, ServingRequest],
+    ) -> bool:
+        """Evict one strictly less urgent request at an iteration boundary."""
+        preempt = getattr(self.backend, "preempt", None)
+        recover = getattr(self.backend, "recover", None)
+        if (
+            self.max_preemptions_per_request == 0
+            or not callable(preempt)
+            or not callable(recover)
+            or getattr(self.backend, "supports_async_prefill", False)
+        ):
+            return False
+        victims = [
+            request
+            for request in active.values()
+            if request.preemption_count < self.max_preemptions_per_request
+            and self._strictly_more_urgent(candidate, request)
+        ]
+        if not victims:
+            return False
+        victim = min(victims, key=self._preemption_victim_key)
+        try:
+            preempt(victim.request_id)
+        except Exception:
+            with self._stats_lock:
+                self._preemption_failures_total += 1
+            return False
+        active.pop(victim.request_id, None)
+        self._decode_scheduler.forget(victim.request_id)
+        victim.preemption_count += 1
+        self._preempted.append(victim)
+        with self._stats_lock:
+            self._preemptions_total += 1
+            self._preempted_count = len(self._preempted)
+        return True
+
+    @staticmethod
+    def _strictly_more_urgent(
+        candidate: ServingRequest, victim: ServingRequest
+    ) -> bool:
+        if candidate.priority != victim.priority:
+            return candidate.priority > victim.priority
+        if candidate.deadline_at is None:
+            return False
+        if victim.deadline_at is None:
+            return True
+        return candidate.deadline_at < victim.deadline_at
+
+    @staticmethod
+    def _preemption_victim_key(request: ServingRequest):
+        # Prefer the least urgent request, then the cheapest exact replay.
+        has_deadline = request.deadline_at is not None
+        deadline = 0.0 if request.deadline_at is None else -request.deadline_at
+        replay_tokens = len(request.token_ids) + max(
+            0, len(request.generated_token_ids) - 1
+        )
+        return (
+            request.priority,
+            has_deadline,
+            deadline,
+            replay_tokens,
+            request.request_id,
+        )
+
+    def _recover_preempted(
+        self, active: OrderedDict[int, ServingRequest]
+    ) -> bool:
+        recover = getattr(self.backend, "recover", None)
+        if not callable(recover) or not self._preempted:
+            return False
+        did_work = False
+        visits = len(self._preempted)
+        for _ in range(visits):
+            request = self._preempted.popleft()
+            if request.cancelled.is_set():
+                self._finish(request, "cancelled", active=active, release=False)
+                did_work = True
+                continue
+            if self._deadline_expired(request):
+                self._fail(
+                    request,
+                    TimeoutError("request deadline expired while preempted"),
+                    active=active,
+                    release=False,
+                )
+                did_work = True
+                continue
+            if len(active) >= self.max_active_requests:
+                self._preempted.append(request)
+                continue
+            try:
+                decision = recover(request)
+            except Exception as exc:
+                with self._stats_lock:
+                    self._recovery_failures_total += 1
+                self._fail(request, exc, active=active, release=True)
+                did_work = True
+                continue
+            if isinstance(decision, AdmissionDecision) and not decision.admitted:
+                if decision.retryable:
+                    self._preempted.append(request)
+                    continue
+                with self._stats_lock:
+                    self._recovery_failures_total += 1
+                self._fail(
+                    request,
+                    MemoryError(decision.reason or "preempted request cannot recover"),
+                    active=active,
+                    release=True,
+                )
+                did_work = True
+                continue
+            request.recovery_count += 1
+            active[request.request_id] = request
+            with self._stats_lock:
+                self._recoveries_total += 1
+            did_work = True
+        with self._stats_lock:
+            self._preempted_count = len(self._preempted)
         return did_work
 
     def _decode_once(self, active: OrderedDict[int, ServingRequest]) -> None:
@@ -700,6 +844,11 @@ class ContinuousGenerationLoop:
 
     def _cancel_incoming(self) -> None:
         empty: OrderedDict[int, ServingRequest] = OrderedDict()
+        while self._preempted:
+            request = self._preempted.popleft()
+            self._finish(request, "cancelled", active=empty, release=False)
+        with self._stats_lock:
+            self._preempted_count = 0
         while self._deferred:
             request, _ = self._deferred.popleft()
             self._pending_done(request)
@@ -723,6 +872,9 @@ class ContinuousGenerationLoop:
         candidates.sort(
             key=lambda item: (
                 -(item[0].priority * 8 + item[0].admission_age),
+                float("inf")
+                if item[0].deadline_at is None
+                else item[0].deadline_at,
                 item[0].request_id,
             )
         )
@@ -779,6 +931,31 @@ class ContinuousGenerationLoop:
         with self._stats_lock:
             return self._prefill_pending_count
 
+    @property
+    def preempted_count(self) -> int:
+        with self._stats_lock:
+            return self._preempted_count
+
+    @property
+    def preemptions_total(self) -> int:
+        with self._stats_lock:
+            return self._preemptions_total
+
+    @property
+    def preemption_failures_total(self) -> int:
+        with self._stats_lock:
+            return self._preemption_failures_total
+
+    @property
+    def recoveries_total(self) -> int:
+        with self._stats_lock:
+            return self._recoveries_total
+
+    @property
+    def recovery_failures_total(self) -> int:
+        with self._stats_lock:
+            return self._recovery_failures_total
+
     def _publish_scheduler_depth(self, active: int, prefill_pending: int) -> None:
         with self._stats_lock:
             self._active_count = active
@@ -832,6 +1009,11 @@ class RuntimeGenerationBackend:
         return len(request.token_ids) + max(0, request.max_new_tokens - 1)
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
+        return self._reserve(request, request.token_ids)
+
+    def _reserve(
+        self, request: ServingRequest, initial_token_ids: tuple[int, ...]
+    ) -> AdmissionDecision:
         manager = self.paged_cache.block_manager
         initial_capacity = self.capacity()
         total_tokens = self._total_kv_tokens(request)
@@ -852,7 +1034,7 @@ class RuntimeGenerationBackend:
                 owns_state_slot = False
             if allocation is not None and owns_state_slot:
                 if (
-                    allocation.num_tokens != len(request.token_ids)
+                    allocation.num_tokens != len(initial_token_ids)
                     or allocation.reserved_tokens < total_tokens
                 ):
                     return AdmissionDecision.reject(
@@ -873,9 +1055,9 @@ class RuntimeGenerationBackend:
             try:
                 self.paged_cache.allocate(
                     request.request_id,
-                    len(request.token_ids),
+                    len(initial_token_ids),
                     reserve_tokens=total_tokens,
-                    token_ids=request.token_ids,
+                    token_ids=initial_token_ids,
                 )
             except MemoryError:
                 self.state_slots.free(request.request_id)
@@ -891,6 +1073,37 @@ class RuntimeGenerationBackend:
                 request.worker_id = 0
                 request.route_decode_load = initial_capacity.decode_load
             return AdmissionDecision.accept()
+
+    def preempt(self, request_id: int) -> None:
+        """Release runtime state and KV so another request can be admitted."""
+        self.release(request_id)
+
+    def recover(self, request: ServingRequest) -> AdmissionDecision:
+        """Recompute exact state without sampling or re-emitting prior tokens."""
+        import torch
+
+        replay_token_ids = request.token_ids + tuple(request.generated_token_ids[:-1])
+        decision = self._reserve(request, replay_token_ids)
+        if not decision.admitted:
+            return decision
+        try:
+            input_ids = torch.tensor(
+                [replay_token_ids], device=self.runtime.device, dtype=torch.long
+            )
+            with torch.inference_mode():
+                _, state = self.runtime.prefill(
+                    input_ids,
+                    chunk_size=self.prefill_chunk_size,
+                    paged_cache=self.paged_cache,
+                    request_id=request.request_id,
+                )
+            if self.state_pool is not None:
+                state = self.state_pool.install(request.request_id, state)
+            self.states[request.request_id] = state
+            return AdmissionDecision.accept()
+        except Exception:
+            self.release(request.request_id)
+            raise
 
     def prefill(self, request: ServingRequest) -> TokenSample:
         import torch

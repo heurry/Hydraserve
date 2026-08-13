@@ -415,6 +415,64 @@ def test_runtime_decode_bisects_failure_and_rolls_back_failed_request() -> None:
     backend.release(2)
 
 
+def test_runtime_backend_recovery_replays_only_model_consumed_tokens() -> None:
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from hydraserve.cache import KVBlockManager
+
+    class FakePagedCache:
+        def __init__(self):
+            self.block_manager = KVBlockManager(8, block_size=4)
+
+        def allocate(self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None):
+            return self.block_manager.allocate(
+                request_id, num_tokens, reserve_tokens=reserve_tokens
+            )
+
+        def free(self, request_id):
+            self.block_manager.free(request_id)
+
+        def publish_prefix(self, request_id, token_ids):
+            return None
+
+    class RecordingRuntime:
+        device = torch.device("cpu")
+        config = None
+
+        def __init__(self):
+            self.prefill_inputs = []
+
+        def prefill(self, input_ids, **kwargs):
+            self.prefill_inputs.append(tuple(input_ids[0].tolist()))
+            logits = torch.zeros(1, input_ids.shape[1], 32)
+            return logits, SimpleNamespace(sequence_length=input_ids.shape[1])
+
+    runtime = RecordingRuntime()
+    cache = FakePagedCache()
+    backend = RuntimeGenerationBackend(runtime, cache, max_state_slots=1)
+    request = ServingRequest(
+        7,
+        (1, 2, 3),
+        6,
+        generated_token_ids=[9, 10, 11],
+    )
+    assert backend.admit(request).admitted
+    backend.states[request.request_id] = SimpleNamespace(sequence_length=3)
+
+    backend.preempt(request.request_id)
+    assert backend.capacity().state_free_slots == 1
+    decision = backend.recover(request)
+
+    assert decision.admitted
+    assert runtime.prefill_inputs == [(1, 2, 3, 9, 10)]
+    allocation = cache.block_manager.get(request.request_id)
+    assert allocation.num_tokens == 5
+    assert allocation.reserved_tokens == 8
+    assert backend.states[request.request_id].sequence_length == 5
+    backend.release(request.request_id)
+    assert cache.block_manager.num_free_blocks == cache.block_manager.num_blocks
+
+
 def test_backend_capacity_uses_most_constrained_resource() -> None:
     capacity = BackendCapacity(100, 80, 10, 2)
     assert capacity.decode_load == pytest.approx(0.8)
@@ -510,3 +568,137 @@ def test_active_limit_can_exceed_decode_batch_and_is_observable() -> None:
     assert all(list(handle)[-1].finish_reason == "length" for handle in handles)
     loop.close()
     assert loop.active_count == 0
+
+
+def test_higher_priority_request_preempts_and_exactly_recovers_active_request() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class PreemptibleBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.decode_calls = 0
+            self.preempted = []
+            self.replayed = []
+
+        def decode(self, requests):
+            self.decode_calls += 1
+            if self.decode_calls == 1:
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            self.preempted.append(request_id)
+            self.release(request_id)
+
+        def recover(self, request):
+            replay = request.token_ids + tuple(request.generated_token_ids[:-1])
+            self.replayed.append((request.request_id, replay))
+            self.live.add(request.request_id)
+            return AdmissionDecision.accept()
+
+    backend = PreemptibleBackend()
+    loop = ContinuousGenerationLoop(
+        backend, max_batch_size=1, max_active_requests=1
+    )
+    background = loop.submit([1], max_new_tokens=4, priority=0)
+    assert background.get(timeout=2).token_id == 2
+    assert decode_entered.wait(2)
+    urgent = loop.submit([10], max_new_tokens=1, priority=7)
+    allow_decode.set()
+
+    assert [event.token_id for event in urgent][:-1] == [11]
+    background_events = list(background)
+    loop.close()
+
+    assert [event.token_id for event in background_events[:-1]] == [3, 4, 5]
+    assert backend.preempted == [background.request_id]
+    assert backend.replayed == [(background.request_id, (1, 2))]
+    assert background.request.preemption_count == 1
+    assert background.request.recovery_count == 1
+    assert loop.preemptions_total == 1
+    assert loop.recoveries_total == 1
+    assert loop.recovery_failures_total == 0
+    assert loop.preempted_count == 0
+    assert backend.live == set()
+
+
+def test_same_priority_deadline_can_preempt_request_without_deadline() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class PreemptibleBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.blocked = False
+            self.preempted = []
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            self.preempted.append(request_id)
+            self.release(request_id)
+
+        def recover(self, request):
+            self.live.add(request.request_id)
+            return AdmissionDecision.accept()
+
+    backend = PreemptibleBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    background = loop.submit([1], max_new_tokens=3)
+    background.get(timeout=2)
+    assert decode_entered.wait(2)
+    urgent = loop.submit([20], max_new_tokens=1, timeout_ms=1000)
+    allow_decode.set()
+    assert list(urgent)[-1].finish_reason == "length"
+    assert list(background)[-1].finish_reason == "length"
+    loop.close()
+    assert backend.preempted == [background.request_id]
+
+
+def test_recovery_failure_is_request_scoped_and_releases_resources() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class FailedRecoveryBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.blocked = False
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            self.release(request_id)
+
+        def recover(self, request):
+            self.live.add(request.request_id)
+            raise RuntimeError("recompute kernel failed")
+
+        def release(self, request_id):
+            self.live.discard(request_id)
+
+    backend = FailedRecoveryBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    background = loop.submit([1], max_new_tokens=3)
+    background.get(timeout=2)
+    assert decode_entered.wait(2)
+    urgent = loop.submit([10], max_new_tokens=1, priority=7)
+    allow_decode.set()
+    assert list(urgent)[-1].finish_reason == "length"
+    terminal = list(background)[-1]
+    loop.close()
+    assert terminal.finish_reason == "error"
+    assert "recompute kernel failed" in terminal.error
+    assert loop.recovery_failures_total == 1
+    assert backend.live == set()

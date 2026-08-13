@@ -206,6 +206,8 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             health = json.loads(response.read())
         assert health["capacity"]["kv_free_blocks"] == 7
         assert health["scheduler"]["max_active_requests"] == 64
+        assert health["scheduler"]["preempted_requests"] == 0
+        assert health["scheduler"]["preemptions_total"] == 0
         assert health["status"] == "degraded"
         assert health["decode_workers"]["recovering"] == [1]
         assert health["routing_cost_model"]["pd_observations"] == 3
@@ -216,6 +218,11 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
         assert "hydraserve_admission_pending_requests 0" in metrics
         assert 'hydraserve_scheduler_requests{state="active"} 0' in metrics
+        assert 'hydraserve_scheduler_requests{state="preempted"} 0' in metrics
+        assert (
+            'hydraserve_scheduler_preemptions_total{outcome="success"} 0'
+            in metrics
+        )
         assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
         assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
         assert (

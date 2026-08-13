@@ -319,6 +319,32 @@ kernel is not safely cancellable. Unit tests cover waiting-admission expiry,
 decode-result expiry, urgency ordering, and four active requests scheduled with
 a decode batch size of two.
 
+## 2026-08-14 — online collocated preemption and exact recovery
+
+Implemented and validated in the production `ContinuousGenerationLoop` and
+`RuntimeGenerationBackend` path:
+
+- a strictly more urgent arrival (higher priority, or an earlier deadline at
+  equal priority) can preempt a lower-urgency active request at a decode
+  iteration boundary;
+- preemption atomically releases both physical KV ownership and recurrent-state
+  slots, and a configurable per-request cap prevents unbounded thrashing;
+- recovery recomputes `prompt + generated[:-1]`, because the most recently
+  emitted token has not yet been consumed by decode, and resumes without
+  sampling or emitting a duplicate token;
+- cancellation and deadline expiry are processed while requests are suspended;
+  recovery failures are request-scoped and release partial allocations;
+- health and Prometheus surfaces report suspended depth and preemption/recovery
+  success and failure counters.
+
+Unit tests compose preemption with streaming, priority, deadlines, exact replay,
+failure cleanup, and allocator reservation lengths. An opt-in real Qwen3.5-4B
+GPU test forced a preemption after the first decode boundary, matched the full
+recovered token stream against uninterrupted greedy generation, and audited all
+KV pages and recurrent-state slots as free afterward. Async PD/multi-worker
+preemption is explicitly not enabled yet; that path needs cross-process local
+recompute and non-blocking recovery integration.
+
 ## 2026-08-14 — KV safety headroom, audit, and observability
 
 Implemented and validated:
