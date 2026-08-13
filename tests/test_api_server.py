@@ -141,11 +141,14 @@ def test_overload_returns_http_429() -> None:
 
 
 def test_health_and_prometheus_metrics_expose_capacity() -> None:
-    from hydraserve.engine import BackendCapacity
+    from hydraserve.engine import BackendCapacity, WorkerRecoveryStats
 
     class CapacityBackend(FakeBackend):
         def capacity(self):
             return BackendCapacity(10, 7, 4, 3)
+
+        def recovery_stats(self):
+            return WorkerRecoveryStats(2, 1, 3, 1, 2, (1,))
 
     loop = ContinuousGenerationLoop(CapacityBackend())
     try:
@@ -165,10 +168,14 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         with urlopen(base + "/health", timeout=3) as response:
             health = json.loads(response.read())
         assert health["capacity"]["kv_free_blocks"] == 7
+        assert health["status"] == "degraded"
+        assert health["decode_workers"]["recovering"] == [1]
         with urlopen(base + "/metrics", timeout=3) as response:
             metrics = response.read().decode()
         assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
         assert "hydraserve_admission_pending_requests 0" in metrics
+        assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
+        assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
     finally:
         server.shutdown()
         server.server_close()

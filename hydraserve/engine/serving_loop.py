@@ -15,6 +15,8 @@ from queue import Empty, Queue
 from threading import Event, Lock, Thread
 from typing import Protocol
 
+from hydraserve.engine.fair_scheduler import FairDecodeScheduler
+
 
 class OverloadedError(RuntimeError):
     """The bounded admission queue cannot accept more work."""
@@ -103,6 +105,8 @@ class ServingRequest:
     route: str | None = None
     route_reason: str | None = None
     worker_id: int | None = None
+    priority: int = 0
+    admission_age: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,15 +164,22 @@ class ContinuousGenerationLoop:
         backend: GenerationBackend,
         *,
         max_batch_size: int = 64,
+        max_active_requests: int | None = None,
         max_queue_size: int = 1024,
         max_queue_tokens: int = 1_048_576,
         eos_token_id: int | None = None,
         idle_wait_s: float = 0.01,
     ) -> None:
-        if min(max_batch_size, max_queue_size, max_queue_tokens) <= 0 or idle_wait_s <= 0:
+        active_limit = max_batch_size if max_active_requests is None else max_active_requests
+        if (
+            min(max_batch_size, active_limit, max_queue_size, max_queue_tokens) <= 0
+            or idle_wait_s <= 0
+            or active_limit < max_batch_size
+        ):
             raise ValueError("invalid serving-loop limits")
         self.backend = backend
         self.max_batch_size = max_batch_size
+        self.max_active_requests = active_limit
         self.max_queue_size = max_queue_size
         self.max_queue_tokens = max_queue_tokens
         self.eos_token_id = eos_token_id
@@ -185,6 +196,7 @@ class ContinuousGenerationLoop:
         self._wake = Event()
         self._stop = Event()
         self._thread: Thread | None = None
+        self._decode_scheduler = FairDecodeScheduler()
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -196,13 +208,23 @@ class ContinuousGenerationLoop:
             self._thread.start()
 
     def submit(
-        self, token_ids: list[int] | tuple[int, ...], max_new_tokens: int
+        self,
+        token_ids: list[int] | tuple[int, ...],
+        max_new_tokens: int,
+        *,
+        priority: int = 0,
     ) -> GenerationHandle:
         if not token_ids or max_new_tokens <= 0:
             raise ValueError("request needs a prompt and positive max_new_tokens")
         if self._stop.is_set():
             raise RuntimeError("serving loop is stopping")
-        request = ServingRequest(next(self._ids), tuple(token_ids), max_new_tokens)
+        if not 0 <= priority <= self._decode_scheduler.config.max_priority:
+            raise ValueError(
+                f"priority must be in [0, {self._decode_scheduler.config.max_priority}]"
+            )
+        request = ServingRequest(
+            next(self._ids), tuple(token_ids), max_new_tokens, priority=priority
+        )
         handle = GenerationHandle(request, self._wake)
         demand = len(request.token_ids) + request.max_new_tokens
         with self._pending_lock:
@@ -280,10 +302,11 @@ class ContinuousGenerationLoop:
 
     def _submit_async_prefill(self, active, pending, executor) -> bool:
         did_work = False
-        available_slots = self.max_batch_size - len(active) - len(pending)
-        for _ in range(available_slots):
-            waiting = self._next_waiting()
-            if waiting is None:
+        available_slots = self.max_active_requests - len(active) - len(pending)
+        candidates = self._waiting_candidates()
+        for index, waiting in enumerate(candidates):
+            if available_slots <= 0:
+                self._defer_remaining(candidates[index:])
                 break
             request, handle = waiting
             if request.cancelled.is_set():
@@ -294,8 +317,9 @@ class ContinuousGenerationLoop:
             decision = self._admission_decision(request)
             if not decision.admitted:
                 if decision.retryable:
-                    self._deferred.appendleft((request, handle))
-                    break
+                    request.admission_age += 1
+                    self._deferred.append((request, handle))
+                    continue
                 self._pending_done(request)
                 self._fail(
                     request,
@@ -310,6 +334,7 @@ class ContinuousGenerationLoop:
                 request,
                 executor.submit(self.backend.prefill, request),
             )
+            available_slots -= 1
             did_work = True
         return did_work
 
@@ -341,11 +366,12 @@ class ContinuousGenerationLoop:
 
     def _admit(self, active: OrderedDict[int, ServingRequest]) -> bool:
         did_work = False
-        available_slots = self.max_batch_size - len(active)
-        for _ in range(available_slots):
-            waiting = self._next_waiting()
-            if waiting is None:
-                return did_work
+        available_slots = self.max_active_requests - len(active)
+        candidates = self._waiting_candidates()
+        for index, waiting in enumerate(candidates):
+            if available_slots <= 0:
+                self._defer_remaining(candidates[index:])
+                break
             request, handle = waiting
             if request.cancelled.is_set():
                 self._pending_done(request)
@@ -355,8 +381,9 @@ class ContinuousGenerationLoop:
             decision = self._admission_decision(request)
             if not decision.admitted:
                 if decision.retryable:
-                    self._deferred.appendleft((request, handle))
-                    return did_work
+                    request.admission_age += 1
+                    self._deferred.append((request, handle))
+                    continue
                 self._pending_done(request)
                 self._fail(
                     request,
@@ -367,6 +394,7 @@ class ContinuousGenerationLoop:
                 did_work = True
                 continue
             self._pending_done(request)
+            available_slots -= 1
             did_work = True
             try:
                 token_id = int(self.backend.prefill(request))
@@ -383,7 +411,7 @@ class ContinuousGenerationLoop:
         return did_work
 
     def _decode_once(self, active: OrderedDict[int, ServingRequest]) -> None:
-        batch = tuple(active.values())[: self.max_batch_size]
+        batch = self._decode_scheduler.select(active.values(), self.max_batch_size)
         try:
             token_ids = self.backend.decode(batch)
             if len(token_ids) != len(batch):
@@ -454,6 +482,7 @@ class ContinuousGenerationLoop:
         release: bool,
     ) -> None:
         active.pop(request.request_id, None)
+        self._decode_scheduler.forget(request.request_id)
         error = None
         if release:
             try:
@@ -480,6 +509,7 @@ class ContinuousGenerationLoop:
         release: bool,
     ) -> None:
         active.pop(request.request_id, None)
+        self._decode_scheduler.forget(request.request_id)
         if release:
             try:
                 self.backend.release(request.request_id)
@@ -510,13 +540,26 @@ class ContinuousGenerationLoop:
             self._pending_done(request)
             self._finish(request, "cancelled", active=empty, release=False)
 
-    def _next_waiting(self):
-        if self._deferred:
-            return self._deferred.popleft()
-        try:
-            return self._incoming.get_nowait()
-        except Empty:
-            return None
+    def _waiting_candidates(self):
+        candidates = list(self._deferred)
+        self._deferred.clear()
+        while True:
+            try:
+                candidates.append(self._incoming.get_nowait())
+            except Empty:
+                break
+        candidates.sort(
+            key=lambda item: (
+                -(item[0].priority * 8 + item[0].admission_age),
+                item[0].request_id,
+            )
+        )
+        return candidates
+
+    def _defer_remaining(self, waiting) -> None:
+        for request, handle in waiting:
+            request.admission_age += 1
+            self._deferred.append((request, handle))
 
     def _admission_decision(self, request: ServingRequest) -> AdmissionDecision:
         admit = getattr(self.backend, "admit", None)

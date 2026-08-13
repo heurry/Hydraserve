@@ -6,7 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import multiprocessing as mp
 from queue import Empty
-from threading import Lock, RLock
+from threading import Event, Lock, RLock, Thread
+from time import monotonic
 from typing import Callable
 from uuid import uuid4
 
@@ -85,6 +86,20 @@ class PDClusterConfig:
 PrefixAffinity = Callable[[ServingRequest, int], int]
 
 
+class WorkerUnavailableError(RuntimeError):
+    """A decode worker exited before completing its RPC."""
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRecoveryStats:
+    total_workers: int
+    healthy_workers: int
+    attempts: int
+    successes: int
+    failures: int
+    recovering_workers: tuple[int, ...]
+
+
 class MultiWorkerGenerationBackend:
     """Persistent 1P+ND backend with immutable per-request worker binding."""
 
@@ -98,37 +113,34 @@ class MultiWorkerGenerationBackend:
         prefix_affinity: PrefixAffinity | None = None,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        max_worker_restarts: int = 3,
+        worker_restart_backoff_s: float = 0.5,
     ) -> None:
+        if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
+            raise ValueError("invalid decode worker recovery policy")
         self.config = config
         self.router = router or AdaptiveRouter()
         self.prefix_affinity = prefix_affinity
         self.operation_timeout = operation_timeout
+        self.startup_timeout = startup_timeout
+        self.max_worker_restarts = max_worker_restarts
+        self.worker_restart_backoff_s = worker_restart_backoff_s
         self.namespace = f"hydraserve-cluster-{uuid4().hex}"
         worker_count = len(config.decode_devices)
         self._namespaces = tuple(
             f"{self.namespace}-decode-{index}" for index in range(worker_count)
         )
-        context = mp.get_context("spawn")
-        self._prefill_commands = context.Queue()
-        self._prefill_responses = context.Queue()
-        self._decode_commands = [context.Queue() for _ in range(worker_count)]
-        self._decode_responses = [context.Queue() for _ in range(worker_count)]
+        self._context = mp.get_context("spawn")
+        self._prefill_commands = self._context.Queue()
+        self._prefill_responses = self._context.Queue()
+        self._decode_commands = [self._context.Queue() for _ in range(worker_count)]
+        self._decode_responses = [self._context.Queue() for _ in range(worker_count)]
         self._decode_locks = [Lock() for _ in range(worker_count)]
         self._decode_processes = [
-            context.Process(
-                target=_decode_worker,
-                args=(
-                    config.worker_config(index),
-                    self._namespaces[index],
-                    self._decode_commands[index],
-                    self._decode_responses[index],
-                    index,
-                ),
-                name=f"hydraserve-decode-{index}",
-            )
+            self._new_decode_process(index)
             for index in range(worker_count)
         ]
-        self._prefill = context.Process(
+        self._prefill = self._context.Process(
             target=_prefill_worker,
             args=(
                 config.worker_config(0),
@@ -168,6 +180,12 @@ class MultiWorkerGenerationBackend:
         self._collocated_count = 0
         self._pd_count = 0
         self._pd_failures = 0
+        self._recovery_stop = Event()
+        self._recovering_workers: set[int] = set()
+        self._recovery_threads: dict[int, Thread] = {}
+        self._recovery_attempts = 0
+        self._recovery_successes = 0
+        self._recovery_failures = 0
 
         for process in self._decode_processes:
             process.start()
@@ -217,7 +235,7 @@ class MultiWorkerGenerationBackend:
         for candidate in candidates:
             try:
                 admitted = self._reserve_on(candidate.worker_id, request)
-            except TimeoutError as exc:
+            except (TimeoutError, WorkerUnavailableError) as exc:
                 last_retryable = str(exc)
                 continue
             if not admitted.admitted:
@@ -378,10 +396,23 @@ class MultiWorkerGenerationBackend:
                 self._prefill_healthy,
             )
 
+    def recovery_stats(self) -> WorkerRecoveryStats:
+        snapshots = self.registry.snapshots()
+        with self._state_lock:
+            return WorkerRecoveryStats(
+                len(snapshots),
+                sum(worker.healthy for worker in snapshots),
+                self._recovery_attempts,
+                self._recovery_successes,
+                self._recovery_failures,
+                tuple(sorted(self._recovering_workers)),
+            )
+
     def close(self, *, force: bool = False) -> None:
         if self._closed:
             return
         self._closed = True
+        self._recovery_stop.set()
         self._prefill_commands.put({"op": "shutdown"})
         for commands in self._decode_commands:
             commands.put({"op": "shutdown"})
@@ -440,18 +471,114 @@ class MultiWorkerGenerationBackend:
         expected_op: str,
         request_id: int | None = None,
     ) -> dict:
+        failure = None
         with self._decode_locks[worker_id]:
-            self._decode_commands[worker_id].put(command)
             try:
-                result = self._get(
-                    self._decode_responses[worker_id], self.operation_timeout
-                )
-            except TimeoutError:
-                self.registry.set_health(worker_id, False)
-                raise
+                if not self._decode_processes[worker_id].is_alive():
+                    raise WorkerUnavailableError(
+                        f"decode worker {worker_id} is not running"
+                    )
+                self._decode_commands[worker_id].put(command)
+                result = self._get_decode_response(worker_id, self.operation_timeout)
+            except (TimeoutError, WorkerUnavailableError) as exc:
+                failure = exc
+        if failure is not None:
+            self.registry.set_health(worker_id, False)
+            self._schedule_decode_recovery(worker_id)
+            raise failure
         self._check(result, expected_op, request_id)
         self._update_worker_capacity(worker_id, result)
         return result
+
+    def _get_decode_response(self, worker_id: int, timeout: float):
+        deadline = monotonic() + timeout
+        while True:
+            if not self._decode_processes[worker_id].is_alive():
+                raise WorkerUnavailableError(
+                    f"decode worker {worker_id} exited during RPC"
+                )
+            remaining = deadline - monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for cluster worker")
+            try:
+                return self._decode_responses[worker_id].get(
+                    timeout=min(0.1, remaining)
+                )
+            except Empty:
+                continue
+
+    def _schedule_decode_recovery(self, worker_id: int) -> None:
+        with self._state_lock:
+            if self._closed or worker_id in self._recovering_workers:
+                return
+            self._recovering_workers.add(worker_id)
+            thread = Thread(
+                target=self._recover_decode_worker,
+                args=(worker_id,),
+                name=f"hydraserve-recover-decode-{worker_id}",
+                daemon=True,
+            )
+            self._recovery_threads[worker_id] = thread
+        thread.start()
+
+    def _recover_decode_worker(self, worker_id: int) -> None:
+        try:
+            for attempt in range(self.max_worker_restarts):
+                if self._recovery_stop.is_set():
+                    return
+                with self._state_lock:
+                    self._recovery_attempts += 1
+                try:
+                    self._restart_decode_worker_once(worker_id)
+                except Exception:
+                    with self._state_lock:
+                        self._recovery_failures += 1
+                    delay = self.worker_restart_backoff_s * (2**attempt)
+                    if self._recovery_stop.wait(delay):
+                        return
+                    continue
+                with self._state_lock:
+                    self._recovery_successes += 1
+                return
+        finally:
+            with self._state_lock:
+                self._recovering_workers.discard(worker_id)
+                self._recovery_threads.pop(worker_id, None)
+
+    def _restart_decode_worker_once(self, worker_id: int) -> None:
+        with self._decode_locks[worker_id]:
+            if self._recovery_stop.is_set():
+                return
+            previous = self._decode_processes[worker_id]
+            if previous.is_alive():
+                previous.terminate()
+            previous.join(10)
+            self._decode_commands[worker_id] = self._context.Queue()
+            self._decode_responses[worker_id] = self._context.Queue()
+            process = self._new_decode_process(worker_id)
+            self._decode_processes[worker_id] = process
+            process.start()
+            result = self._get_decode_response(worker_id, self.startup_timeout)
+            self._check(result, "ready")
+            if result.get("model_name") != self.model_name:
+                raise RuntimeError("restarted decode worker loaded a different model")
+            self._update_worker_capacity(worker_id, result)
+            with self._state_lock:
+                self._reserved_blocks[worker_id].clear()
+            self.registry.set_health(worker_id, True)
+
+    def _new_decode_process(self, worker_id: int):
+        return self._context.Process(
+            target=_decode_worker,
+            args=(
+                self.config.worker_config(worker_id),
+                self._namespaces[worker_id],
+                self._decode_commands[worker_id],
+                self._decode_responses[worker_id],
+                worker_id,
+            ),
+            name=f"hydraserve-decode-{worker_id}",
+        )
 
     def _prefix_match(self, request: ServingRequest, worker_id: int) -> int:
         if self.prefix_affinity is not None:
@@ -469,7 +596,7 @@ class MultiWorkerGenerationBackend:
                 "prefix_probe",
                 request.request_id,
             )
-        except TimeoutError:
+        except (TimeoutError, WorkerUnavailableError):
             return 0
         return max(0, int(result.get("matched_tokens", 0)))
 

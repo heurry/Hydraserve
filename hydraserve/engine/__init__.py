@@ -6,6 +6,7 @@ from hydraserve.engine.continuous_batching import (
     RecoveryPlan,
 )
 from hydraserve.engine.batch_executor import ContinuousBatchExecutor
+from hydraserve.engine.fair_scheduler import FairDecodeScheduler, FairSchedulingConfig
 from hydraserve.engine.prefill_engine import PrefillEngine, PrefillOutput
 from hydraserve.engine.pd_worker import (
     DecodePrepared,
@@ -34,6 +35,8 @@ from hydraserve.engine.pd_service import (
 from hydraserve.engine.multi_worker import (
     MultiWorkerGenerationBackend,
     PDClusterConfig,
+    WorkerRecoveryStats,
+    WorkerUnavailableError,
 )
 
 __all__ = [
@@ -45,6 +48,8 @@ __all__ = [
     "ContinuousBatchExecutor",
     "DecodeBatch",
     "DecodeEngine",
+    "FairDecodeScheduler",
+    "FairSchedulingConfig",
     "DecodePrepared",
     "DecodeWorker",
     "InstalledRequest",
@@ -63,6 +68,8 @@ __all__ = [
     "PartialDecodeError",
     "MultiWorkerGenerationBackend",
     "PDClusterConfig",
+    "WorkerRecoveryStats",
+    "WorkerUnavailableError",
     "RuntimeGenerationBackend",
     "ServingRequest",
     "DisaggregatedGenerationBackend",

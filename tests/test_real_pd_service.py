@@ -110,6 +110,42 @@ def test_real_cluster_backend_single_decode_worker_vertical_slice() -> None:
     loop.close()
 
 
+def test_real_cluster_recovers_a_crashed_decode_worker() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = MultiWorkerGenerationBackend(
+        PDClusterConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            ("cuda:1",),
+            cache_tokens_per_worker=64,
+            use_flash_attention=False,
+        ),
+        startup_timeout=180,
+        operation_timeout=30,
+        worker_restart_backoff_s=0.1,
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    try:
+        crashed = backend._decode_processes[0]
+        crashed.terminate()
+        crashed.join(10)
+        assert not crashed.is_alive()
+
+        handle = loop.submit([1, 42, 17], max_new_tokens=1)
+        events = []
+        while True:
+            event = handle.get(timeout=180)
+            events.append(event)
+            if event.finished:
+                break
+        assert events[-1].finish_reason == "length"
+        stats = backend.recovery_stats()
+        assert stats.successes == 1
+        assert stats.healthy_workers == 1
+    finally:
+        loop.close()
+
+
 def test_real_decode_worker_retains_and_reuses_full_attention_prefix_pages() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required")

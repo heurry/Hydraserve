@@ -43,6 +43,21 @@ class _Handler(BaseHTTPRequestHandler):
                     "state_free_slots": snapshot.state_free_slots,
                     "decode_load": snapshot.decode_load,
                 }
+            recovery_stats = getattr(
+                self.hydra.generation_loop.backend, "recovery_stats", None
+            )
+            if recovery_stats is not None:
+                recovery = recovery_stats()
+                payload["decode_workers"] = {
+                    "total": recovery.total_workers,
+                    "healthy": recovery.healthy_workers,
+                    "recovering": list(recovery.recovering_workers),
+                    "restart_attempts": recovery.attempts,
+                    "restart_successes": recovery.successes,
+                    "restart_failures": recovery.failures,
+                }
+                if recovery.healthy_workers < recovery.total_workers:
+                    payload["status"] = "degraded"
             self._json(200, payload)
             return
         if self.path == "/metrics":
@@ -264,6 +279,21 @@ class _Handler(BaseHTTPRequestHandler):
                     f"hydraserve_pd_failures_total {stats.pd_failures}",
                     "# TYPE hydraserve_prefill_worker_healthy gauge",
                     f"hydraserve_prefill_worker_healthy {1 if stats.prefill_healthy else 0}",
+                ]
+            )
+        recovery_stats = getattr(backend, "recovery_stats", None)
+        if recovery_stats is not None:
+            stats = recovery_stats()
+            lines.extend(
+                [
+                    "# TYPE hydraserve_decode_workers gauge",
+                    f'hydraserve_decode_workers{{state="total"}} {stats.total_workers}',
+                    f'hydraserve_decode_workers{{state="healthy"}} {stats.healthy_workers}',
+                    f'hydraserve_decode_workers{{state="recovering"}} {len(stats.recovering_workers)}',
+                    "# TYPE hydraserve_worker_restarts_total counter",
+                    f'hydraserve_worker_restarts_total{{outcome="attempt"}} {stats.attempts}',
+                    f'hydraserve_worker_restarts_total{{outcome="success"}} {stats.successes}',
+                    f'hydraserve_worker_restarts_total{{outcome="failure"}} {stats.failures}',
                 ]
             )
         body = ("\n".join(lines) + "\n").encode("utf-8")

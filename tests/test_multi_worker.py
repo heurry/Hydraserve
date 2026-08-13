@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from threading import RLock
+from threading import Event, Lock, RLock
+from queue import Queue
 
 import pytest
 
@@ -12,6 +13,7 @@ from hydraserve.engine import (
     PartialDecodeError,
     PDClusterConfig,
     ServingRequest,
+    WorkerUnavailableError,
 )
 from hydraserve.router import (
     AdaptiveRouter,
@@ -50,6 +52,15 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._collocated_count = 0
         self._pd_count = 0
         self._pd_failures = 0
+        self._closed = False
+        self._recovery_stop = Event()
+        self._recovering_workers = set()
+        self._recovery_threads = {}
+        self._recovery_attempts = 0
+        self._recovery_successes = 0
+        self._recovery_failures = 0
+        self.max_worker_restarts = 3
+        self.worker_restart_backoff_s = 0
         self.rpc_calls = []
 
     def _reserve_on(self, worker_id, request):
@@ -128,3 +139,49 @@ def test_multi_worker_admission_defers_when_cluster_is_full() -> None:
         )
     decision = backend.admit(ServingRequest(99, (1,), 1))
     assert not decision.admitted and decision.retryable
+
+
+def test_dead_decode_worker_is_removed_and_recovery_is_scheduled() -> None:
+    class DeadProcess:
+        def is_alive(self):
+            return False
+
+    backend = FakeMultiWorkerBackend()
+    backend._decode_processes = [DeadProcess(), DeadProcess()]
+    backend._decode_locks = [Lock(), Lock()]
+    backend._decode_commands = [Queue(), Queue()]
+    backend._decode_responses = [Queue(), Queue()]
+    scheduled = []
+    backend._schedule_decode_recovery = scheduled.append
+
+    with pytest.raises(WorkerUnavailableError, match="not running"):
+        MultiWorkerGenerationBackend._decode_rpc(
+            backend, 0, {"op": "decode", "request_ids": (1,)}, "decode"
+        )
+    assert not backend.registry.snapshots()[0].healthy
+    assert scheduled == [0]
+
+
+def test_worker_recovery_retries_with_backoff_and_restores_health() -> None:
+    class RecoveringBackend(FakeMultiWorkerBackend):
+        def __init__(self):
+            super().__init__()
+            self.restart_calls = 0
+
+        def _restart_decode_worker_once(self, worker_id):
+            self.restart_calls += 1
+            if self.restart_calls == 1:
+                raise RuntimeError("startup failed")
+            self.registry.set_health(worker_id, True)
+
+    backend = RecoveringBackend()
+    backend.registry.set_health(0, False)
+    backend._recovering_workers.add(0)
+    backend._recover_decode_worker(0)
+    stats = backend.recovery_stats()
+    assert backend.restart_calls == 2
+    assert stats.attempts == 2
+    assert stats.successes == 1
+    assert stats.failures == 1
+    assert stats.healthy_workers == 2
+    assert stats.recovering_workers == ()

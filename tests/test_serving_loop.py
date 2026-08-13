@@ -135,7 +135,8 @@ def test_partial_decode_failure_preserves_healthy_requests() -> None:
                 assert allow_decode.wait(2)
             if not self.failed_once and len(requests) == 2:
                 self.failed_once = True
-                healthy, failed = requests
+                healthy = min(requests, key=lambda request: request.request_id)
+                failed = max(requests, key=lambda request: request.request_id)
                 raise PartialDecodeError(
                     {healthy.request_id: healthy.generated_token_ids[-1] + 1},
                     {failed.request_id: RuntimeError("bound worker failed")},
@@ -267,6 +268,24 @@ def test_permanent_admission_rejection_is_request_scoped() -> None:
     assert _collect(rejected)[-1].error == "request exceeds KV capacity"
     assert [event.token_id for event in _collect(healthy)[:-1]] == [5]
     loop.close()
+
+
+def test_deferred_large_request_does_not_block_admissible_request() -> None:
+    class SelectiveAdmissionBackend(FakeBackend):
+        def admit(self, request):
+            if request.token_ids == (9,):
+                return AdmissionDecision.defer("large request is waiting for capacity")
+            return AdmissionDecision.accept()
+
+    backend = SelectiveAdmissionBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    deferred = loop.submit([9], max_new_tokens=1)
+    healthy = loop.submit([2], max_new_tokens=1)
+    assert [event.token_id for event in _collect(healthy)[:-1]] == [3]
+    deferred.cancel()
+    assert _collect(deferred)[-1].finish_reason == "cancelled"
+    loop.close()
+    assert loop.pending_count == 0
 
 
 def test_bounded_admission_queue_applies_backpressure() -> None:
