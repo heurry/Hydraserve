@@ -702,3 +702,141 @@ def test_recovery_failure_is_request_scoped_and_releases_resources() -> None:
     assert "recompute kernel failed" in terminal.error
     assert loop.recovery_failures_total == 1
     assert backend.live == set()
+
+
+def test_async_prefill_path_preempts_and_recovers_without_duplicate_output() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class AsyncPreemptibleBackend(FakeBackend):
+        supports_async_prefill = True
+
+        def __init__(self):
+            super().__init__()
+            self.blocked = False
+            self.preempted = []
+            self.replayed = []
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            self.preempted.append(request_id)
+            self.release(request_id)
+
+        def recover(self, request):
+            replay = request.token_ids + tuple(request.generated_token_ids[:-1])
+            self.replayed.append((request.request_id, replay))
+            self.live.add(request.request_id)
+            return AdmissionDecision.accept()
+
+    backend = AsyncPreemptibleBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    background = loop.submit([1], max_new_tokens=4)
+    first = background.get(timeout=2)
+    assert first.token_id == 2
+    assert decode_entered.wait(2)
+    urgent = loop.submit([20], max_new_tokens=1, priority=7)
+    allow_decode.set()
+
+    assert list(urgent)[-1].finish_reason == "length"
+    background_events = [first, *list(background)]
+    loop.close()
+    assert [event.token_id for event in background_events[:-1]] == [2, 3, 4, 5]
+    assert backend.preempted == [background.request_id]
+    assert backend.replayed == [(background.request_id, (1, 2))]
+    assert loop.preemptions_total == 1
+    assert loop.recoveries_total == 1
+    assert loop.preempted_count == 0
+    assert backend.live == set()
+
+
+def test_preemption_failure_fails_only_victim_and_still_admits_urgent_work() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class BrokenPreemptionBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.blocked = False
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            raise RuntimeError("release RPC timed out")
+
+        def recover(self, request):
+            raise AssertionError("failed preemption must not enter recovery")
+
+    backend = BrokenPreemptionBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    background = loop.submit([1], max_new_tokens=3)
+    background.get(timeout=2)
+    assert decode_entered.wait(2)
+    urgent = loop.submit([10], max_new_tokens=1, priority=7)
+    allow_decode.set()
+
+    assert list(urgent)[-1].finish_reason == "length"
+    terminal = list(background)[-1]
+    loop.close()
+    assert terminal.finish_reason == "error"
+    assert "preemption failed: release RPC timed out" in terminal.error
+    assert loop.preemption_failures_total == 1
+    assert loop.preemptions_total == 0
+    assert loop.recoveries_total == 0
+    assert backend.live == set()
+
+
+def test_async_recovery_retries_transient_capacity_deferral() -> None:
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class DeferredRecoveryBackend(FakeBackend):
+        supports_async_prefill = True
+
+        def __init__(self):
+            super().__init__()
+            self.blocked = False
+            self.recovery_attempts = 0
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(2)
+            return super().decode(requests)
+
+        def preempt(self, request_id):
+            self.release(request_id)
+
+        def recover(self, request):
+            self.recovery_attempts += 1
+            if self.recovery_attempts == 1:
+                return AdmissionDecision.defer("worker is still draining")
+            self.live.add(request.request_id)
+            return AdmissionDecision.accept()
+
+    backend = DeferredRecoveryBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    background = loop.submit([1], max_new_tokens=3)
+    first = background.get(timeout=2)
+    assert decode_entered.wait(2)
+    urgent = loop.submit([10], max_new_tokens=1, priority=7)
+    allow_decode.set()
+
+    assert list(urgent)[-1].finish_reason == "length"
+    assert [first, *list(background)][-1].finish_reason == "length"
+    loop.close()
+    assert backend.recovery_attempts == 2
+    assert loop.recoveries_total == 1
+    assert loop.recovery_failures_total == 0
+    assert loop.preempted_count == 0

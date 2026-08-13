@@ -63,6 +63,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self.max_worker_restarts = 3
         self.worker_restart_backoff_s = 0
         self.rpc_calls = []
+        self.rpc_commands = []
 
     def _reserve_on(self, worker_id, request):
         self.rpc_calls.append(("reserve", worker_id, request.request_id))
@@ -74,6 +75,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         return request.request_id + 100
 
     def _decode_rpc(self, worker_id, command, expected_op, request_id=None):
+        self.rpc_commands.append((worker_id, dict(command)))
         self.rpc_calls.append((expected_op, worker_id, tuple(command.get("request_ids", ()))))
         if expected_op == "decode":
             ids = tuple(command["request_ids"])
@@ -140,6 +142,30 @@ def test_multi_worker_admission_defers_when_cluster_is_full() -> None:
         )
     decision = backend.admit(ServingRequest(99, (1,), 1))
     assert not decision.admitted and decision.retryable
+
+
+def test_multi_worker_preemption_rebinds_and_sends_exact_recovery_replay() -> None:
+    backend = FakeMultiWorkerBackend()
+    request = ServingRequest(9, (1, 2, 3), 6, generated_token_ids=[10, 11, 12])
+    assert backend.admit(request).admitted
+    original_worker = backend.worker_for(request.request_id)
+
+    backend.preempt(request.request_id)
+    assert request.request_id not in backend._reserved_blocks[original_worker]
+    decision = backend.recover(request)
+
+    assert decision.admitted
+    worker_id = backend.worker_for(request.request_id)
+    recovery = [
+        command
+        for recorded_worker, command in backend.rpc_commands
+        if recorded_worker == worker_id and command.get("op") == "recover"
+    ]
+    assert len(recovery) == 1
+    assert recovery[0]["token_ids"] == (1, 2, 3)
+    assert recovery[0]["generated_token_ids"] == (10, 11, 12)
+    assert recovery[0]["replay_token_ids"] == (1, 2, 3, 10, 11)
+    backend.release(request.request_id)
 
 
 def test_dead_decode_worker_is_removed_and_recovery_is_scheduled() -> None:

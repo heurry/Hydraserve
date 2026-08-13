@@ -343,11 +343,21 @@ class ContinuousGenerationLoop:
         self, active: OrderedDict[int, ServingRequest]
     ) -> None:
         pending: OrderedDict[int, tuple[ServingRequest, Future]] = OrderedDict()
+        recovering: set[int] = set()
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hydraserve-prefill") as executor:
             while not self._stop.is_set():
                 did_work = self._submit_async_prefill(active, pending, executor)
-                did_work = self._collect_async_prefill(active, pending) or did_work
+                did_work = (
+                    self._collect_async_prefill(active, pending, recovering=recovering)
+                    or did_work
+                )
                 did_work = self._remove_cancelled_or_expired(active) or did_work
+                did_work = (
+                    self._submit_async_recovery(
+                        active, pending, recovering, executor
+                    )
+                    or did_work
+                )
                 self._publish_scheduler_depth(len(active), len(pending))
                 if active:
                     self._decode_once(active)
@@ -358,7 +368,9 @@ class ContinuousGenerationLoop:
             for request, _ in pending.values():
                 request.cancelled.set()
             while pending:
-                self._collect_async_prefill(active, pending, wait=True)
+                self._collect_async_prefill(
+                    active, pending, recovering=recovering, wait=True
+                )
 
     def _submit_async_prefill(self, active, pending, executor) -> bool:
         did_work = False
@@ -366,8 +378,11 @@ class ContinuousGenerationLoop:
         candidates = self._waiting_candidates()
         for index, waiting in enumerate(candidates):
             if available_slots <= 0:
-                self._defer_remaining(candidates[index:])
-                break
+                if self._try_preempt_for(waiting[0], active):
+                    available_slots += 1
+                else:
+                    self._defer_remaining(candidates[index:])
+                    break
             request, handle = waiting
             if request.cancelled.is_set():
                 self._pending_done(request)
@@ -389,6 +404,9 @@ class ContinuousGenerationLoop:
             )
             decision = self._admission_decision(request)
             if not decision.admitted:
+                if decision.retryable and self._try_preempt_for(request, active):
+                    available_slots += 1
+                    decision = self._admission_decision(request)
                 if decision.retryable:
                     request.admission_age += 1
                     self._deferred.append((request, handle))
@@ -409,6 +427,44 @@ class ContinuousGenerationLoop:
                 executor.submit(self._execute_prefill, request),
             )
             available_slots -= 1
+            did_work = True
+        return did_work
+
+    def _submit_async_recovery(
+        self, active, pending, recovering: set[int], executor
+    ) -> bool:
+        recover = getattr(self.backend, "recover", None)
+        if not callable(recover) or not self._preempted:
+            return False
+        did_work = False
+        visits = len(self._preempted)
+        for _ in range(visits):
+            request = self._preempted.popleft()
+            if request.cancelled.is_set():
+                self._finish(request, "cancelled", active=active, release=False)
+                with self._stats_lock:
+                    self._preempted_count -= 1
+                did_work = True
+                continue
+            if self._deadline_expired(request):
+                self._fail(
+                    request,
+                    TimeoutError("request deadline expired while preempted"),
+                    active=active,
+                    release=False,
+                )
+                with self._stats_lock:
+                    self._preempted_count -= 1
+                did_work = True
+                continue
+            if len(active) + len(pending) >= self.max_active_requests:
+                self._preempted.append(request)
+                continue
+            pending[request.request_id] = (
+                request,
+                executor.submit(recover, request),
+            )
+            recovering.add(request.request_id)
             did_work = True
         return did_work
 
@@ -452,7 +508,15 @@ class ContinuousGenerationLoop:
                 0.0, (request.admitted_at - request.submitted_at) * 1000.0
             )
 
-    def _collect_async_prefill(self, active, pending, *, wait: bool = False) -> bool:
+    def _collect_async_prefill(
+        self,
+        active,
+        pending,
+        *,
+        recovering: set[int] | None = None,
+        wait: bool = False,
+    ) -> bool:
+        recovering = set() if recovering is None else recovering
         completed = []
         for request_id, (_, future) in pending.items():
             if wait or future.done():
@@ -462,8 +526,36 @@ class ContinuousGenerationLoop:
                     break
         for request_id in completed:
             request, future = pending.pop(request_id)
+            is_recovery = request_id in recovering
+            recovering.discard(request_id)
             try:
-                sample = self._normalize_sample(future.result())
+                result = future.result()
+                if is_recovery:
+                    if request.cancelled.is_set() or self._stop.is_set():
+                        self._finish(request, "cancelled", active=active, release=True)
+                    elif self._deadline_expired(request):
+                        self._fail(
+                            request,
+                            TimeoutError("request deadline expired during recovery"),
+                            active=active,
+                            release=True,
+                        )
+                    elif isinstance(result, AdmissionDecision) and not result.admitted:
+                        if result.retryable:
+                            self._preempted.append(request)
+                            continue
+                        raise MemoryError(
+                            result.reason or "preempted request cannot recover"
+                        )
+                    else:
+                        request.recovery_count += 1
+                        active[request.request_id] = request
+                        with self._stats_lock:
+                            self._recoveries_total += 1
+                    with self._stats_lock:
+                        self._preempted_count -= 1
+                    continue
+                sample = self._normalize_sample(result)
                 if request.cancelled.is_set() or self._stop.is_set():
                     self._finish(request, "cancelled", active=active, release=True)
                     continue
@@ -483,6 +575,10 @@ class ContinuousGenerationLoop:
                 else:
                     active[request.request_id] = request
             except Exception as exc:
+                if is_recovery:
+                    with self._stats_lock:
+                        self._recovery_failures_total += 1
+                        self._preempted_count -= 1
                 self._fail(request, exc, active=active, release=True)
         return bool(completed)
 
@@ -572,7 +668,6 @@ class ContinuousGenerationLoop:
             self.max_preemptions_per_request == 0
             or not callable(preempt)
             or not callable(recover)
-            or getattr(self.backend, "supports_async_prefill", False)
         ):
             return False
         victims = [
@@ -586,10 +681,16 @@ class ContinuousGenerationLoop:
         victim = min(victims, key=self._preemption_victim_key)
         try:
             preempt(victim.request_id)
-        except Exception:
+        except Exception as exc:
             with self._stats_lock:
                 self._preemption_failures_total += 1
-            return False
+            self._fail(
+                victim,
+                RuntimeError(f"preemption failed: {exc}"),
+                active=active,
+                release=True,
+            )
+            return True
         active.pop(victim.request_id, None)
         self._decode_scheduler.forget(victim.request_id)
         victim.preemption_count += 1
@@ -1102,7 +1203,10 @@ class RuntimeGenerationBackend:
             self.states[request.request_id] = state
             return AdmissionDecision.accept()
         except Exception:
-            self.release(request.request_id)
+            try:
+                self.release(request.request_id)
+            except Exception:
+                pass
             raise
 
     def prefill(self, request: ServingRequest) -> TokenSample:

@@ -392,6 +392,54 @@ def _decode_worker(
                             "sample": sample,
                         }
                     )
+                elif operation == "recover":
+                    request_id = command["request_id"]
+                    if request_id not in reservations:
+                        raise RuntimeError("recovery requires a KV/state reservation")
+                    replay_token_ids = tuple(command["replay_token_ids"])
+                    generated_token_ids = tuple(command["generated_token_ids"])
+                    if not replay_token_ids or not generated_token_ids:
+                        raise RuntimeError("recovery requires consumed and emitted tokens")
+                    expected_replay = tuple(command["token_ids"]) + generated_token_ids[:-1]
+                    if replay_token_ids != expected_replay:
+                        raise RuntimeError("recovery replay does not match request history")
+                    total_tokens = len(command["token_ids"]) + max(
+                        0, command["max_new_tokens"] - 1
+                    )
+                    state_pool.free(request_id)
+                    states.pop(request_id, None)
+                    requests.pop(request_id, None)
+                    cache.free(request_id)
+                    cache.allocate(
+                        request_id,
+                        len(replay_token_ids),
+                        reserve_tokens=total_tokens,
+                        token_ids=replay_token_ids,
+                    )
+                    replay = torch.tensor(
+                        [replay_token_ids], device=device, dtype=torch.long
+                    )
+                    with torch.inference_mode():
+                        _, state = runtime.prefill(
+                            replay,
+                            chunk_size=config.prefill_chunk_size,
+                            paged_cache=cache,
+                            request_id=request_id,
+                        )
+                    request = _request(
+                        request_id,
+                        command["token_ids"],
+                        command["max_new_tokens"],
+                        transferred=False,
+                        route=Route.COLLOCATED,
+                        sampling_params=command.get("sampling_params"),
+                    )
+                    request.generated_token_ids.extend(generated_token_ids)
+                    requests[request_id] = request
+                    states[request_id] = state_pool.install(request_id, state)
+                    responses.put(
+                        {"op": "recover", "request_id": request_id, **capacity_payload()}
+                    )
                 elif operation == "decode":
                     request_ids = tuple(command["request_ids"])
                     cache.block_manager.grow_many(request_ids, additional_tokens=1)
@@ -452,9 +500,11 @@ def _decode_worker(
                 else:
                     raise ValueError(f"unknown decode-worker operation {operation!r}")
             except Exception as exc:
-                if operation in {"prepare", "collocated_prepare"}:
+                if operation in {"prepare", "collocated_prepare", "recover"}:
                     reservations.discard(command.get("request_id"))
                     state_pool.free(command.get("request_id"))
+                    states.pop(command.get("request_id"), None)
+                    requests.pop(command.get("request_id"), None)
                     cache.free(command.get("request_id"))
                 responses.put(
                     {
@@ -642,6 +692,37 @@ class DisaggregatedGenerationBackend:
         if samples is not None:
             return tuple(samples)
         return tuple(int(token) for token in result["token_ids"])
+
+    def preempt(self, request_id: int) -> None:
+        self.release(request_id)
+
+    def recover(self, request: ServingRequest) -> AdmissionDecision:
+        decision = self._reserve_decode(request)
+        if not decision.admitted:
+            return decision
+        command = {
+            "op": "recover",
+            "request_id": request.request_id,
+            "token_ids": request.token_ids,
+            "generated_token_ids": tuple(request.generated_token_ids),
+            "replay_token_ids": request.token_ids
+            + tuple(request.generated_token_ids[:-1]),
+            "max_new_tokens": request.max_new_tokens,
+            "sampling_params": request.sampling_params,
+        }
+        try:
+            with self._decode_lock:
+                self._decode_commands.put(command)
+                result = self._get(self._decode_responses, self.operation_timeout)
+            self._check(result, "recover", request.request_id)
+            self._update_capacity(result)
+            return AdmissionDecision.accept()
+        except Exception:
+            try:
+                self.release(request.request_id)
+            except Exception:
+                pass
+            raise
 
     def release(self, request_id: int) -> None:
         if self._closed:

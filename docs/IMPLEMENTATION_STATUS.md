@@ -339,11 +339,33 @@ Implemented and validated in the production `ContinuousGenerationLoop` and
 
 Unit tests compose preemption with streaming, priority, deadlines, exact replay,
 failure cleanup, and allocator reservation lengths. An opt-in real Qwen3.5-4B
-GPU test forced a preemption after the first decode boundary, matched the full
-recovered token stream against uninterrupted greedy generation, and audited all
-KV pages and recurrent-state slots as free afterward. Async PD/multi-worker
-preemption is explicitly not enabled yet; that path needs cross-process local
-recompute and non-blocking recovery integration.
+  GPU test forced a preemption after the first decode boundary, matched the full
+  recovered token stream against uninterrupted greedy generation, and audited all
+  KV pages and recurrent-state slots as free afterward.
+
+## 2026-08-14 — async PD and multi-worker preemption recovery
+
+Implemented and validated after the collocated slice:
+
+- async admission can preempt at the same decode iteration boundary without
+  treating an in-flight prefill as an active victim;
+- recovery is submitted through the persistent prefill executor and identified
+  separately from ordinary prefill completion, so it installs state without
+  emitting or sampling a second first token;
+- the decode worker validates `replay == prompt + generated[:-1]`, replaces the
+  old reservation transactionally, performs chunked local recompute, restores
+  the original sampling history, and returns updated capacity/cache telemetry;
+- fixed 1P+1D and adaptive 1P+ND coordinators both expose preempt/recover, with
+  the latter allowed to rebind a suspended request to a currently healthy worker;
+- transient recovery admission failure remains suspended and retries; ambiguous
+  preemption failure conservatively terminates only the victim and attempts
+  idempotent cleanup rather than decoding against missing state.
+
+Two opt-in real Qwen3.5-4B tests passed on the local RTX 3090 pair. The fixed PD
+test used seeded temperature/top-k sampling and matched all recovered tokens to
+an uninterrupted run, proving sampling-step continuity. The multi-worker test
+covered coordinator rebinding and local recovery RPC. Both ended with zero live
+allocations and all physical KV blocks free.
 
 ## 2026-08-14 — KV safety headroom, audit, and observability
 

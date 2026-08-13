@@ -50,6 +50,133 @@ def test_persistent_real_two_gpu_pd_generation() -> None:
     assert second_events[-1].finish_reason == "length"
 
 
+def test_real_pd_preemption_recovery_matches_uninterrupted_generation() -> None:
+    from threading import Event
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    inner = DisaggregatedGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            max_state_slots=1,
+            use_flash_attention=False,
+        )
+    )
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class BlockingBackend:
+        supports_async_prefill = True
+
+        def __init__(self):
+            self.blocked = False
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(30)
+            return inner.decode(requests)
+
+    loop = ContinuousGenerationLoop(BlockingBackend(), max_batch_size=1)
+    prompt = [1, 42, 17, 9]
+    sampling = SamplingParams(temperature=0.8, top_k=16, seed=20260814)
+    try:
+        background = loop.submit(
+            prompt, max_new_tokens=3, sampling_params=sampling
+        )
+        first = background.get(timeout=120)
+        assert first.token_id is not None
+        assert decode_entered.wait(120)
+        urgent = loop.submit([1, 7], max_new_tokens=1, priority=7)
+        allow_decode.set()
+        urgent_events = list(urgent)
+        background_events = [first, *list(background)]
+        reference_events = list(
+            loop.submit(prompt, max_new_tokens=3, sampling_params=sampling)
+        )
+    finally:
+        loop.close(timeout=120)
+
+    generated = [event.token_id for event in background_events if event.token_id is not None]
+    reference = [event.token_id for event in reference_events if event.token_id is not None]
+    assert generated == reference
+    assert urgent_events[-1].finish_reason == "length"
+    assert background_events[-1].finish_reason == "length"
+    assert loop.preemptions_total == 1
+    assert loop.recoveries_total == 1
+    stats = inner.cache_stats()
+    assert stats["active_allocations"] == 0
+    assert stats["physical_free_blocks"] == stats["physical_total_blocks"]
+
+
+def test_real_multi_worker_coordinator_recovers_preempted_request() -> None:
+    from threading import Event
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    inner = MultiWorkerGenerationBackend(
+        PDClusterConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            ("cuda:1",),
+            prefill_device="cuda:0",
+            cache_tokens_per_worker=128,
+            max_state_slots_per_worker=1,
+            use_flash_attention=False,
+        ),
+        router=AdaptiveRouter(
+            RouterConfig(short_prompt_tokens=32, long_prompt_tokens=64)
+        ),
+    )
+    decode_entered = Event()
+    allow_decode = Event()
+
+    class BlockingBackend:
+        supports_async_prefill = True
+
+        def __init__(self):
+            self.blocked = False
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+        def decode(self, requests):
+            if not self.blocked:
+                self.blocked = True
+                decode_entered.set()
+                assert allow_decode.wait(30)
+            return inner.decode(requests)
+
+    loop = ContinuousGenerationLoop(BlockingBackend(), max_batch_size=1)
+    prompt = [1, 42, 17, 9]
+    try:
+        background = loop.submit(prompt, max_new_tokens=3)
+        first = background.get(timeout=120)
+        assert first.token_id is not None
+        assert decode_entered.wait(120)
+        urgent = loop.submit([1, 7], max_new_tokens=1, priority=7)
+        allow_decode.set()
+        urgent_events = list(urgent)
+        background_events = [first, *list(background)]
+        reference_events = list(loop.submit(prompt, max_new_tokens=3))
+    finally:
+        loop.close(timeout=120)
+
+    generated = [event.token_id for event in background_events if event.token_id is not None]
+    reference = [event.token_id for event in reference_events if event.token_id is not None]
+    assert generated == reference
+    assert urgent_events[-1].finish_reason == "length"
+    assert loop.preemptions_total == 1
+    assert loop.recoveries_total == 1
+    stats = inner.cache_stats()
+    assert stats["active_allocations"] == 0
+    assert stats["physical_free_blocks"] == stats["physical_total_blocks"]
+
+
 def test_real_pd_kv_headroom_stats_and_release_are_end_to_end() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required")

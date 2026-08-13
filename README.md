@@ -259,7 +259,9 @@ HTTP 408，SSE 返回 `timeout_error` event。GPU kernel 不可中断，因此 d
 `prompt + generated[:-1]` 精确重算，保留已经输出的 token、采样 step 和停止序列状态。
 `--max-preemptions-per-request`（默认 2，设为 0 可关闭）限制反复抢占。
 `/health` 与 `/metrics` 暴露 admission、prefill、active、preempted 四层深度，以及抢占和
-恢复的成功/失败累计值。异步 PD 主链路的跨进程恢复仍是下一阶段，不会伪装成已支持。
+恢复的成功/失败累计值。异步 PD 与 1P+ND 主链路使用同一个 prefill executor 提交恢复，
+decode worker 通过独立 `recover` RPC 在本地重算并安装状态，不重新采样或发出历史 token；
+同一 decode worker 上的恢复与 decode 由 RPC 锁串行，不同 worker 的 decode 仍可并行。
 
 `--kv-headroom-blocks` 从 admission 可用容量中永久保留指定物理页，防止工作集逼到最后
 一页时反复准入/失败；默认 0 保持向后兼容。headroom 仍是已分配的 GPU KV tensor，

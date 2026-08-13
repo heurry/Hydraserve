@@ -422,6 +422,35 @@ class MultiWorkerGenerationBackend:
                 self._reserved_blocks[worker_id].pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
 
+    def preempt(self, request_id: int) -> None:
+        self.release(request_id)
+
+    def recover(self, request: ServingRequest) -> AdmissionDecision:
+        decision = self.admit(request)
+        if not decision.admitted:
+            return decision
+        worker_id = self.registry.worker_for(request.request_id)
+        command = {
+            **self._request_command("recover", request),
+            "generated_token_ids": tuple(request.generated_token_ids),
+            "replay_token_ids": request.token_ids
+            + tuple(request.generated_token_ids[:-1]),
+        }
+        try:
+            self._decode_rpc(
+                worker_id,
+                command,
+                "recover",
+                request.request_id,
+            )
+            return AdmissionDecision.accept()
+        except Exception:
+            try:
+                self.release(request.request_id)
+            except Exception:
+                pass
+            raise
+
     def capacity(self) -> BackendCapacity:
         snapshots = self.registry.snapshots()
         return BackendCapacity(
