@@ -35,7 +35,9 @@ Prefill–Decode 分离推理引擎。当前主线按 [`main.md`](main.md) 从�
 - 真实双进程、双 GPU 的 SHM PARTIAL_TRANSFER 端到端链路；
 - FULL/INT4 QUANTIZED KV 安装路径与真实物理页读取；
 - CUDA P2P 后端及硬件能力检测（本机 NODE 拓扑无 peer access，自动回退 SHM）；
-- 完整块粒度的 full-attention prefix radix cache（不错误缓存 GDN 状态）；
+- 完整块粒度的 full-attention prefix radix cache（不错误缓存 GDN 状态）：支持
+  model/tokenizer/revision/adapter 命名空间、引用保护、频率 doorkeeper、成本/大小/新鲜度
+  淘汰评分、容量上限和有界频率元数据；淘汰页显式返回给物理页管理器回收；
 - ShareGPT、HumanEval、LongBench、WikiText-103、GSM8K 低内存数据适配器。
 
 当前还包括驻留式 Continuous Batching 生成循环、直接读取 `tokenizer.json` 的文本
@@ -49,7 +51,8 @@ PARTIAL PD 间切换。P2P 后端已实现，但当前两卡拓扑不支持 CUDA
 KV/state 容量快照供后续逐请求路由、worker 负载均衡和监控复用。
 
 这里的“已实现”仍不等于整个系统已经达到生产完成态。逐请求 Collocated/PD 混合路由、
-1P+ND、成本感知 Prefix Cache、完整抢占重算、故障恢复、压力与长稳验证仍在生产化路线中。
+1P+ND、Prefix Cache 与真实执行路径的复用集成、完整抢占重算、故障恢复、压力与长稳验证
+仍在生产化路线中。
 
 ## 模型兼容性
 

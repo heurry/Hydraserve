@@ -197,7 +197,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证完成；生产级优先级与真实重算恢复待完善 |
 | KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 物理页、容量预留、批量原子增长、Triton scatter、block table 完成 |
 | Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | FP32 状态与 worker slot 容量准入完成；连续 GPU pool 待优化 |
-| Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 完整块 radix、引用保护、LRU 基线完成；成本感知策略待实现 |
+| Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 命名空间、引用保护、频率准入、成本感知淘汰完成；runtime 复用集成待实现 |
 | Adaptive Router | CPU | Collocated vs PD 路由 | 阈值决策器完成；逐请求执行路径、容量/拓扑路由待实现 |
 | ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
 | API Server | CPU | OpenAI-compatible | completions/chat/SSE + collocated/PD 常驻模式完成 |
@@ -538,12 +538,12 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
-| 9 | 生产化资源准入 | 持续 | 完成 P0：KV 最大输出预留、GDN slot 联合事务、有界队列/429、统一容量快照 |
+| 9 | 生产化资源准入与缓存策略 | 持续 | 完成 P0：KV/GDN 联合准入、有界队列/429、统一容量快照；完成 P1：命名空间与成本感知 Prefix Cache 策略 |
 | 总计 | | ~16 周 | |
 
 **最紧急的下一步**：
 1. 将逐请求 Collocated/PD 路由接入 serving loop，并使用统一容量快照做预留与安全回退
-2. 实现成本感知 Prefix Cache admission/eviction，与 decode worker cache affinity 联动
+2. 将成本感知 Prefix Cache 接入物理页生命周期，并与 decode worker cache affinity 联动
 3. 完善抢占重算、batch 故障隔离和 1P+ND 调度，再跑正式 B vs D 性能矩阵
 4. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
 3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
