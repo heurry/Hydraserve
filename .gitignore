@@ -1,40 +1,10 @@
-# Python
 __pycache__/
 *.py[cod]
 *.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
 dist/
 build/
-*.egg
-
-# Virtual environments
-.venv/
-venv/
-env/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Model weights (large files)
-/models/
-*.safetensors
-*.bin
-*.pt
-*.pth
-
-# Benchmark output
 benchmark_output/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Conda
-.pixi/
-
-main.md

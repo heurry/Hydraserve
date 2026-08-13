@@ -1,10 +1,24 @@
-"""HydraServe transfer layer for dual-state PD separation."""
-from hydraserve.transfer.backend import TransferBackend, TransferMode, select_backend
-from hydraserve.transfer.descriptor import StateTransferDescriptor, RegionDescriptor
-from hydraserve.transfer.pipeline import TransferPipeline
+from hydraserve.transfer.backend import (
+    InMemoryTransferBackend,
+    SharedMemoryTransferBackend,
+    TransferBackend,
+)
+from hydraserve.transfer.descriptor import (
+    RegionDescriptor,
+    RegionType,
+    StateTransferDescriptor,
+    TransferMode,
+)
+from hydraserve.transfer.pipeline import HybridStateBundle, TransferPipeline
 
 __all__ = [
-    "TransferBackend", "TransferMode", "select_backend",
-    "StateTransferDescriptor", "RegionDescriptor",
+    "HybridStateBundle",
+    "InMemoryTransferBackend",
+    "RegionDescriptor",
+    "RegionType",
+    "SharedMemoryTransferBackend",
+    "StateTransferDescriptor",
+    "TransferBackend",
+    "TransferMode",
     "TransferPipeline",
 ]

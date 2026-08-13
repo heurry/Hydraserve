@@ -1,7 +1,16 @@
-"""
-HydraServe: Prefill-Decode Disaggregated Inference Engine
-for Hybrid Attention Architecture LLMs (Qwen3.5/3.6: GDN + GQA)
+"""HydraServe: PD-disaggregated inference for hybrid-attention models."""
 
-Supports dual-state transfer: Full Attention KV Cache + Linear Attention recurrent states.
-"""
+from hydraserve.config import (
+    ModelConfig,
+    discover_model_configs,
+    get_model_config,
+    load_model_config,
+)
+
+__all__ = [
+    "ModelConfig",
+    "discover_model_configs",
+    "get_model_config",
+    "load_model_config",
+]
 __version__ = "0.1.0"
