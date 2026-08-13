@@ -21,6 +21,7 @@ from hydraserve.kernels.reference import (
     silu,
 )
 from hydraserve.model.weights import (
+    BlockScaledFP8Weight,
     LANGUAGE_PREFIX,
     PackedInt4Weight,
     ShardedSafeTensorLoader,
@@ -83,23 +84,79 @@ class QwenTextRuntime:
         loader = ShardedSafeTensorLoader(model_dir)
         dtype = dtype or torch.bfloat16
         names = loader.keys(f"{LANGUAGE_PREFIX}.")
-        if any(name.endswith(".weight_scale_inv") for name in names):
-            raise NotImplementedError(
-                "block-scaled FP8 checkpoints require the HydraServe FP8 GEMM, "
-                "which is not implemented yet; use BF16 or compressed-tensors INT4"
-            )
         if "lm_head.weight" in loader:
             names += ("lm_head.weight",)
         packed_names = tuple(name for name in names if name.endswith(".weight_packed"))
+        fp8_names = tuple(
+            name
+            for name in names
+            if name.endswith(".weight") and f"{name}_scale_inv" in loader
+        )
         packed_parts = (".weight_packed", ".weight_scale", ".weight_zero_point", ".weight_shape")
+        cpu_weight_names = set()
+        if packed_names or fp8_names:
+            cpu_weight_names.add(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        if fp8_names and torch.device(device).type == "cuda" and "lm_head.weight" in names:
+            free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
+            element_size = torch.empty((), dtype=dtype).element_size()
+            estimated_sizes = {}
+            for candidate in names:
+                if candidate.endswith(packed_parts):
+                    continue
+                elements = 1
+                for dimension in loader.tensor_shape(candidate):
+                    elements *= dimension
+                if candidate in fp8_names:
+                    bytes_per_element = 1
+                elif candidate.endswith((".A_log", ".dt_bias")):
+                    bytes_per_element = 4
+                else:
+                    bytes_per_element = element_size
+                estimated_sizes[candidate] = elements * bytes_per_element
+            estimated_gpu_bytes = sum(
+                size
+                for candidate, size in estimated_sizes.items()
+                if candidate not in cpu_weight_names
+            )
+            # Preserve space for the recurrent-state pool, KV pages, CUDA
+            # libraries and decode activations on memory-bound consumer GPUs.
+            reserve_bytes = max(1024**3, config.recurrent_state_bytes * 3)
+            if estimated_gpu_bytes + reserve_bytes > free_bytes:
+                cpu_weight_names.add("lm_head.weight")
+                estimated_gpu_bytes -= estimated_sizes["lm_head.weight"]
+            if estimated_gpu_bytes + reserve_bytes > free_bytes:
+                fp8_sizes = {
+                    candidate: estimated_sizes[candidate]
+                    + estimated_sizes[f"{candidate}_scale_inv"]
+                    for candidate in fp8_names
+                }
+                for candidate in sorted(
+                    fp8_names, key=fp8_sizes.__getitem__, reverse=True
+                ):
+                    cpu_weight_names.add(candidate)
+                    estimated_gpu_bytes -= fp8_sizes[candidate]
+                    if estimated_gpu_bytes + reserve_bytes <= free_bytes:
+                        break
+            if estimated_gpu_bytes + reserve_bytes > free_bytes:
+                raise MemoryError(
+                    "checkpoint cannot preserve the minimum CUDA execution reserve"
+                )
         weights: dict[str, Any] = {}
         for name in names:
-            if name.endswith(packed_parts):
+            if name.endswith(packed_parts) or name.endswith(".weight_scale_inv"):
+                continue
+            if name in fp8_names:
+                weight_device = "cpu" if name in cpu_weight_names else device
+                weights[name] = BlockScaledFP8Weight(
+                    data=loader.tensor(name, device=weight_device).contiguous(),
+                    scale_inv=loader.tensor(
+                        f"{name}_scale_inv", device=weight_device, dtype=dtype
+                    ).contiguous(),
+                    original_shape=loader.tensor_shape(name),
+                )
                 continue
             weight_device = (
-                "cpu"
-                if packed_names and name == f"{LANGUAGE_PREFIX}.embed_tokens.weight"
-                else device
+                "cpu" if name in cpu_weight_names else device
             )
             weights[name] = loader.tensor(
                 name,
@@ -613,6 +670,12 @@ class QwenTextRuntime:
             from hydraserve.kernels.awq import awq_linear
 
             return awq_linear(hidden, weight)
+        if isinstance(weight, BlockScaledFP8Weight):
+            from hydraserve.kernels.fp8 import fp8_linear
+
+            return fp8_linear(hidden, weight)
+        if hidden.device != weight.device:
+            hidden = hidden.to(weight.device)
         return hidden @ weight.transpose(0, 1)
 
     def _embedding(self, input_ids, embedding):

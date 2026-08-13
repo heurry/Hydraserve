@@ -24,6 +24,20 @@ class PackedInt4Weight:
         return self.original_shape
 
 
+@dataclass(frozen=True, slots=True)
+class BlockScaledFP8Weight:
+    """E4M3 weight with a two-dimensional inverse scale per weight block."""
+
+    data: Any
+    scale_inv: Any
+    original_shape: tuple[int, int]
+    block_size: tuple[int, int] = (128, 128)
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.original_shape
+
+
 class ShardedSafeTensorLoader:
     """Resolve tensors from a Hugging Face sharded safetensors index.
 

@@ -13,6 +13,7 @@ from hydraserve.cache import (
     dequantize_int4,
     quantize_int4,
 )
+from hydraserve.cache.state_pool import cuda_state_memory_budget
 
 
 def test_block_manager_allocate_grow_and_free() -> None:
@@ -193,6 +194,13 @@ def test_request_state_slots_are_bounded_and_idempotent() -> None:
     slots.free(1)
     assert slots.allocate(2) == 0
     assert slots.capacity().allocated_slots == 1
+
+
+def test_cuda_state_budget_enforces_fraction_and_hard_reserve() -> None:
+    gib = 1024**3
+    assert cuda_state_memory_budget(20 * gib, 0.5, 512 * 1024**2) == 10 * gib
+    assert cuda_state_memory_budget(900 * 1024**2, 0.5, 512 * 1024**2) == 388 * 1024**2
+    assert cuda_state_memory_budget(256 * 1024**2, 0.5, 512 * 1024**2) == 0
 
 
 def test_gpu_linear_state_pool_uses_contiguous_reusable_views(tiny_model) -> None:

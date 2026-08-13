@@ -8,6 +8,18 @@ from weakref import ref
 import numpy as np
 
 
+def cuda_state_memory_budget(
+    free_bytes: int, memory_fraction: float, reserve_bytes: int
+) -> int:
+    """Bytes allowed while satisfying both fraction and hard-reserve limits."""
+    if free_bytes < 0 or not 0 < memory_fraction <= 1 or reserve_bytes < 0:
+        raise ValueError("invalid CUDA state-pool memory policy")
+    return min(
+        int(free_bytes * memory_fraction),
+        max(0, free_bytes - reserve_bytes),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class StateSlotCapacity:
     total_slots: int
@@ -180,9 +192,8 @@ class GpuLinearStatePool:
         effective_workspace_capacity = requested_workspace_capacity
         if target.type == "cuda":
             free_bytes, _ = torch.cuda.mem_get_info(target)
-            budget = max(
-                0,
-                int(free_bytes * cuda_memory_fraction) - cuda_reserve_bytes,
+            budget = cuda_state_memory_budget(
+                free_bytes, cuda_memory_fraction, cuda_reserve_bytes
             )
             capacity = min(capacity, budget // self.bytes_per_slot)
             effective_workspace_capacity = min(

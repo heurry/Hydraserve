@@ -535,7 +535,7 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | 3 | 传输层 + 双状态序列化 | 2 周 | InMemory/SHM/P2P + 层级协议完成；P2P 待可用硬件实测 |
 | 4 | PD 分离核心 + N-1 truncation | 2 周 | 4B 真实 GPU 双进程 SHM PARTIAL 完成 |
 | 5 | Continuous batching + chunked prefill | 2 周 | 完成：batched decode + Paged 历史与 causal offset |
-| 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ runtime 完成；FP8 待实现 |
+| 6 | 自适应路由 + 多模型适配 | 1.5 周 | 动态 config + 4B/9B BF16 + 27B AWQ/FP8 runtime 完成；FP8 在 SM86 手动 E4M3FN 解码并按显存规划 host streaming |
 | 7 | Benchmark + 对比实验 | 2 周 | 五类数据集、并发 runner、TTFT/TPOT 分位数完成；正式实验待跑 |
 | 8 | API + PD worker + SHM Partial 实测 | 1 周 | 完成：常驻双进程 PD 接入 API/benchmark |
 | 9 | 生产化资源准入、缓存与路由 | 持续 | P0 联合准入；P1 成本感知策略；P2 混合执行；P3 1P+ND；P4 Prefix 物理页共享；P5 抢占/故障隔离；P6 调度/worker 恢复；P7 采样 API；P8 typed SHM/batched KV scatter/tiled attention；P9 allocation-free 事务 GDN state batch 与 Paged KV metadata 批量上传完成 |
@@ -544,8 +544,8 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 **最紧急的下一步**：
 1. 建立压力、故障矩阵、长稳与正式 B-vs-D benchmark 验证
 2. 在 4+ GPU 环境验证 1P+ND 与拓扑路由，再跑正式 B vs D 性能矩阵
-3. 扩展并优化 27B AWQ benchmark；实现 FP8 GEMM
-3. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
+3. 扩展 27B AWQ/FP8 benchmark，继续优化量化 GEMM
+4. 四卡全 x16 P2P 环境验证完整 QUANTIZED_TRANSFER
 
 ---
 

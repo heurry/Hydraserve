@@ -31,6 +31,8 @@ Prefill–Decode 分离推理引擎。当前主线按 [`main.md`](main.md) 从�
 - Qwen3.5-9B BF16（独立 lm_head）真实 32 层 chunked prefill smoke；
 - Qwen3.6-27B compressed-tensors AWQ/INT4 真实 64 层 prefill + decode smoke；
 - 自写 Triton grouped asymmetric INT4 GEMM（packed weight/zero-point，group=128）；
+- 自写 Triton 128×128 block-scaled E4M3FN GEMM；在无原生 FP8 Tensor Core 的
+  RTX 3090 上手动解码位模式，并以最小 host-streaming 集合运行完整 27B FP8；
 - 独立 prefill/decode worker、N-1 truncation 与首 token 一致性校验；
 - 真实双进程、双 GPU 的 SHM PARTIAL_TRANSFER 端到端链路；
 - FULL/INT4 QUANTIZED KV 安装路径与真实物理页读取；
@@ -78,9 +80,13 @@ python -m hydraserve inspect-models /mnt/nvme-data/models/LLM_model
 循环状态形状会自动跟随配置变化。
 
 “配置可识别”与“该权重格式已能执行”分开记录：BF16 runtime 已实跑 4B/9B；
-compressed-tensors AWQ/INT4 已实跑 27B。27B BF16 约 52 GB，不能放入单张 24 GB
-3090；本机 27B FP8 语言权重本身约 25.08 GiB，也超过可用显存，且 block-scaled
-FP8 GEMM 尚未实现，loader 会明确拒绝而不是静默转 BF16 或调用外部后端。
+compressed-tensors AWQ/INT4 和 block-scaled FP8 均已实跑 27B。27B BF16 约 52 GB，
+不能放入单张 24 GB 3090；本机 27B FP8 语言权重约 25.08 GiB，同样超过可用显存。
+loader 会把 embedding 和 lm_head 留在 CPU，并按实际空闲显存选择最少的一组大 FP8
+投影做按需 host streaming，保留 1 GiB 给 recurrent state、KV 和激活；其余权重 GPU
+常驻。RTX 3090 不支持原生 E4M3 Tensor Core，HydraServe Triton kernel 直接读取
+`uint8` 位模式、手动还原有限 E4M3FN 值，再应用 128×128 inverse scale 和 BF16 dot，
+不展开常驻 BF16 权重，也不调用外部推理后端。完整 64 层 prefill + decode 已实跑。
 
 27B AWQ 的 checkpoint 保留 GDN 投影为 BF16、量化 MLP/full-attention linear。
 HydraServe 将只做 token lookup 的 embedding 留在 CPU，把独立 lm_head 和执行权重

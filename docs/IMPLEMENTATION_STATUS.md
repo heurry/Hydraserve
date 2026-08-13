@@ -146,9 +146,9 @@ temporary caused by converting the entire BF16 lm_head to FP32. The corrected
 path performs BF16 GEMM and converts only logits to FP32. The full prefill+decode
 test then passed. Model weights used about 22.02 GiB of PyTorch allocation.
 
-Block-scaled 27B FP8 is explicitly rejected until a HydraServe FP8 GEMM exists;
-it is not silently expanded to BF16. The local FP8 language tensors total about
-25.08 GiB and do not fit one 24 GB card regardless.
+At this milestone block-scaled 27B FP8 was still rejected instead of being
+silently expanded to BF16. Native execution is covered by the later FP8
+milestone below.
 
 ## 2026-08-14 — CPU-resident embedding input placement
 
@@ -503,3 +503,28 @@ path created 52/204/408/816 MiB of peak transient allocations per step; the
 preallocated hot path created none. A real two-request Qwen3.5-4B batched decode
 matched sequential BF16 logits within 0.12 absolute tolerance and produced
 identical argmax tokens. Real preemption/recovery also passed unchanged.
+
+## 2026-08-14 — native block-scaled FP8 execution on Ampere
+
+Implemented and validated:
+
+- a `BlockScaledFP8Weight` loader that pairs each E4M3 tensor with its 128x128
+  `weight_scale_inv` grid without materializing BF16 weights;
+- a HydraServe Triton GEMM that manually decodes E4M3FN bit patterns on SM86,
+  applies two-dimensional inverse scales, and accumulates BF16 dot products;
+- exact tests over every finite positive and negative E4M3FN encoding, partial
+  scale blocks, CPU oracle execution, host-resident streaming, and runtime
+  loader dispatch;
+- memory-aware placement that keeps embedding/lm_head on CPU and selects the
+  smallest set of largest FP8 projections for host streaming until a 1 GiB CUDA
+  execution reserve is preserved;
+- corrected recurrent-state budgeting that independently enforces both the
+  configured free-memory fraction and hard reserve.
+
+The real 10240x5120 projection from the local Qwen3.6-27B-FP8 checkpoint matches
+a materialized BF16 oracle. On one RTX 3090, the final tiled kernel measured
+0.2645/0.2444/0.2461/0.4009/1.5158 ms at 1/8/32/128/512 rows. The complete
+64-layer checkpoint loaded with 21.636 GiB of PyTorch allocation and completed
+one-token prefill plus pooled decode with finite 248,320-way logits; peak
+allocation was 22.099 GiB. This is an Ampere compatibility
+path, not a claim of native Hopper FP8 Tensor Core throughput.

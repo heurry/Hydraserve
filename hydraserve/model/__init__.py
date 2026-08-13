@@ -2,7 +2,11 @@ from hydraserve.model.adapter import ModelAdapter
 from hydraserve.model.qwen import QwenHybridAdapter
 from hydraserve.model.runtime import QwenTextRuntime, RuntimeState
 from hydraserve.model.tokenizer import IncrementalTextDecoder, QwenTokenizer
-from hydraserve.model.weights import PackedInt4Weight, ShardedSafeTensorLoader
+from hydraserve.model.weights import (
+    BlockScaledFP8Weight,
+    PackedInt4Weight,
+    ShardedSafeTensorLoader,
+)
 
 __all__ = [
     "ModelAdapter",
@@ -13,4 +17,5 @@ __all__ = [
     "QwenTokenizer",
     "ShardedSafeTensorLoader",
     "PackedInt4Weight",
+    "BlockScaledFP8Weight",
 ]

@@ -14,6 +14,7 @@ from hydraserve.cache import (
 )
 from hydraserve.model.runtime import QwenTextRuntime, RuntimeState
 from hydraserve.model.weights import LANGUAGE_PREFIX, layer_prefix
+from hydraserve.model.weights import BlockScaledFP8Weight
 
 
 def make_weights(model, *, device="cpu", dtype=torch.float32):
@@ -123,6 +124,56 @@ def test_independent_lm_head_is_used_for_logits(tiny_model) -> None:
     )
     logits, _ = runtime.forward(torch.tensor([[3, 7]]))
     assert torch.count_nonzero(logits) == 0
+
+
+def test_checkpoint_loader_pairs_fp8_weights_with_inverse_scales(
+    tiny_model, monkeypatch, tmp_path
+) -> None:
+    import hydraserve.model.runtime as runtime_module
+
+    raw = make_weights(tiny_model)
+    name = f"{layer_prefix(0)}.linear_attn.in_proj_qkv.weight"
+    source = raw[name]
+    scale = source.abs().max().clamp_min(1e-6) / 448.0
+    raw[name] = (source / scale).to(torch.float8_e4m3fn)
+    raw[f"{name}_scale_inv"] = scale.reshape(1, 1)
+
+    class FakeLoader:
+        def __init__(self, _):
+            pass
+
+        def keys(self, prefix=None):
+            return tuple(
+                sorted(key for key in raw if prefix is None or key.startswith(prefix))
+            )
+
+        def __contains__(self, key):
+            return key in raw
+
+        def tensor(self, key, *, device="cpu", dtype=None):
+            value = raw[key]
+            if dtype is not None:
+                value = value.to(dtype=dtype)
+            return value.to(device=device)
+
+        def tensor_shape(self, key):
+            return tuple(raw[key].shape)
+
+    monkeypatch.setattr(runtime_module, "load_model_config", lambda _: tiny_model)
+    monkeypatch.setattr(runtime_module, "ShardedSafeTensorLoader", FakeLoader)
+    runtime = QwenTextRuntime.from_checkpoint(
+        tmp_path,
+        device="cpu",
+        dtype=torch.float32,
+        use_triton=False,
+        use_flash_attention=False,
+    )
+
+    assert isinstance(runtime.weights[name], BlockScaledFP8Weight)
+    assert runtime.weights[name].data.dtype == torch.float8_e4m3fn
+    logits, state = runtime.forward(torch.tensor([[1, 2, 3]]))
+    assert logits.shape == (1, 3, tiny_model.vocab_size)
+    assert state.sequence_length == 3
 
 
 def test_chunked_prefill_with_paged_history_matches_whole_prefill(tiny_model) -> None:
