@@ -124,6 +124,10 @@ python -m hydraserve benchmark \
 冷启动烟测已打通 collocated 与 PD；这种短 prompt 小样本中 PD 更慢，不能作为
 crossover 或吞吐结论。
 
+runner 支持 `--warmup` 排除首次 kernel 编译，并支持 `burst`、固定速率和 seeded
+Poisson arrival trace。常驻 PD coordinator 会异步等待 GPU0 prefill，让 GPU1 继续
+推进已有 decode；GPU1 安装新请求的重算阶段仍需与 decode 串行。
+
 ## 代码结构
 
 ```text

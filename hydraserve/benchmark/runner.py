@@ -5,7 +5,8 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from math import ceil
-from time import perf_counter
+from random import Random
+from time import perf_counter, sleep
 from typing import Iterable
 
 from hydraserve.benchmark.datasets import BenchmarkSample
@@ -31,6 +32,9 @@ class BenchmarkSummary:
     wall_time_s: float
     request_throughput: float
     output_token_throughput: float
+    warmup_requests: int
+    offered_request_rate: float | None
+    arrival_pattern: str
     ttft_ms: dict[str, float]
     tpot_ms: dict[str, float]
     latency_ms: dict[str, float]
@@ -44,6 +48,9 @@ class BenchmarkSummary:
             "wall_time_s": self.wall_time_s,
             "request_throughput": self.request_throughput,
             "output_token_throughput": self.output_token_throughput,
+            "warmup_requests": self.warmup_requests,
+            "offered_request_rate": self.offered_request_rate,
+            "arrival_pattern": self.arrival_pattern,
             "ttft_ms": self.ttft_ms,
             "tpot_ms": self.tpot_ms,
             "latency_ms": self.latency_ms,
@@ -78,18 +85,47 @@ def run_benchmark(
     max_new_tokens: int = 32,
     concurrency: int = 1,
     max_prompt_tokens: int | None = None,
+    warmup_requests: int = 0,
+    request_rate: float | None = None,
+    arrival_pattern: str = "burst",
+    seed: int = 0,
 ) -> BenchmarkSummary:
     if max_new_tokens <= 0 or concurrency <= 0:
         raise ValueError("max_new_tokens and concurrency must be positive")
     if max_prompt_tokens is not None and max_prompt_tokens <= 0:
         raise ValueError("max_prompt_tokens must be positive")
-    indexed = tuple(enumerate(samples))
+    if warmup_requests < 0:
+        raise ValueError("warmup_requests must be non-negative")
+    if request_rate is not None and request_rate <= 0:
+        raise ValueError("request_rate must be positive")
+    if arrival_pattern not in {"burst", "fixed", "poisson"}:
+        raise ValueError("arrival_pattern must be burst, fixed, or poisson")
+    if arrival_pattern != "burst" and request_rate is None:
+        raise ValueError("fixed/poisson arrivals require request_rate")
+    all_samples = tuple(samples)
+    warmups = all_samples[:warmup_requests]
+    indexed = tuple(enumerate(all_samples[warmup_requests:]))
 
-    def run_one(item) -> tuple[int, RequestMetrics]:
-        index, sample = item
+    def encode(sample: BenchmarkSample):
         token_ids = tokenizer.encode(sample.prompt)
         if max_prompt_tokens is not None and len(token_ids) > max_prompt_tokens:
             token_ids = token_ids[-max_prompt_tokens:]
+        return token_ids
+
+    for sample in warmups:
+        handle = generation_loop.submit(encode(sample), max_new_tokens)
+        terminal = None
+        for terminal in handle:
+            pass
+        if terminal is None or terminal.error:
+            raise RuntimeError(
+                f"warmup request {sample.sample_id} failed: "
+                f"{None if terminal is None else terminal.error}"
+            )
+
+    def run_one(item) -> tuple[int, RequestMetrics]:
+        index, sample = item
+        token_ids = encode(sample)
         started = perf_counter()
         first_token_at = None
         completion_tokens = 0
@@ -125,10 +161,28 @@ def run_benchmark(
             error,
         )
 
+    offsets: list[float] = []
+    if arrival_pattern == "burst":
+        offsets = [0.0] * len(indexed)
+    elif arrival_pattern == "fixed":
+        offsets = [index / request_rate for index in range(len(indexed))]
+    else:
+        random = Random(seed)
+        elapsed = 0.0
+        for index in range(len(indexed)):
+            if index:
+                elapsed += random.expovariate(request_rate)
+            offsets.append(elapsed)
+
     wall_started = perf_counter()
     ordered_results: list[RequestMetrics | None] = [None] * len(indexed)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
-        futures = [executor.submit(run_one, item) for item in indexed]
+        futures = []
+        for item, offset in zip(indexed, offsets, strict=True):
+            delay = wall_started + offset - perf_counter()
+            if delay > 0:
+                sleep(delay)
+            futures.append(executor.submit(run_one, item))
         for future in as_completed(futures):
             index, result = future.result()
             ordered_results[index] = result
@@ -143,6 +197,9 @@ def run_benchmark(
         wall_time_s=wall_time,
         request_throughput=len(succeeded) / divisor,
         output_token_throughput=sum(result.completion_tokens for result in succeeded) / divisor,
+        warmup_requests=len(warmups),
+        offered_request_rate=request_rate,
+        arrival_pattern=arrival_pattern,
         ttft_ms=_percentiles(
             result.ttft_ms for result in succeeded if result.ttft_ms is not None
         ),

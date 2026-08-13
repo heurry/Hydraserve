@@ -111,6 +111,25 @@ real persistent two-GPU PD regression still passes.
 
 Next implementation slice:
 
-1. full B-vs-D dataset experiments with warmup and controlled arrival traces;
+## 2026-08-13 — reproducible arrivals and P/D overlap
+
+Implemented:
+
+- excluded warmup requests;
+- burst, fixed-rate, and reproducibly seeded Poisson arrivals;
+- asynchronous PD admission so waiting for GPU0 prefill does not pause active
+  GPU1 decode;
+- serialized GPU1 prepare/decode/release RPCs to keep one response stream safe.
+
+Small controlled result (Qwen3.5-4B, GSM8K, 2 warmup + 8 measured, burst C=4,
+8 output tokens): collocated output throughput 58.58 tok/s, P50 TTFT 171.17 ms,
+P50 TPOT 49.45 ms; PARTIAL PD 22.65 tok/s, 679.81 ms, and 67.85 ms. The short
+prompt workload is below crossover. Async overlap improved PD from 21.09 to
+22.65 tok/s and P50 TPOT from 108.94 to 67.85 ms versus the earlier serialized
+coordinator, but does not offset state transfer plus KV recomputation.
+
+Next implementation slice:
+
+1. broaden B-vs-D across prompt lengths, concurrency, and arrival rates;
 2. 9B/27B runtime validation;
 3. P2P/NVLink validation on capable hardware.

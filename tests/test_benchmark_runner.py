@@ -37,16 +37,18 @@ def test_benchmark_collects_concurrent_latency_and_throughput() -> None:
         max_new_tokens=3,
         concurrency=3,
         max_prompt_tokens=5,
+        warmup_requests=1,
     )
     loop.close()
-    assert summary.requests == summary.succeeded == 6
+    assert summary.requests == summary.succeeded == 5
     assert summary.failed == 0
     assert all(result.prompt_tokens == 5 for result in summary.results)
     assert all(result.completion_tokens == 3 for result in summary.results)
     assert set(summary.ttft_ms) == {"p50", "p95", "p99"}
     assert set(summary.tpot_ms) == {"p50", "p95", "p99"}
     assert summary.output_token_throughput > 0
-    assert summary.to_dict()["results"][0]["sample_id"] == "0"
+    assert summary.warmup_requests == 1
+    assert summary.to_dict()["results"][0]["sample_id"] == "1"
     assert backend.live == set()
 
 
@@ -67,3 +69,37 @@ def test_benchmark_records_request_error() -> None:
     assert summary.failed == 1
     assert summary.ttft_ms == {}
     assert summary.results[0].error == "cannot prefill"
+
+
+def test_fixed_and_seeded_poisson_arrival_configuration() -> None:
+    samples = [BenchmarkSample("toy", str(index), "x") for index in range(3)]
+    for pattern in ("fixed", "poisson"):
+        loop = ContinuousGenerationLoop(Backend())
+        summary = run_benchmark(
+            loop,
+            Tokenizer(),
+            samples,
+            max_new_tokens=1,
+            concurrency=2,
+            request_rate=1000,
+            arrival_pattern=pattern,
+            seed=7,
+        )
+        loop.close()
+        assert summary.succeeded == 3
+        assert summary.arrival_pattern == pattern
+        assert summary.offered_request_rate == 1000
+
+
+def test_arrival_configuration_validation() -> None:
+    import pytest
+
+    loop = ContinuousGenerationLoop(Backend())
+    with pytest.raises(ValueError, match="require request_rate"):
+        run_benchmark(
+            loop,
+            Tokenizer(),
+            [],
+            arrival_pattern="fixed",
+        )
+    loop.close()

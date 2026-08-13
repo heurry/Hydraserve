@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import multiprocessing as mp
 from queue import Empty
+from threading import Lock
 from uuid import uuid4
 
 from hydraserve.engine.serving_loop import ServingRequest
@@ -225,6 +226,7 @@ class DisaggregatedGenerationBackend:
         if min(config.cache_tokens, config.block_size, config.prefill_chunk_size) <= 0:
             raise ValueError("cache limits must be positive")
         self.config = config
+        self.supports_async_prefill = True
         self.operation_timeout = operation_timeout
         self.namespace = f"hydraserve-pd-{uuid4().hex}"
         context = mp.get_context("spawn")
@@ -243,6 +245,7 @@ class DisaggregatedGenerationBackend:
             name="hydraserve-decode",
         )
         self._closed = False
+        self._decode_lock = Lock()
         self._decode.start()
         self._prefill.start()
         try:
@@ -267,14 +270,15 @@ class DisaggregatedGenerationBackend:
         self._prefill_commands.put(command)
         result = self._get(self._prefill_responses, self.operation_timeout)
         self._check(result, "prefill", request.request_id)
-        self._decode_commands.put(
-            {
-                **command,
-                "op": "prepare",
-                "timeout": self.operation_timeout,
-            }
-        )
-        prepared = self._get(self._decode_responses, self.operation_timeout)
+        with self._decode_lock:
+            self._decode_commands.put(
+                {
+                    **command,
+                    "op": "prepare",
+                    "timeout": self.operation_timeout,
+                }
+            )
+            prepared = self._get(self._decode_responses, self.operation_timeout)
         self._check(prepared, "prepare", request.request_id)
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
@@ -282,8 +286,9 @@ class DisaggregatedGenerationBackend:
 
     def decode(self, requests: tuple[ServingRequest, ...]) -> tuple[int, ...]:
         request_ids = tuple(request.request_id for request in requests)
-        self._decode_commands.put({"op": "decode", "request_ids": request_ids})
-        result = self._get(self._decode_responses, self.operation_timeout)
+        with self._decode_lock:
+            self._decode_commands.put({"op": "decode", "request_ids": request_ids})
+            result = self._get(self._decode_responses, self.operation_timeout)
         self._check(result, "decode")
         if tuple(result["request_ids"]) != request_ids:
             raise RuntimeError("decode worker returned a different request batch")
@@ -292,8 +297,9 @@ class DisaggregatedGenerationBackend:
     def release(self, request_id: int) -> None:
         if self._closed:
             return
-        self._decode_commands.put({"op": "release", "request_id": request_id})
-        result = self._get(self._decode_responses, self.operation_timeout)
+        with self._decode_lock:
+            self._decode_commands.put({"op": "release", "request_id": request_id})
+            result = self._get(self._decode_responses, self.operation_timeout)
         self._check(result, "release", request_id)
 
     def close(self, *, force: bool = False) -> None:

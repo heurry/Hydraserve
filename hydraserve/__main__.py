@@ -52,6 +52,12 @@ def main() -> int:
     benchmark_parser.add_argument("--max-new-tokens", type=int, default=32)
     benchmark_parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
+    benchmark_parser.add_argument("--warmup", type=int, default=0)
+    benchmark_parser.add_argument("--request-rate", type=float)
+    benchmark_parser.add_argument(
+        "--arrival-pattern", choices=("burst", "fixed", "poisson"), default="burst"
+    )
+    benchmark_parser.add_argument("--seed", type=int, default=0)
     benchmark_parser.add_argument("--device", default="cuda:0")
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
     benchmark_parser.add_argument("--pd", action="store_true")
@@ -197,7 +203,7 @@ def main() -> int:
                 args.datasets,
                 args.dataset,
                 subset=args.subset,
-                limit=args.limit,
+                limit=args.limit + args.warmup,
             )
             summary = run_benchmark(
                 loop,
@@ -206,6 +212,10 @@ def main() -> int:
                 max_new_tokens=args.max_new_tokens,
                 concurrency=args.concurrency,
                 max_prompt_tokens=args.max_prompt_tokens,
+                warmup_requests=args.warmup,
+                request_rate=args.request_rate,
+                arrival_pattern=args.arrival_pattern,
+                seed=args.seed,
             )
         finally:
             loop.close()

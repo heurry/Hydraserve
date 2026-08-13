@@ -440,6 +440,7 @@ KV 重算约为 prefill 的 25%，随上下文线性增长。
 | INT4 精度 | 4B BF16 | 实测（PPL +0.74） |
 | MPS intra-GPU | 4B BF16 | 实测（decode 2.5x 减速） |
 | 27B FP8 vLLM TP=2 | 27B FP8 | 实测（TTFT/TPOT/并发） |
+| HydraServe 4B GSM8K C=4 | 4B BF16 | 2 warmup + 8 measured：collocated 58.58 tok/s；PARTIAL PD 22.65 tok/s，未 crossover |
 
 ### 7.3 待实测数据
 

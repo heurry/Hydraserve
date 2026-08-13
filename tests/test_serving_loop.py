@@ -126,3 +126,49 @@ def test_prefill_failure_does_not_kill_loop() -> None:
     assert _collect(failed)[-1].finish_reason == "error"
     assert [event.token_id for event in _collect(healthy)[:-1]] == [5]
     loop.close()
+
+
+def test_disaggregated_prefill_overlaps_active_decode() -> None:
+    first_decode_entered = Event()
+    allow_first_decode = Event()
+    second_prefill_entered = Event()
+    allow_second_prefill = Event()
+
+    class AsyncBackend(FakeBackend):
+        supports_async_prefill = True
+
+        def __init__(self):
+            super().__init__()
+            self.decode_calls = 0
+
+        def prefill(self, request):
+            if request.token_ids == (20,):
+                second_prefill_entered.set()
+                assert allow_second_prefill.wait(2)
+            return super().prefill(request)
+
+        def decode(self, requests):
+            self.decode_calls += 1
+            if self.decode_calls == 1:
+                first_decode_entered.set()
+                assert allow_first_decode.wait(2)
+            elif self.decode_calls == 2:
+                assert second_prefill_entered.wait(2)
+            result = super().decode(requests)
+            if second_prefill_entered.is_set():
+                allow_second_prefill.set()
+            return result
+
+    backend = AsyncBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    first = loop.submit([1], max_new_tokens=4)
+    assert first.get(timeout=2).token_id == 2
+    assert first_decode_entered.wait(2)
+    second = loop.submit([20], max_new_tokens=2)
+    allow_first_decode.set()
+    first_events = list(first)
+    second_events = list(second)
+    loop.close()
+    assert second_prefill_entered.is_set()
+    assert [event.token_id for event in first_events[:-1]] == [3, 4, 5]
+    assert [event.token_id for event in second_events[:-1]] == [21, 22]

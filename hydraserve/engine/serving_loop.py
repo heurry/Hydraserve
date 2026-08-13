@@ -8,6 +8,7 @@ and batch lifecycle.
 from __future__ import annotations
 
 from collections import OrderedDict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from itertools import count
 from queue import Empty, Queue
@@ -144,8 +145,31 @@ class ContinuousGenerationLoop:
     def _run(self) -> None:
         active: OrderedDict[int, ServingRequest] = OrderedDict()
         try:
+            if getattr(self.backend, "supports_async_prefill", False):
+                self._run_disaggregated(active)
+            else:
+                while not self._stop.is_set():
+                    did_work = self._admit(active)
+                    did_work = self._remove_cancelled(active) or did_work
+                    if active:
+                        self._decode_once(active)
+                        did_work = True
+                    if not did_work:
+                        self._wake.wait(self.idle_wait_s)
+                        self._wake.clear()
+        finally:
+            self._cancel_incoming()
+            for request in tuple(active.values()):
+                self._finish(request, "cancelled", active=active, release=True)
+
+    def _run_disaggregated(
+        self, active: OrderedDict[int, ServingRequest]
+    ) -> None:
+        pending: OrderedDict[int, tuple[ServingRequest, Future]] = OrderedDict()
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hydraserve-prefill") as executor:
             while not self._stop.is_set():
-                did_work = self._admit(active)
+                did_work = self._submit_async_prefill(active, pending, executor)
+                did_work = self._collect_async_prefill(active, pending) or did_work
                 did_work = self._remove_cancelled(active) or did_work
                 if active:
                     self._decode_once(active)
@@ -153,10 +177,54 @@ class ContinuousGenerationLoop:
                 if not did_work:
                     self._wake.wait(self.idle_wait_s)
                     self._wake.clear()
-        finally:
-            self._cancel_incoming()
-            for request in tuple(active.values()):
-                self._finish(request, "cancelled", active=active, release=True)
+            for request, _ in pending.values():
+                request.cancelled.set()
+            while pending:
+                self._collect_async_prefill(active, pending, wait=True)
+
+    def _submit_async_prefill(self, active, pending, executor) -> bool:
+        did_work = False
+        available_slots = self.max_batch_size - len(active) - len(pending)
+        for _ in range(available_slots):
+            try:
+                request, _ = self._incoming.get_nowait()
+            except Empty:
+                break
+            did_work = True
+            if request.cancelled.is_set():
+                self._finish(request, "cancelled", active=active, release=False)
+                continue
+            pending[request.request_id] = (
+                request,
+                executor.submit(self.backend.prefill, request),
+            )
+        return did_work
+
+    def _collect_async_prefill(self, active, pending, *, wait: bool = False) -> bool:
+        completed = []
+        for request_id, (_, future) in pending.items():
+            if wait or future.done():
+                completed.append(request_id)
+                if wait:
+                    # Resolve in admission order during shutdown.
+                    break
+        for request_id in completed:
+            request, future = pending.pop(request_id)
+            try:
+                token_id = int(future.result())
+                if request.cancelled.is_set() or self._stop.is_set():
+                    self._finish(request, "cancelled", active=active, release=True)
+                    continue
+                request.generated_token_ids.append(token_id)
+                self._emit(request, token_id)
+                reason = self._finish_reason(request, token_id)
+                if reason is not None:
+                    self._finish(request, reason, active=active, release=True)
+                else:
+                    active[request.request_id] = request
+            except Exception as exc:
+                self._fail(request, exc, active=active, release=True)
+        return bool(completed)
 
     def _admit(self, active: OrderedDict[int, ServingRequest]) -> bool:
         did_work = False
