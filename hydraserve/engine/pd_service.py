@@ -533,6 +533,7 @@ class DisaggregatedGenerationBackend:
     def _reserve_decode(
         self, request: ServingRequest, *, force_rpc: bool = False
     ) -> AdmissionDecision:
+        initial_capacity = self.capacity()
         total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
         required_blocks = (total_tokens + self.config.block_size - 1) // self.config.block_size
         command = {
@@ -552,6 +553,11 @@ class DisaggregatedGenerationBackend:
             if result.get("admitted"):
                 self._admitted_requests.add(request.request_id)
                 self._reserved_blocks[request.request_id] = required_blocks
+                if request.route is None:
+                    request.route = Route.PD_DISAGGREGATED.value
+                    request.route_reason = "fixed_pd"
+                    request.worker_id = 0
+                    request.route_decode_load = initial_capacity.decode_load
                 return AdmissionDecision.accept()
             if result.get("retryable"):
                 return AdmissionDecision.defer(
@@ -785,6 +791,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 request.route_pd_cost_ms = bound.pd_cost_ms
                 request.route_estimated_savings_ms = bound.estimated_savings_ms
                 request.route_cost_confidence = bound.cost_model_confidence
+                request.route_decode_load = bound.decode_load
         return admitted
 
     def prefill(self, request: ServingRequest) -> int | TokenSample:

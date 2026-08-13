@@ -118,6 +118,7 @@ class ServingRequest:
     route_pd_cost_ms: float | None = None
     route_estimated_savings_ms: float | None = None
     route_cost_confidence: float | None = None
+    route_decode_load: float | None = None
     worker_id: int | None = None
     priority: int = 0
     admission_age: int = 0
@@ -689,6 +690,7 @@ class RuntimeGenerationBackend:
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
         manager = self.paged_cache.block_manager
+        initial_capacity = self.capacity()
         total_tokens = self._total_kv_tokens(request)
         required = manager.blocks_required(total_tokens)
         if required > manager.num_blocks:
@@ -740,6 +742,11 @@ class RuntimeGenerationBackend:
             except Exception:
                 self.state_slots.free(request.request_id)
                 raise
+            if request.route is None:
+                request.route = "collocated"
+                request.route_reason = "fixed_collocated"
+                request.worker_id = 0
+                request.route_decode_load = initial_capacity.decode_load
             return AdmissionDecision.accept()
 
     def prefill(self, request: ServingRequest) -> TokenSample:

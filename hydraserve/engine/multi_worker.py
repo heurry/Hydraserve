@@ -268,6 +268,7 @@ class MultiWorkerGenerationBackend:
                 request.route_pd_cost_ms = decision.pd_cost_ms
                 request.route_estimated_savings_ms = decision.estimated_savings_ms
                 request.route_cost_confidence = decision.cost_model_confidence
+                request.route_decode_load = decision.decode_load
             return AdmissionDecision.accept()
         return AdmissionDecision.defer(
             last_retryable or "all decode workers rejected the reservation"

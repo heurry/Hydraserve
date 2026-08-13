@@ -64,6 +64,23 @@ distinct lengths (26–9,000 tokens). The nonnegative quadratic fits achieved
 error on the small calibration set, not prediction error on an independent
 holdout.
 
+A second C4 run persisted admission decode load for all requests. Fitting those
+loaded samples separately from the C1 base curves yielded
+`decode_load_scale=1.08` collocated and `1.83` partial PD. With 18 observations
+per route, collocated RMSE was 58.22 ms and partial-PD RMSE was 246.30 ms. The
+large PD residual is a negative diagnostic result: requests at the same 0.75
+decode load still had materially different TTFT because the current feature set
+does not encode serial prefill queue position. The route model therefore uses a
+risk margin, hysteresis and drift fail-closed behavior rather than treating this
+one-dimensional load fit as exact.
+
+A final real adaptive gate used the checked-in profile on 8 GSM8K requests at
+C4 with 8 output tokens. It completed 8/8 at 7.79 request/s and 62.31 output
+token/s. All short prompts were conservatively collocated; each result recorded
+worker 0 and its admission load (0.0, 0.25, 0.5, or 0.75). This run validates
+route metadata and load capture, not a comparison with the earlier 16-output-
+token throughput matrix.
+
 ## OOM found and fixed
 
 The first 9K adaptive run failed 0/2 on the decode worker with an attempted

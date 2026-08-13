@@ -70,7 +70,16 @@ class _Handler(BaseHTTPRequestHandler):
                         "pd_observations": costs.pd_observations,
                         "collocated_correction": costs.collocated_correction,
                         "pd_correction": costs.pd_correction,
+                        "collocated_drifted_buckets": list(
+                            costs.collocated_drifted_buckets
+                        ),
+                        "pd_drifted_buckets": list(costs.pd_drifted_buckets),
                     }
+                    if (
+                        costs.collocated_drifted_buckets
+                        or costs.pd_drifted_buckets
+                    ):
+                        payload["status"] = "degraded"
             self._json(200, payload)
             return
         if self.path == "/metrics":
@@ -533,6 +542,11 @@ class _Handler(BaseHTTPRequestHandler):
                         f"{stats.collocated_correction}",
                         'hydraserve_route_cost_correction_ratio{route="pd_disaggregated"} '
                         f"{stats.pd_correction}",
+                        "# TYPE hydraserve_route_cost_profile_drift gauge",
+                        'hydraserve_route_cost_profile_drift{route="collocated"} '
+                        f"{1 if stats.collocated_drifted_buckets else 0}",
+                        'hydraserve_route_cost_profile_drift{route="pd_disaggregated"} '
+                        f"{1 if stats.pd_drifted_buckets else 0}",
                     ]
                 )
         recovery_stats = getattr(backend, "recovery_stats", None)

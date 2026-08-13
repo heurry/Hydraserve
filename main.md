@@ -198,7 +198,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 容量预留、批量原子增长、共享页引用计数/写保护/压力淘汰、batched Triton scatter 与 tiled online-softmax 完成 |
 | Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | layer-major 连续 GPU pool、显存预算化保证容量、decode 原地事务提交完成 |
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 策略与真实 Paged KV 页生命周期、worker affinity 探测完成；GDN 不缓存 |
-| Adaptive Router | CPU | Collocated vs PD 路由 | 成本曲线、收益/风险门禁、在线分桶 EWMA、profile 配置、不可变 route binding、1P+ND 容量/缓存/拓扑评分、跨 worker 并行 decode、worker 自动摘流/重启/握手完成；N>1 实机待验证 |
+| Adaptive Router | CPU | Collocated vs PD 路由 | 成本曲线、decode-load 一阶外部性、收益/风险/迟滞门禁、在线分桶 EWMA 与漂移回退、profile 配置、不可变 route binding、1P+ND 容量/缓存/拓扑评分、跨 worker 并行 decode、worker 自动摘流/重启/握手完成；prefill queue 特征与 N>1 实机待验证 |
 | ModelAdapter | both | 多模型适配 | 动态 config + 4B 真实 runtime smoke 完成 |
 | API Server | CPU | OpenAI-compatible | completions/chat/SSE、完整单 choice 采样参数、stop 隐藏、logprobs、流式 usage + collocated/PD 常驻模式完成；tools/多 choice 未实现并显式拒绝 |
 

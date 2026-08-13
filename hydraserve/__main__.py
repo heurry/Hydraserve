@@ -42,6 +42,13 @@ def main() -> int:
         "--pd-uncertainty-multiplier", type=float, default=1.10
     )
     fit_router_parser.add_argument("--ewma-alpha", type=float, default=0.2)
+    fit_router_parser.add_argument("--hysteresis-ms", type=float, default=5.0)
+    fit_router_parser.add_argument("--hysteresis-ratio", type=float, default=0.02)
+    fit_router_parser.add_argument("--drift-ratio-threshold", type=float, default=1.5)
+    fit_router_parser.add_argument("--drift-min-observations", type=int, default=5)
+    fit_router_parser.add_argument(
+        "--allow-routing-during-drift", action="store_true"
+    )
     fit_router_parser.add_argument("--output", type=Path)
     serve_parser = subparsers.add_parser(
         "serve", help="run the HydraServe OpenAI-compatible HTTP server"
@@ -116,6 +123,11 @@ def main() -> int:
                 minimum_savings_ratio=args.minimum_savings_ratio,
                 pd_uncertainty_multiplier=args.pd_uncertainty_multiplier,
                 ewma_alpha=args.ewma_alpha,
+                hysteresis_ms=args.hysteresis_ms,
+                hysteresis_ratio=args.hysteresis_ratio,
+                drift_ratio_threshold=args.drift_ratio_threshold,
+                drift_min_observations=args.drift_min_observations,
+                fail_closed_on_drift=not args.allow_routing_during_drift,
             )
             CostRouterConfig.from_dict(profile)
         except (OSError, ValueError) as exc:

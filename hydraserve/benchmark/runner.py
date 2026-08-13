@@ -29,6 +29,7 @@ class RequestMetrics:
     route_pd_cost_ms: float | None = None
     route_estimated_savings_ms: float | None = None
     route_cost_confidence: float | None = None
+    route_decode_load: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +177,7 @@ def run_benchmark(
             None if handle is None else handle.request.route_pd_cost_ms,
             None if handle is None else handle.request.route_estimated_savings_ms,
             None if handle is None else handle.request.route_cost_confidence,
+            None if handle is None else handle.request.route_decode_load,
         )
 
     offsets: list[float] = []

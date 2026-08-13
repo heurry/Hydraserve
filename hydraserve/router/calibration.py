@@ -18,9 +18,15 @@ from hydraserve.router.adaptive_router import LatencyCurve
 class CalibrationPoint:
     prompt_tokens: int
     ttft_ms: float
+    decode_load: float = 0.0
 
     def __post_init__(self) -> None:
-        if self.prompt_tokens <= 0 or self.ttft_ms <= 0 or not isfinite(self.ttft_ms):
+        if (
+            self.prompt_tokens <= 0
+            or self.ttft_ms <= 0
+            or not isfinite(self.ttft_ms)
+            or not 0 <= self.decode_load <= 1
+        ):
             raise ValueError("calibration points require positive finite values")
 
 
@@ -31,6 +37,7 @@ class CurveFitDiagnostics:
     minimum_prompt_tokens: int
     maximum_prompt_tokens: int
     rmse_ms: float
+    loaded_samples: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,7 +60,9 @@ def load_calibration_points(paths: Iterable[str | Path]) -> tuple[CalibrationPoi
                 continue
             try:
                 point = CalibrationPoint(
-                    int(result["prompt_tokens"]), float(result["ttft_ms"])
+                    int(result["prompt_tokens"]),
+                    float(result["ttft_ms"]),
+                    float(result.get("route_decode_load") or 0.0),
                 )
             except (KeyError, TypeError, ValueError) as exc:
                 raise ValueError(f"invalid benchmark result in {path}: {exc}") from exc
@@ -65,11 +74,16 @@ def load_calibration_points(paths: Iterable[str | Path]) -> tuple[CalibrationPoi
 
 def fit_latency_curve(points: Iterable[CalibrationPoint]) -> FittedLatencyCurve:
     values = tuple(points)
-    lengths = np.asarray([point.prompt_tokens for point in values], dtype=np.float64)
-    latency = np.asarray([point.ttft_ms for point in values], dtype=np.float64)
+    baseline_values = tuple(point for point in values if point.decode_load <= 0.05)
+    lengths = np.asarray(
+        [point.prompt_tokens for point in baseline_values], dtype=np.float64
+    )
+    latency = np.asarray([point.ttft_ms for point in baseline_values], dtype=np.float64)
     unique_lengths = np.unique(lengths)
     if unique_lengths.size < 3:
-        raise ValueError("latency fitting requires at least three distinct prompt lengths")
+        raise ValueError(
+            "latency fitting requires at least three distinct low-load prompt lengths"
+        )
 
     scale = float(lengths.max())
     normalized = lengths / scale
@@ -78,20 +92,33 @@ def fit_latency_curve(points: Iterable[CalibrationPoint]) -> FittedLatencyCurve:
     )
     coefficients, predictions = _nonnegative_least_squares(design, latency)
     fixed, normalized_linear, normalized_quadratic = coefficients
-    curve = LatencyCurve(
+    base_curve = LatencyCurve(
         fixed_ms=float(fixed),
         linear_ms_per_token=float(normalized_linear / scale),
         quadratic_ms_per_token2=float(normalized_quadratic / (scale * scale)),
     )
-    rmse = float(np.sqrt(np.mean(np.square(predictions - latency))))
+    loaded_values = tuple(point for point in values if point.decode_load > 0.05)
+    load_scale = _fit_decode_load_scale(base_curve, loaded_values)
+    curve = LatencyCurve(
+        base_curve.fixed_ms,
+        base_curve.linear_ms_per_token,
+        base_curve.quadratic_ms_per_token2,
+        load_scale,
+    )
+    all_predictions = np.asarray(
+        [curve.predict(point.prompt_tokens, point.decode_load) for point in values]
+    )
+    all_latency = np.asarray([point.ttft_ms for point in values])
+    rmse = float(np.sqrt(np.mean(np.square(all_predictions - all_latency))))
     return FittedLatencyCurve(
         curve,
         CurveFitDiagnostics(
             samples=len(values),
             unique_prompt_lengths=int(unique_lengths.size),
-            minimum_prompt_tokens=int(lengths.min()),
-            maximum_prompt_tokens=int(lengths.max()),
+            minimum_prompt_tokens=min(point.prompt_tokens for point in values),
+            maximum_prompt_tokens=max(point.prompt_tokens for point in values),
             rmse_ms=rmse,
+            loaded_samples=len(loaded_values),
         ),
     )
 
@@ -105,6 +132,11 @@ def build_router_profile(
     minimum_savings_ratio: float = 0.05,
     pd_uncertainty_multiplier: float = 1.10,
     ewma_alpha: float = 0.2,
+    hysteresis_ms: float = 5.0,
+    hysteresis_ratio: float = 0.02,
+    drift_ratio_threshold: float = 1.5,
+    drift_min_observations: int = 5,
+    fail_closed_on_drift: bool = True,
 ) -> dict:
     collocated = fit_latency_curve(collocated_points)
     pd = fit_latency_curve(pd_points)
@@ -116,13 +148,21 @@ def build_router_profile(
         "minimum_savings_ratio": minimum_savings_ratio,
         "pd_uncertainty_multiplier": pd_uncertainty_multiplier,
         "ewma_alpha": ewma_alpha,
+        "hysteresis_ms": hysteresis_ms,
+        "hysteresis_ratio": hysteresis_ratio,
+        "drift_ratio_threshold": drift_ratio_threshold,
+        "drift_min_observations": drift_min_observations,
+        "fail_closed_on_drift": fail_closed_on_drift,
         "metadata": {
             "fit": {
                 "collocated": asdict(collocated.diagnostics),
                 "pd_disaggregated": asdict(pd.diagnostics),
             },
             "latency_metric": "ttft_ms",
-            "recommended_input": "concurrency-1 warmed benchmark outputs",
+            "recommended_input": (
+                "warmed C1 baselines plus optional loaded traces carrying "
+                "route_decode_load"
+            ),
         },
     }
 
@@ -152,3 +192,16 @@ def _nonnegative_least_squares(
     if best_coefficients is None or best_predictions is None:
         raise RuntimeError("nonnegative latency fit has no feasible solution")
     return best_coefficients, best_predictions
+
+
+def _fit_decode_load_scale(
+    curve: LatencyCurve, points: tuple[CalibrationPoint, ...]
+) -> float:
+    if not points:
+        return 0.0
+    estimates = []
+    for point in points:
+        baseline = curve.predict(point.prompt_tokens, 0.0)
+        estimate = (point.ttft_ms / max(baseline, 1e-6) - 1.0) / point.decode_load
+        estimates.append(max(0.0, estimate))
+    return min(10.0, float(np.median(np.asarray(estimates, dtype=np.float64))))

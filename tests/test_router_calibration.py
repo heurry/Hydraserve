@@ -30,6 +30,23 @@ def test_nonnegative_curve_fit_recovers_synthetic_latency() -> None:
     assert fitted.curve.quadratic_ms_per_token2 == pytest.approx(0.0002, rel=1e-7)
     assert fitted.diagnostics.rmse_ms < 1e-8
     assert fitted.diagnostics.unique_prompt_lengths == 4
+    assert fitted.diagnostics.loaded_samples == 0
+
+
+def test_curve_fit_separates_decode_load_externality() -> None:
+    baseline = _points(20, 0.1, 0.0001)
+    loaded = tuple(
+        CalibrationPoint(
+            point.prompt_tokens,
+            point.ttft_ms * 1.5,
+            0.5,
+        )
+        for point in baseline
+    )
+    fitted = fit_latency_curve((*baseline, *loaded))
+    assert fitted.curve.decode_load_scale == pytest.approx(1.0, rel=1e-7)
+    assert fitted.diagnostics.loaded_samples == 4
+    assert fitted.diagnostics.rmse_ms < 1e-8
 
 
 def test_curve_fit_requires_prompt_length_coverage() -> None:

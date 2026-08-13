@@ -23,6 +23,9 @@ class RouteReason(str, Enum):
     COST_MODEL_COLLOCATED = "cost_model_collocated"
     COST_MODEL_PD = "cost_model_pd"
     COST_MODEL_CONSERVATIVE = "cost_model_conservative"
+    COST_MODEL_HOLD_COLLOCATED = "cost_model_hold_collocated"
+    COST_MODEL_HOLD_PD = "cost_model_hold_pd"
+    COST_MODEL_DRIFT = "cost_model_drift"
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +139,11 @@ class CostRouterConfig:
     minimum_savings_ratio: float = 0.05
     pd_uncertainty_multiplier: float = 1.10
     ewma_alpha: float = 0.2
+    hysteresis_ms: float = 5.0
+    hysteresis_ratio: float = 0.02
+    drift_ratio_threshold: float = 1.5
+    drift_min_observations: int = 5
+    fail_closed_on_drift: bool = True
 
     def __post_init__(self) -> None:
         if self.minimum_pd_prompt_tokens <= 0:
@@ -148,6 +156,10 @@ class CostRouterConfig:
             raise ValueError("PD uncertainty multiplier cannot be below one")
         if not 0 < self.ewma_alpha <= 1:
             raise ValueError("EWMA alpha must be in (0, 1]")
+        if self.hysteresis_ms < 0 or not 0 <= self.hysteresis_ratio < 1:
+            raise ValueError("invalid route hysteresis")
+        if self.drift_ratio_threshold <= 1 or self.drift_min_observations <= 0:
+            raise ValueError("invalid route-profile drift policy")
 
     @classmethod
     def partial_transfer_default(cls) -> "CostRouterConfig":
@@ -159,14 +171,16 @@ class CostRouterConfig:
 
         return cls(
             collocated=LatencyCurve(
-                21.802638304077778,
-                0.7440074621754906,
-                0.00027073184949249845,
+                16.767807395778988,
+                0.775929730019134,
+                0.00026724709023354896,
+                1.0836663196165324,
             ),
             pd_disaggregated=LatencyCurve(
-                252.91923530140815,
-                0.6801430442154653,
-                0.00044979155493816183,
+                264.67172221148587,
+                0.6056289161730537,
+                0.00045792580777039157,
+                1.8343988443004484,
             ),
             minimum_pd_prompt_tokens=256,
             minimum_savings_ms=5.0,
@@ -201,6 +215,8 @@ class RouteCostStats:
     pd_observations: int
     collocated_correction: float
     pd_correction: float
+    collocated_drifted_buckets: tuple[int, ...] = ()
+    pd_drifted_buckets: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)
@@ -215,6 +231,7 @@ class CostAwareRouter:
     def __init__(self, config: CostRouterConfig | None = None) -> None:
         self.config = config or CostRouterConfig.partial_transfer_default()
         self._observations: dict[tuple[Route, int], _CostObservation] = {}
+        self._last_routes: dict[int, Route] = {}
         self._lock = RLock()
 
     @classmethod
@@ -249,14 +266,41 @@ class CostAwareRouter:
             self.config.minimum_savings_ms,
             collocated * self.config.minimum_savings_ratio,
         )
+        bucket = self._bucket(prompt_tokens)
         if not decode_has_slot:
             route, reason = Route.COLLOCATED, RouteReason.NO_DECODE_SLOT
         elif prompt_tokens < self.config.minimum_pd_prompt_tokens:
             route, reason = Route.COLLOCATED, RouteReason.COST_MODEL_CONSERVATIVE
-        elif savings >= required_savings:
-            route, reason = Route.PD_DISAGGREGATED, RouteReason.COST_MODEL_PD
         else:
-            route, reason = Route.COLLOCATED, RouteReason.COST_MODEL_COLLOCATED
+            with self._lock:
+                drifted = self._bucket_is_drifted(bucket)
+                previous = self._last_routes.get(bucket)
+                hysteresis = max(
+                    self.config.hysteresis_ms,
+                    collocated * self.config.hysteresis_ratio,
+                )
+                if drifted and self.config.fail_closed_on_drift:
+                    route, reason = Route.COLLOCATED, RouteReason.COST_MODEL_DRIFT
+                elif (
+                    previous is Route.COLLOCATED
+                    and savings >= required_savings
+                    and savings < required_savings + hysteresis
+                ):
+                    route = Route.COLLOCATED
+                    reason = RouteReason.COST_MODEL_HOLD_COLLOCATED
+                elif (
+                    previous is Route.PD_DISAGGREGATED
+                    and savings < required_savings
+                    and savings >= required_savings - hysteresis
+                ):
+                    route = Route.PD_DISAGGREGATED
+                    reason = RouteReason.COST_MODEL_HOLD_PD
+                elif savings >= required_savings:
+                    route, reason = Route.PD_DISAGGREGATED, RouteReason.COST_MODEL_PD
+                else:
+                    route = Route.COLLOCATED
+                    reason = RouteReason.COST_MODEL_COLLOCATED
+                self._last_routes[bucket] = route
         return RouteDecision(
             route,
             reason,
@@ -309,7 +353,16 @@ class CostAwareRouter:
 
             collocated = summarize(Route.COLLOCATED)
             pd = summarize(Route.PD_DISAGGREGATED)
-            return RouteCostStats(collocated[0], pd[0], collocated[1], pd[1])
+            collocated_drift = self._drifted_buckets(Route.COLLOCATED)
+            pd_drift = self._drifted_buckets(Route.PD_DISAGGREGATED)
+            return RouteCostStats(
+                collocated[0],
+                pd[0],
+                collocated[1],
+                pd[1],
+                collocated_drift,
+                pd_drift,
+            )
 
     def _predict(self, route: Route, prompt_tokens: int, decode_load: float) -> float:
         baseline = self._curve(route).predict(prompt_tokens, decode_load)
@@ -332,6 +385,29 @@ class CostAwareRouter:
         if route is Route.COLLOCATED:
             return self.config.collocated
         return self.config.pd_disaggregated
+
+    def _bucket_is_drifted(self, bucket: int) -> bool:
+        return any(self._observation_is_drifted(route, bucket) for route in Route)
+
+    def _drifted_buckets(self, route: Route) -> tuple[int, ...]:
+        return tuple(
+            sorted(
+                bucket
+                for observed_route, bucket in self._observations
+                if observed_route is route
+                and self._observation_is_drifted(route, bucket)
+            )
+        )
+
+    def _observation_is_drifted(self, route: Route, bucket: int) -> bool:
+        observation = self._observations.get((route, bucket))
+        if observation is None or observation.count < self.config.drift_min_observations:
+            return False
+        threshold = self.config.drift_ratio_threshold
+        return (
+            observation.correction > threshold
+            or observation.correction < 1.0 / threshold
+        )
 
     @staticmethod
     def _bucket(prompt_tokens: int) -> int:

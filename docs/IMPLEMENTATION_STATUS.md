@@ -248,9 +248,27 @@ Implemented:
 - fit metadata containing sample count, prompt range and RMSE;
 - direct loading of fitted profiles, including their audit metadata.
 
-The checked-in 4B/RTX-3090/SHM-PARTIAL profile was regenerated from 10
+The initial 4B/RTX-3090/SHM-PARTIAL base curves were regenerated from 10
 collocated and 10 partial-PD concurrency-1 observations spanning 9 distinct
-lengths from 26 to 9,000 tokens. RMSE is 68.02 ms for collocated and 25.67 ms
-for partial PD. Concurrency traces are intentionally not folded into these
-service-cost curves because queueing and decode interference require a separate
-tail-latency model.
+lengths from 26 to 9,000 tokens. Base-fit RMSE was 68.02 ms for collocated and
+25.67 ms for partial PD. Loaded traces are handled as a separate multiplicative
+externality rather than being folded into the base length coefficients.
+
+## 2026-08-14 — route stability and first-order load externality
+
+Implemented:
+
+- admission-time decode load persisted in every benchmark request record,
+  including fixed collocated and fixed PD calibration runs;
+- separate nonnegative `decode_load_scale` fitting on loaded traces while the
+  base length curve is fitted only from low-load samples;
+- per-prompt-bucket Schmitt-trigger hysteresis around the PD savings boundary;
+- online profile-drift detection after a configurable minimum observation count;
+- fail-closed collocated routing on drift, degraded health, and Prometheus drift
+  gauges.
+
+Adding 8 C4 observations per route produced load scales of 1.08 collocated and
+1.83 partial PD. The combined collocated RMSE improved to 58.22 ms, while
+partial-PD RMSE increased to 246.30 ms. The latter is retained as evidence that
+decode load alone is insufficient: serial prefill queue position and in-flight
+prompt work must be explicit features in the next routing model.

@@ -99,3 +99,48 @@ def test_router_profile_loads_and_rejects_incomplete_json(tmp_path) -> None:
     profile.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="missing"):
         CostAwareRouter.from_json(profile)
+
+
+def test_cost_router_hysteresis_prevents_boundary_flapping() -> None:
+    router = CostAwareRouter(
+        CostRouterConfig(
+            collocated=LatencyCurve(100, 0, decode_load_scale=1),
+            pd_disaggregated=LatencyCurve(100, 0),
+            minimum_pd_prompt_tokens=1,
+            minimum_savings_ms=1,
+            minimum_savings_ratio=0,
+            pd_uncertainty_multiplier=1,
+            hysteresis_ms=10,
+            hysteresis_ratio=0,
+        )
+    )
+    assert router.route(1024, 0) is Route.COLLOCATED
+    held_collocated = router.decide(1024, 0.05)
+    assert held_collocated.route is Route.COLLOCATED
+    assert held_collocated.reason is RouteReason.COST_MODEL_HOLD_COLLOCATED
+    assert router.route(1024, 0.2) is Route.PD_DISAGGREGATED
+    held_pd = router.decide(1024, 0.005)
+    assert held_pd.route is Route.PD_DISAGGREGATED
+    assert held_pd.reason is RouteReason.COST_MODEL_HOLD_PD
+
+
+def test_profile_drift_fails_closed_and_is_reported() -> None:
+    router = CostAwareRouter(
+        CostRouterConfig(
+            collocated=LatencyCurve(100, 0),
+            pd_disaggregated=LatencyCurve(50, 0),
+            minimum_pd_prompt_tokens=1,
+            minimum_savings_ms=1,
+            minimum_savings_ratio=0,
+            pd_uncertainty_multiplier=1,
+            ewma_alpha=1,
+            drift_ratio_threshold=1.5,
+            drift_min_observations=3,
+        )
+    )
+    for _ in range(3):
+        router.observe(Route.COLLOCATED, 1024, 200, 0)
+    decision = router.decide(1024, 0)
+    assert decision.route is Route.COLLOCATED
+    assert decision.reason is RouteReason.COST_MODEL_DRIFT
+    assert router.stats().collocated_drifted_buckets == (10,)

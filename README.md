@@ -179,8 +179,15 @@ python -m hydraserve fit-router-profile \
 ```
 
 拟合器对 fixed/linear/quadratic 系数施加非负约束，避免噪声生成随长度下降或最终变为负数
-的延迟曲线。并发结果混入排队与 interference，不应作为基础 service-cost 曲线输入；
-它们属于下一层 SLO/externality 校准。
+的延迟曲线。低负载样本拟合基础曲线；新 runner 记录 admission 时的
+`route_decode_load`，可选并发 trace 会单独拟合非负 `decode_load_scale`，不会污染基础
+长度曲线。当前只是一阶外部性模型，尚未显式表示 prefill queue/inflight 顺序。
+
+成本路由使用 Schmitt-trigger 式迟滞：从当前 route 切换需要跨过收益门槛再加迟滞带，
+减少边界附近抖动。在线 EWMA 修正连续达到 `drift_min_observations` 且偏离 profile 超过
+`drift_ratio_threshold` 时，默认 fail closed 到 collocated；`/health` 变为 degraded，
+`hydraserve_route_cost_profile_drift` 置 1。benchmark 每条结果同时记录 admission
+decode load，便于重放与重新拟合。
 
 1P+ND 使用一个 prefill worker 和多个各自持有 KV/GDN 容量的 decode worker：
 

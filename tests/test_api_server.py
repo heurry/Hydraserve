@@ -161,7 +161,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             return WorkerRecoveryStats(2, 1, 3, 1, 2, (1,))
 
         def routing_cost_stats(self):
-            return RouteCostStats(7, 3, 0.9, 1.2)
+            return RouteCostStats(7, 3, 0.9, 1.2, (5,), ())
 
     loop = ContinuousGenerationLoop(CapacityBackend())
     try:
@@ -184,6 +184,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert health["status"] == "degraded"
         assert health["decode_workers"]["recovering"] == [1]
         assert health["routing_cost_model"]["pd_observations"] == 3
+        assert health["routing_cost_model"]["collocated_drifted_buckets"] == [5]
         with urlopen(base + "/metrics", timeout=3) as response:
             metrics = response.read().decode()
         assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
@@ -198,6 +199,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             'hydraserve_route_cost_correction_ratio{route="pd_disaggregated"} 1.2'
             in metrics
         )
+        assert 'hydraserve_route_cost_profile_drift{route="collocated"} 1' in metrics
     finally:
         server.shutdown()
         server.server_close()

@@ -51,6 +51,7 @@ def test_benchmark_collects_concurrent_latency_and_throughput() -> None:
     assert summary.warmup_requests == 1
     assert summary.to_dict()["results"][0]["sample_id"] == "1"
     assert "route_estimated_savings_ms" in summary.to_dict()["results"][0]
+    assert "route_decode_load" in summary.to_dict()["results"][0]
     assert backend.live == set()
 
 
