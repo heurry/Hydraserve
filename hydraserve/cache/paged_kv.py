@@ -75,9 +75,13 @@ class PagedKVCache:
                     num_tokens if reserve_tokens is None else reserve_tokens
                 )
                 new_required = max(0, required - len(match.block_ids))
-                shortage = max(0, new_required - self.block_manager.num_free_blocks)
+                shortage = max(
+                    0, new_required - self.block_manager.num_allocatable_blocks
+                )
                 if shortage and self.prefix_cache is not None:
-                    evicted = self.prefix_cache.evict(shortage)
+                    evicted = self.prefix_cache.evict(
+                        shortage, reason="active_pressure"
+                    )
                     if evicted:
                         self.block_manager.release_blocks(evicted)
                 allocation = self.block_manager.allocate(
@@ -164,6 +168,91 @@ class PagedKVCache:
         with self._prefix_lock:
             owner = self._prefix_matches.get(request_id)
             return 0 if owner is None else owner[1].matched_tokens
+
+    def stats(self) -> dict[str, int | float]:
+        block = self.block_manager.capacity()
+        prefix = None if self.prefix_cache is None else self.prefix_cache.stats()
+        values: dict[str, int | float] = {
+            "physical_total_blocks": block.physical_total_blocks,
+            "physical_free_blocks": block.physical_free_blocks,
+            "usable_total_blocks": block.total_blocks,
+            "allocatable_free_blocks": block.free_blocks,
+            "headroom_blocks": block.headroom_blocks,
+            "allocated_blocks": block.allocated_blocks,
+            "active_allocations": block.active_allocations,
+            "allocation_block_references": block.allocation_block_references,
+            "total_references": block.total_references,
+            "shared_blocks": block.shared_blocks,
+            "logical_tokens": block.logical_tokens,
+            "reserved_tokens": block.reserved_tokens,
+            "internal_fragmentation_tokens": block.internal_fragmentation_tokens,
+            "high_watermark_blocks": block.high_watermark_blocks,
+            "allocation_failures": block.allocation_failures,
+            "prefix_cached_blocks": 0,
+            "prefix_referenced_blocks": 0,
+            "prefix_evictable_blocks": 0,
+            "prefix_cached_bytes": 0,
+            "prefix_hits": 0,
+            "prefix_misses": 0,
+            "prefix_hit_tokens": 0,
+            "prefix_admissions": 0,
+            "prefix_rejected_admissions": 0,
+            "prefix_evictions": 0,
+            "prefix_rejected_frequency": 0,
+            "prefix_rejected_capacity": 0,
+            "prefix_rejected_size": 0,
+            "prefix_rejected_length": 0,
+            "prefix_evicted_active_pressure": 0,
+            "prefix_evicted_cache_capacity": 0,
+            "prefix_evicted_manual": 0,
+        }
+        if prefix is not None:
+            rejected = dict(prefix.rejected_by_reason)
+            evicted = dict(prefix.evicted_by_reason)
+            values.update(
+                prefix_cached_blocks=prefix.cached_blocks,
+                prefix_referenced_blocks=prefix.referenced_blocks,
+                prefix_evictable_blocks=prefix.evictable_blocks,
+                prefix_cached_bytes=prefix.cached_bytes,
+                prefix_hits=prefix.hits,
+                prefix_misses=prefix.misses,
+                prefix_hit_tokens=prefix.hit_tokens,
+                prefix_admissions=prefix.admissions,
+                prefix_rejected_admissions=prefix.rejected_admissions,
+                prefix_evictions=prefix.evictions,
+                prefix_rejected_frequency=rejected.get(
+                    "prefix has not passed the frequency doorkeeper", 0
+                ),
+                prefix_rejected_capacity=rejected.get(
+                    "cache has no evictable capacity", 0
+                ),
+                prefix_rejected_size=rejected.get(
+                    "prefix would consume too much of the cache", 0
+                ),
+                prefix_rejected_length=rejected.get(
+                    "prefix is below the minimum reusable length", 0
+                ),
+                prefix_evicted_active_pressure=evicted.get("active_pressure", 0),
+                prefix_evicted_cache_capacity=evicted.get("cache_capacity", 0),
+                prefix_evicted_manual=evicted.get("manual", 0),
+            )
+        return values
+
+    def audit(self) -> dict[str, int | float]:
+        block = self.block_manager.audit()
+        prefix = None if self.prefix_cache is None else self.prefix_cache.stats()
+        prefix_owners = 0 if prefix is None else prefix.cached_blocks
+        expected_references = block.allocation_block_references + prefix_owners
+        if block.total_references != expected_references:
+            raise RuntimeError(
+                "KV reference leak: allocator references do not match request and prefix owners"
+            )
+        with self._prefix_lock:
+            for request_id, (_, match) in self._prefix_matches.items():
+                allocation = self.block_manager.get(request_id)
+                if allocation.prefix_blocks != len(match.block_ids):
+                    raise RuntimeError("KV prefix ownership metadata is inconsistent")
+        return self.stats()
 
     def write(self, request_id: int, layer_index: int, positions, key, value) -> None:
         import torch

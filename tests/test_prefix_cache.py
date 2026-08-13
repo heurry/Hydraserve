@@ -30,7 +30,12 @@ def test_referenced_prefix_is_not_evicted() -> None:
     cache.insert((1, 2, 3, 4), (20, 21))
     cache.insert((8, 9), (30,))
     match = cache.match((1, 2, 3, 4), acquire=True)
+    stats = cache.stats()
+    assert stats.referenced_blocks == 2
+    assert stats.evictable_blocks == 1
+    assert stats.hit_tokens == 4
     assert cache.evict(2) == (30,)
+    assert dict(cache.stats().evicted_by_reason) == {"manual": 1}
     cache.release((1, 2, 3, 4), match.matched_tokens)
     # Leaves are evicted from the end of a shared path; the parent becomes a
     # candidate on the next call.
@@ -69,6 +74,9 @@ def test_frequency_doorkeeper_rejects_one_hit_scan() -> None:
     stats = cache.stats()
     assert stats.rejected_admissions == 1
     assert stats.admissions == 1
+    assert dict(stats.rejected_by_reason) == {
+        "prefix has not passed the frequency doorkeeper": 1
+    }
 
 
 def test_cost_aware_eviction_returns_physical_blocks_to_reclaim() -> None:
@@ -83,6 +91,7 @@ def test_cost_aware_eviction_returns_physical_blocks_to_reclaim() -> None:
     assert cache.match((3, 4)).block_ids == (20,)
     assert cache.match((5, 6)).block_ids == (30,)
     assert cache.stats().cached_blocks == 2
+    assert dict(cache.stats().evicted_by_reason) == {"cache_capacity": 1}
 
 
 def test_capacity_rejects_when_every_victim_is_referenced() -> None:

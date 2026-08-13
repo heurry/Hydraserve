@@ -115,6 +115,12 @@ class PrefixCacheStats:
     evictions: int
     namespaces: int
     frequency_entries: int
+    referenced_blocks: int
+    evictable_blocks: int
+    cached_bytes: int
+    hit_tokens: int
+    rejected_by_reason: tuple[tuple[str, int], ...]
+    evicted_by_reason: tuple[tuple[str, int], ...]
 
 
 @dataclass(slots=True)
@@ -168,6 +174,9 @@ class PrefixCache:
         self._admissions = 0
         self._rejected_admissions = 0
         self._evictions = 0
+        self._hit_tokens = 0
+        self._rejection_reasons: dict[str, int] = {}
+        self._eviction_reasons: dict[str, int] = {}
         self._lock = RLock()
 
     def insert(
@@ -227,6 +236,7 @@ class PrefixCache:
             admitted, reason = self.policy.admit(candidate)
             if not admitted:
                 self._rejected_admissions += 1
+                self._record_rejection(reason)
                 return PrefixMatch(0, (), admitted=False, reason=reason)
 
             evicted: tuple[int, ...] = ()
@@ -236,13 +246,14 @@ class PrefixCache:
                 available = self._count_evictable(protected)
                 if required > available:
                     self._rejected_admissions += 1
+                    self._record_rejection("cache has no evictable capacity")
                     return PrefixMatch(
                         0,
                         (),
                         admitted=False,
                         reason="cache has no evictable capacity",
                     )
-                evicted = self._evict_locked(required, protected)
+                evicted = self._evict_locked(required, protected, "cache_capacity")
 
             node = root
             cost_per_block = candidate.recompute_cost_ms / full_blocks
@@ -296,6 +307,7 @@ class PrefixCache:
                 node = child
             if matched:
                 self._hits += 1
+                self._hit_tokens += len(matched) * self.block_size
                 if acquire:
                     self._adjust_references(namespace, tokens, len(matched), 1)
             else:
@@ -317,14 +329,24 @@ class PrefixCache:
                 namespace, tokens, matched_tokens // self.block_size, -1
             )
 
-    def evict(self, max_blocks: int = 1) -> tuple[int, ...]:
+    def evict(
+        self, max_blocks: int = 1, *, reason: str = "manual"
+    ) -> tuple[int, ...]:
         if max_blocks <= 0:
             raise ValueError("max_blocks must be positive")
+        if not reason:
+            raise ValueError("eviction reason cannot be empty")
         with self._lock:
-            return self._evict_locked(max_blocks, set())
+            return self._evict_locked(max_blocks, set(), reason)
 
     def stats(self) -> PrefixCacheStats:
         with self._lock:
+            nodes = [
+                node
+                for root in self._roots.values()
+                for node in self._nodes(root)
+                if node.block_id is not None
+            ]
             return PrefixCacheStats(
                 cached_blocks=self._cached_blocks,
                 hits=self._hits,
@@ -334,7 +356,17 @@ class PrefixCache:
                 evictions=self._evictions,
                 namespaces=len(self._roots),
                 frequency_entries=len(self._frequency),
+                referenced_blocks=sum(node.references > 0 for node in nodes),
+                evictable_blocks=self._count_evictable(set()),
+                cached_bytes=sum(node.bytes_per_block for node in nodes),
+                hit_tokens=self._hit_tokens,
+                rejected_by_reason=tuple(sorted(self._rejection_reasons.items())),
+                evicted_by_reason=tuple(sorted(self._eviction_reasons.items())),
             )
+
+    def _record_rejection(self, reason: str | None) -> None:
+        key = reason or "unspecified"
+        self._rejection_reasons[key] = self._rejection_reasons.get(key, 0) + 1
 
     def _record_frequency(
         self, key: tuple[CacheNamespace, tuple[int, ...]]
@@ -394,7 +426,7 @@ class PrefixCache:
             path_node.references += delta
 
     def _evict_locked(
-        self, max_blocks: int, protected: set[int]
+        self, max_blocks: int, protected: set[int], reason: str
     ) -> tuple[int, ...]:
         evicted: list[int] = []
         while len(evicted) < max_blocks:
@@ -418,6 +450,9 @@ class PrefixCache:
                 evicted.append(victim.block_id)
                 self._cached_blocks -= 1
                 self._evictions += 1
+                self._eviction_reasons[reason] = (
+                    self._eviction_reasons.get(reason, 0) + 1
+                )
             parent = victim.parent
             if parent is not None and victim.token_block is not None:
                 parent.children.pop(victim.token_block, None)
@@ -465,3 +500,10 @@ class PrefixCache:
         for child in node.children.values():
             leaves.extend(cls._leaves(child))
         return leaves
+
+    @classmethod
+    def _nodes(cls, node: _RadixNode) -> list[_RadixNode]:
+        nodes = [] if node.parent is None else [node]
+        for child in node.children.values():
+            nodes.extend(cls._nodes(child))
+        return nodes

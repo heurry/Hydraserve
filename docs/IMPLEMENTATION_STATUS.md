@@ -318,3 +318,27 @@ Deadlines are cooperative at GPU kernel boundaries because an in-flight CUDA
 kernel is not safely cancellable. Unit tests cover waiting-admission expiry,
 decode-result expiry, urgency ordering, and four active requests scheduled with
 a decode batch size of two.
+
+## 2026-08-14 — KV safety headroom, audit, and observability
+
+Implemented and validated:
+
+- configurable KV block headroom excluded from admission while remaining
+  visible as physical free capacity;
+- prefix eviction under active-request pressure that reclaims only the shortage
+  and never consumes headroom;
+- allocator high-watermark and failure counters, request/shared/reference
+  ownership, logical/reserved tokens, and internal-fragmentation statistics;
+- Prefix Cache referenced/evictable/byte/hit-token counters plus bounded reason
+  labels for admission rejection and eviction;
+- Paged KV audits reconciling free list, refcounts, request block references,
+  prefix owners and per-request prefix metadata;
+- health and Prometheus export from collocated, single-decode PD, and aggregated
+  multi-worker backends.
+
+A deterministic 2,000-operation allocator fault/transaction soak audits every
+step and ends with all 64 physical blocks and zero references. A real 4B
+collocated run with four active requests ended with 16/16 pages free, zero state
+slots and references, 14 allocatable pages plus 2 headroom, and a four-page high
+watermark. A real two-GPU PD test ended with 8/8 remote decode pages free, 6
+allocatable plus 2 headroom, and no active allocation/reference leak.

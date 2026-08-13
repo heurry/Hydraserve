@@ -37,6 +37,7 @@ class PDWorkerConfig:
     max_state_slots: int = 64
     prefix_cache_blocks: int = 0
     prefix_cache_min_frequency: int = 2
+    kv_headroom_blocks: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,7 +203,11 @@ def _decode_worker(
         revision = str(Path(config.model_dir).resolve())
         cache = PagedKVCache(
             runtime.config,
-            KVBlockManager(blocks, block_size=config.block_size),
+            KVBlockManager(
+                blocks,
+                block_size=config.block_size,
+                headroom_blocks=config.kv_headroom_blocks,
+            ),
             device=device,
             dtype=torch.bfloat16,
             prefix_cache=prefix_cache,
@@ -233,6 +238,7 @@ def _decode_worker(
                 "kv_free_blocks": capacity.free_blocks,
                 "state_total_slots": state_capacity,
                 "state_free_slots": max(0, state_capacity - live),
+                "kv_cache_stats": cache.stats(),
             }
 
         responses.put(
@@ -487,6 +493,11 @@ class DisaggregatedGenerationBackend:
             raise ValueError("cache limits must be positive")
         if config.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
+        total_blocks = (
+            config.cache_tokens + config.block_size - 1
+        ) // config.block_size
+        if not 0 <= config.kv_headroom_blocks < total_blocks:
+            raise ValueError("KV headroom must be below physical cache blocks")
         self.config = config
         self.supports_async_prefill = True
         self.operation_timeout = operation_timeout
@@ -511,6 +522,7 @@ class DisaggregatedGenerationBackend:
         self._admitted_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
         self._last_capacity: BackendCapacity | None = None
+        self._last_cache_stats: dict[str, int | float] = {}
         self._replay_mismatches = 0
         self._decode.start()
         self._prefill.start()
@@ -648,7 +660,7 @@ class DisaggregatedGenerationBackend:
                 return self._last_capacity
             total_blocks = (
                 self.config.cache_tokens + self.config.block_size - 1
-            ) // self.config.block_size
+            ) // self.config.block_size - self.config.kv_headroom_blocks
             allocated_blocks = sum(self._reserved_blocks.values())
             allocated_slots = len(self._admitted_requests)
             return BackendCapacity(
@@ -660,6 +672,10 @@ class DisaggregatedGenerationBackend:
 
     def transfer_validation_stats(self) -> TransferValidationStats:
         return TransferValidationStats(self._replay_mismatches)
+
+    def cache_stats(self) -> dict[str, int | float]:
+        with self._decode_lock:
+            return dict(self._last_cache_stats)
 
     def prefix_match_tokens(self, token_ids) -> int:
         command = {
@@ -683,6 +699,13 @@ class DisaggregatedGenerationBackend:
         )
         if all(key in result for key in keys):
             self._last_capacity = BackendCapacity(*(int(result[key]) for key in keys))
+        cache_stats = result.get("kv_cache_stats")
+        if isinstance(cache_stats, dict):
+            self._last_cache_stats = {
+                str(key): value
+                for key, value in cache_stats.items()
+                if isinstance(value, (int, float))
+            }
 
     def close(self, *, force: bool = False) -> None:
         if self._closed:

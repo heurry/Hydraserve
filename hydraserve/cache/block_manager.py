@@ -19,6 +19,18 @@ class BlockCapacity:
     free_blocks: int
     allocated_blocks: int
     block_size: int
+    physical_total_blocks: int
+    physical_free_blocks: int
+    headroom_blocks: int
+    active_allocations: int
+    allocation_block_references: int
+    total_references: int
+    shared_blocks: int
+    logical_tokens: int
+    reserved_tokens: int
+    internal_fragmentation_tokens: int
+    high_watermark_blocks: int
+    allocation_failures: int
 
     @property
     def total_tokens(self) -> int:
@@ -32,20 +44,40 @@ class BlockCapacity:
 class KVBlockManager:
     """Thread-safe allocator for paged-attention block identities."""
 
-    def __init__(self, num_blocks: int, block_size: int = 16) -> None:
+    def __init__(
+        self,
+        num_blocks: int,
+        block_size: int = 16,
+        *,
+        headroom_blocks: int = 0,
+    ) -> None:
         if num_blocks <= 0 or block_size <= 0:
             raise ValueError("num_blocks and block_size must be positive")
+        if not 0 <= headroom_blocks < num_blocks:
+            raise ValueError("headroom_blocks must be below num_blocks")
         self.num_blocks = num_blocks
         self.block_size = block_size
+        self.headroom_blocks = headroom_blocks
         self._free = list(range(num_blocks))
         self._refcounts = [0] * num_blocks
         self._allocations: dict[int, BlockAllocation] = {}
+        self._high_watermark_blocks = 0
+        self._allocation_failures = 0
         self._lock = RLock()
 
     @property
     def num_free_blocks(self) -> int:
         with self._lock:
             return len(self._free)
+
+    @property
+    def num_allocatable_blocks(self) -> int:
+        with self._lock:
+            return max(0, len(self._free) - self.headroom_blocks)
+
+    @property
+    def usable_blocks(self) -> int:
+        return self.num_blocks - self.headroom_blocks
 
     def blocks_required(self, num_tokens: int) -> int:
         if num_tokens < 0:
@@ -55,7 +87,7 @@ class KVBlockManager:
     def can_allocate(self, num_tokens: int) -> bool:
         required = self.blocks_required(num_tokens)
         with self._lock:
-            return required <= len(self._free)
+            return required <= max(0, len(self._free) - self.headroom_blocks)
 
     def allocate(
         self,
@@ -90,9 +122,12 @@ class KVBlockManager:
             new_required = required - len(prefix)
             if new_required < 0:
                 raise ValueError("prefix contains more blocks than the reservation")
-            if new_required > len(self._free):
+            allocatable = max(0, len(self._free) - self.headroom_blocks)
+            if new_required > allocatable:
+                self._allocation_failures += 1
                 raise MemoryError(
-                    f"need {new_required} KV blocks, only {len(self._free)} are free"
+                    f"need {new_required} KV blocks, only {allocatable} are allocatable "
+                    f"({self.headroom_blocks} headroom)"
                 )
             new_blocks = tuple(self._free[:new_required])
             del self._free[:new_required]
@@ -105,6 +140,7 @@ class KVBlockManager:
                 request_id, block_ids, num_tokens, reservation, len(prefix)
             )
             self._allocations[request_id] = allocation
+            self._record_high_watermark_locked()
             return allocation
 
     def reserve(self, request_id: int, total_tokens: int) -> BlockAllocation:
@@ -117,7 +153,9 @@ class KVBlockManager:
                 raise ValueError("reservation cannot be smaller than logical length")
             target_blocks = self.blocks_required(total_tokens)
             extra = max(0, target_blocks - len(current.block_ids))
-            if extra > len(self._free):
+            allocatable = max(0, len(self._free) - self.headroom_blocks)
+            if extra > allocatable:
+                self._allocation_failures += 1
                 raise MemoryError(f"need {extra} additional KV blocks")
             block_ids = current.block_ids + tuple(self._free[:extra])
             del self._free[:extra]
@@ -131,6 +169,7 @@ class KVBlockManager:
                 current.prefix_blocks,
             )
             self._allocations[request_id] = allocation
+            self._record_high_watermark_locked()
             return allocation
 
     def grow(self, request_id: int, additional_tokens: int) -> BlockAllocation:
@@ -159,10 +198,12 @@ class KVBlockManager:
                 )
                 planned.append((current, num_tokens, extra))
                 total_extra += extra
-            if total_extra > len(self._free):
+            allocatable = max(0, len(self._free) - self.headroom_blocks)
+            if total_extra > allocatable:
+                self._allocation_failures += 1
                 raise MemoryError(
                     f"decode batch needs {total_extra} additional KV blocks, "
-                    f"only {len(self._free)} are free"
+                    f"only {allocatable} are allocatable"
                 )
             cursor = 0
             results = []
@@ -183,6 +224,7 @@ class KVBlockManager:
                 for block_id in allocation.block_ids:
                     if self._refcounts[block_id] == 0:
                         self._refcounts[block_id] = 1
+            self._record_high_watermark_locked()
             return tuple(results)
 
     def truncate(self, request_id: int, num_tokens: int) -> BlockAllocation:
@@ -255,10 +297,69 @@ class KVBlockManager:
 
     def capacity(self) -> BlockCapacity:
         with self._lock:
-            free = len(self._free)
-            return BlockCapacity(
-                total_blocks=self.num_blocks,
-                free_blocks=free,
-                allocated_blocks=self.num_blocks - free,
-                block_size=self.block_size,
+            physical_free = len(self._free)
+            free = max(0, physical_free - self.headroom_blocks)
+            allocations = tuple(self._allocations.values())
+            allocation_references = sum(
+                len(allocation.block_ids) for allocation in allocations
             )
+            total_references = sum(self._refcounts)
+            reserved_tokens = sum(
+                allocation.reserved_tokens for allocation in allocations
+            )
+            allocated_blocks = self.num_blocks - physical_free
+            return BlockCapacity(
+                total_blocks=self.usable_blocks,
+                free_blocks=free,
+                allocated_blocks=allocated_blocks,
+                block_size=self.block_size,
+                physical_total_blocks=self.num_blocks,
+                physical_free_blocks=physical_free,
+                headroom_blocks=self.headroom_blocks,
+                active_allocations=len(allocations),
+                allocation_block_references=allocation_references,
+                total_references=total_references,
+                shared_blocks=sum(refcount > 1 for refcount in self._refcounts),
+                logical_tokens=sum(
+                    allocation.num_tokens for allocation in allocations
+                ),
+                reserved_tokens=reserved_tokens,
+                internal_fragmentation_tokens=(
+                    allocation_references * self.block_size - reserved_tokens
+                ),
+                high_watermark_blocks=self._high_watermark_blocks,
+                allocation_failures=self._allocation_failures,
+            )
+
+    def audit(self) -> BlockCapacity:
+        """Validate free-list, ownership, and reference-count invariants."""
+
+        with self._lock:
+            free = set(self._free)
+            if len(free) != len(self._free):
+                raise RuntimeError("KV free list contains duplicate block ids")
+            if any(not 0 <= block_id < self.num_blocks for block_id in free):
+                raise RuntimeError("KV free list contains an invalid block id")
+            for block_id, refcount in enumerate(self._refcounts):
+                if refcount < 0:
+                    raise RuntimeError("KV block reference count is negative")
+                if (block_id in free) != (refcount == 0):
+                    raise RuntimeError("KV free list and reference counts disagree")
+            for request_id, allocation in self._allocations.items():
+                if request_id != allocation.request_id:
+                    raise RuntimeError("KV allocation request id is inconsistent")
+                if len(set(allocation.block_ids)) != len(allocation.block_ids):
+                    raise RuntimeError("KV allocation contains duplicate blocks")
+                if any(self._refcounts[block_id] <= 0 for block_id in allocation.block_ids):
+                    raise RuntimeError("KV allocation references a free block")
+                if not 0 <= allocation.num_tokens <= allocation.reserved_tokens:
+                    raise RuntimeError("KV allocation token lengths are inconsistent")
+                if self.blocks_required(allocation.reserved_tokens) > len(
+                    allocation.block_ids
+                ):
+                    raise RuntimeError("KV allocation reservation exceeds its blocks")
+        return self.capacity()
+
+    def _record_high_watermark_locked(self) -> None:
+        allocated = self.num_blocks - len(self._free)
+        self._high_watermark_blocks = max(self._high_watermark_blocks, allocated)

@@ -198,5 +198,60 @@ def test_active_admission_evicts_unreferenced_prefix_pages_under_pressure(tiny_m
     allocation = cache.allocate(2, 4, token_ids=(8, 9, 10, 11))
     assert len(allocation.block_ids) == 2
     assert prefix.stats().evictions == 1
+    assert dict(prefix.stats().evicted_by_reason) == {"active_pressure": 1}
     assert manager.num_free_blocks == 0
     cache.free(2)
+
+
+def test_paged_cache_audit_reconciles_prefix_and_request_owners(tiny_model) -> None:
+    manager = KVBlockManager(6, block_size=2, headroom_blocks=1)
+    prefix = PrefixCache(block_size=2, max_blocks=2)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    tokens = (1, 2, 3, 4)
+    cache.allocate(1, 4, reserve_tokens=5, token_ids=tokens)
+    cache.publish_prefix(1, tokens)
+    live = cache.audit()
+    assert live["active_allocations"] == 1
+    assert live["prefix_cached_blocks"] == 2
+    assert live["headroom_blocks"] == 1
+    cache.free(1)
+    retained = cache.audit()
+    assert retained["active_allocations"] == 0
+    assert retained["allocated_blocks"] == 2
+    evicted = prefix.evict(2)
+    manager.release_blocks(evicted)
+    final = cache.audit()
+    assert final["allocated_blocks"] == 0
+    assert final["physical_free_blocks"] == 6
+
+
+def test_active_pressure_reclaims_prefix_without_consuming_headroom(tiny_model) -> None:
+    manager = KVBlockManager(4, block_size=2, headroom_blocks=1)
+    prefix = PrefixCache(block_size=2, max_blocks=2)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device="cpu",
+        dtype=torch.float32,
+        prefix_cache=prefix,
+    )
+    cached_tokens = (1, 2, 3, 4)
+    cache.allocate(1, 4, token_ids=cached_tokens)
+    cache.publish_prefix(1, cached_tokens)
+    cache.free(1)
+    assert manager.num_allocatable_blocks == 1
+
+    allocation = cache.allocate(2, 4, token_ids=(8, 9, 10, 11))
+    assert len(allocation.block_ids) == 2
+    stats = cache.stats()
+    assert stats["physical_free_blocks"] == 1
+    assert stats["allocatable_free_blocks"] == 0
+    assert stats["prefix_evicted_active_pressure"] == 1
+    cache.free(2)
+    cache.audit()

@@ -836,9 +836,9 @@ class RuntimeGenerationBackend:
         initial_capacity = self.capacity()
         total_tokens = self._total_kv_tokens(request)
         required = manager.blocks_required(total_tokens)
-        if required > manager.num_blocks:
+        if required > manager.usable_blocks:
             return AdmissionDecision.reject(
-                f"request needs {required} KV blocks, worker capacity is {manager.num_blocks}"
+                f"request needs {required} KV blocks, worker capacity is {manager.usable_blocks}"
             )
         with self._admission_lock:
             try:
@@ -1051,3 +1051,18 @@ class RuntimeGenerationBackend:
             state_total_slots=state.total_slots,
             state_free_slots=state.free_slots,
         )
+
+    def cache_stats(self) -> dict[str, int | float]:
+        return self.paged_cache.stats()
+
+    def audit_resources(self) -> dict[str, int | float]:
+        stats = self.paged_cache.audit()
+        state = self.state_slots.capacity()
+        if state.allocated_slots != len(self.states):
+            raise RuntimeError("recurrent-state slots and runtime states disagree")
+        return {
+            **stats,
+            "state_total_slots": state.total_slots,
+            "state_allocated_slots": state.allocated_slots,
+            "state_free_slots": state.free_slots,
+        }

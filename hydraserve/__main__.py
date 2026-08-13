@@ -64,6 +64,7 @@ def main() -> int:
     serve_mode.add_argument("--adaptive", action="store_true")
     serve_parser.add_argument("--router-profile", type=Path)
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
+    serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
     serve_parser.add_argument("--max-batch-size", type=int, default=64)
     serve_parser.add_argument("--max-active-requests", type=int)
@@ -98,6 +99,7 @@ def main() -> int:
     benchmark_mode.add_argument("--adaptive", action="store_true")
     benchmark_parser.add_argument("--router-profile", type=Path)
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
+    benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     benchmark_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
@@ -169,6 +171,9 @@ def main() -> int:
             parser.error("--max-active-requests cannot be below --max-batch-size")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+        if not 0 <= args.kv_headroom_blocks < cache_blocks:
+            parser.error("--kv-headroom-blocks must be below physical cache blocks")
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
@@ -195,6 +200,7 @@ def main() -> int:
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
+                    kv_headroom_blocks=args.kv_headroom_blocks,
                 ),
                 router=router,
             )
@@ -211,6 +217,7 @@ def main() -> int:
                 max_state_slots=max_active_requests,
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
+                kv_headroom_blocks=args.kv_headroom_blocks,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)
@@ -241,7 +248,11 @@ def main() -> int:
             blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
             cache = PagedKVCache(
                 runtime.config,
-                KVBlockManager(blocks, block_size=args.block_size),
+                KVBlockManager(
+                    blocks,
+                    block_size=args.block_size,
+                    headroom_blocks=args.kv_headroom_blocks,
+                ),
                 device=args.device,
                 dtype=torch.bfloat16,
                 prefix_cache=(
@@ -321,6 +332,9 @@ def main() -> int:
             parser.error("cache limits must be positive")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
+        if not 0 <= args.kv_headroom_blocks < cache_blocks:
+            parser.error("--kv-headroom-blocks must be below physical cache blocks")
         tokenizer = QwenTokenizer(args.model)
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
@@ -347,6 +361,7 @@ def main() -> int:
                     prefill_chunk_size=args.prefill_chunk_size,
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
+                    kv_headroom_blocks=args.kv_headroom_blocks,
                 ),
                 router=router,
             )
@@ -362,6 +377,7 @@ def main() -> int:
                 max_state_slots=args.concurrency,
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
+                kv_headroom_blocks=args.kv_headroom_blocks,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)
@@ -391,7 +407,11 @@ def main() -> int:
             blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
             cache = PagedKVCache(
                 runtime.config,
-                KVBlockManager(blocks, block_size=args.block_size),
+                KVBlockManager(
+                    blocks,
+                    block_size=args.block_size,
+                    headroom_blocks=args.kv_headroom_blocks,
+                ),
                 device=args.device,
                 dtype=torch.bfloat16,
                 prefix_cache=(

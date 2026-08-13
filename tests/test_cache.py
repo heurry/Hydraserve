@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from random import Random
 
 from hydraserve.cache import (
     KVBlockManager,
@@ -53,6 +54,78 @@ def test_block_manager_reservation_failure_is_atomic() -> None:
     with pytest.raises(MemoryError):
         manager.allocate(1, 1, reserve_tokens=9)
     assert manager.capacity().free_blocks == 2
+
+
+def test_block_manager_headroom_is_not_admitted_but_remains_physically_free() -> None:
+    manager = KVBlockManager(4, block_size=4, headroom_blocks=1)
+    manager.allocate(1, 8)
+    capacity = manager.capacity()
+    assert capacity.total_blocks == 3
+    assert capacity.free_blocks == 1
+    assert capacity.physical_free_blocks == 2
+    assert capacity.headroom_blocks == 1
+    with pytest.raises(MemoryError, match="headroom"):
+        manager.allocate(2, 8)
+    failed = manager.audit()
+    assert failed.allocation_failures == 1
+    assert failed.high_watermark_blocks == 2
+    manager.free(1)
+    assert manager.audit().physical_free_blocks == 4
+
+
+def test_block_manager_audit_tracks_fragmentation_sharing_and_no_leaks() -> None:
+    manager = KVBlockManager(8, block_size=4)
+    first = manager.allocate(1, 5, reserve_tokens=7)
+    manager.retain_blocks((first.block_ids[0],))
+    manager.allocate(2, 4, prefix_block_ids=(first.block_ids[0],))
+    stats = manager.audit()
+    assert stats.active_allocations == 2
+    assert stats.shared_blocks == 1
+    assert stats.total_references == stats.allocation_block_references + 1
+    assert stats.internal_fragmentation_tokens == 1
+    manager.free(1)
+    manager.free(2)
+    manager.release_blocks((first.block_ids[0],))
+    final = manager.audit()
+    assert final.allocated_blocks == 0
+    assert final.total_references == 0
+
+
+def test_block_manager_random_transaction_soak_preserves_invariants() -> None:
+    rng = Random(17)
+    manager = KVBlockManager(64, block_size=4, headroom_blocks=4)
+    active: set[int] = set()
+    for _ in range(2_000):
+        request_id = rng.randrange(32)
+        operation = rng.randrange(4)
+        try:
+            if request_id not in active:
+                tokens = rng.randint(1, 12)
+                reserve = tokens + rng.randint(0, 20)
+                manager.allocate(request_id, tokens, reserve_tokens=reserve)
+                active.add(request_id)
+            elif operation == 0:
+                manager.free(request_id)
+                active.remove(request_id)
+            elif operation == 1:
+                current = manager.get(request_id)
+                manager.truncate(request_id, rng.randint(0, current.num_tokens))
+            elif operation == 2:
+                current = manager.get(request_id)
+                manager.reserve(
+                    request_id,
+                    current.num_tokens + rng.randint(0, 12),
+                )
+            else:
+                manager.grow(request_id, rng.randint(0, 3))
+        except MemoryError:
+            pass
+        manager.audit()
+    for request_id in tuple(active):
+        manager.free(request_id)
+    final = manager.audit()
+    assert final.physical_free_blocks == 64
+    assert final.total_references == 0
 
 
 def test_decode_batch_growth_is_atomic() -> None:

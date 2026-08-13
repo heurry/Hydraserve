@@ -195,7 +195,7 @@ naive 对称量化无校准，PPL +0.74。AWQ/GPTQ 带校准可达 <0.3。4B 上
 | TransferBackend | GPU0->1..N | 传输后端抽象 | InMemory/SHM/P2P 实现；本机 P2P 不可用，未实测 |
 | TransferPipeline | GPU0->1..N | 状态传输 | typed 单-envelope SHM、原子发布、pinned D2H/H2D 完成；P2P 层级 GPU 异步流水仍待可用硬件接入验证 |
 | Continuous Batching | GPU 1..N | decode 调度、抢占恢复 | batched runtime、容量保证、精确回放、事务回滚、故障隔离与老化加权公平调度完成 |
-| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 容量预留、批量原子增长、共享页引用计数/写保护/压力淘汰、batched Triton scatter 与 tiled online-softmax 完成 |
+| KV Cache Manager | GPU 1..N | PagedAttention block 管理 | 最大输出容量预留、不可侵占 headroom、批量原子增长、共享页引用计数/写保护、按原因压力淘汰、free/refcount/request/prefix 强审计、高水位/碎片/失败指标、batched Triton scatter 与 tiled online-softmax 完成 |
 | Linear State Pool | GPU 1..N | FP32 固定 slot 管理 | layer-major 连续 GPU pool、显存预算化保证容量、decode 原地事务提交完成 |
 | Prefix Cache | GPU 1..N | Radix tree (skip mamba) | 策略与真实 Paged KV 页生命周期、worker affinity 探测完成；GDN 不缓存 |
 | Adaptive Router | CPU | Collocated vs PD 路由 | 直接 service 成本曲线、admission/executor queue 分解、running-future 剩余工作、decode-load 一阶外部性、收益/风险/迟滞门禁、在线分桶 EWMA 与漂移回退、profile 配置、不可变 route binding、1P+ND 容量/缓存/拓扑评分、跨 worker 并行 decode、worker 自动摘流/重启/握手完成；N>1 实机待验证 |

@@ -48,6 +48,7 @@ class PDClusterConfig:
     prefill_chunk_size: int = 4096
     prefix_cache_blocks: int = 0
     prefix_cache_min_frequency: int = 2
+    kv_headroom_blocks: int = 0
     topologies: tuple[WorkerTopology, ...] = ()
 
     def __post_init__(self) -> None:
@@ -67,6 +68,11 @@ class PDClusterConfig:
             raise ValueError("cluster resource limits must be positive")
         if self.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
+        total_blocks = (
+            self.cache_tokens_per_worker + self.block_size - 1
+        ) // self.block_size
+        if not 0 <= self.kv_headroom_blocks < total_blocks:
+            raise ValueError("KV headroom must be below physical cache blocks")
         if self.topologies and len(self.topologies) != len(self.decode_devices):
             raise ValueError("topologies must match decode devices")
 
@@ -82,6 +88,7 @@ class PDClusterConfig:
             max_state_slots=self.max_state_slots_per_worker,
             prefix_cache_blocks=self.prefix_cache_blocks,
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
+            kv_headroom_blocks=self.kv_headroom_blocks,
         )
 
 
@@ -154,7 +161,7 @@ class MultiWorkerGenerationBackend:
         )
         total_blocks = (
             config.cache_tokens_per_worker + config.block_size - 1
-        ) // config.block_size
+        ) // config.block_size - config.kv_headroom_blocks
         topologies = config.topologies or tuple(
             WorkerTopology() for _ in range(worker_count)
         )
@@ -175,6 +182,9 @@ class MultiWorkerGenerationBackend:
             )
         )
         self._reserved_blocks = [dict() for _ in range(worker_count)]
+        self._worker_cache_stats: list[dict[str, int | float]] = [
+            {} for _ in range(worker_count)
+        ]
         self._route_decisions: dict[int, RouteDecision] = {}
         self._state_lock = RLock()
         self._prefill_healthy = True
@@ -420,6 +430,18 @@ class MultiWorkerGenerationBackend:
             state_total_slots=sum(item.capacity.state_total_slots for item in snapshots),
             state_free_slots=sum(item.capacity.state_free_slots for item in snapshots),
         )
+
+    def cache_stats(self) -> dict[str, int | float]:
+        with self._state_lock:
+            keys = {
+                key for worker in self._worker_cache_stats for key in worker
+            }
+            return {
+                key: sum(
+                    float(worker.get(key, 0)) for worker in self._worker_cache_stats
+                )
+                for key in keys
+            }
 
     def worker_for(self, request_id: int) -> int:
         return self.registry.worker_for(request_id)
@@ -674,6 +696,14 @@ class MultiWorkerGenerationBackend:
                 worker_id,
                 BackendCapacity(*(int(result[key]) for key in keys)),
             )
+        cache_stats = result.get("kv_cache_stats")
+        if isinstance(cache_stats, dict):
+            with self._state_lock:
+                self._worker_cache_stats[worker_id] = {
+                    str(key): value
+                    for key, value in cache_stats.items()
+                    if isinstance(value, (int, float))
+                }
 
     def _required_blocks(self, request: ServingRequest) -> int:
         total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
@@ -682,7 +712,7 @@ class MultiWorkerGenerationBackend:
     def _total_blocks_per_worker(self) -> int:
         return (
             self.config.cache_tokens_per_worker + self.config.block_size - 1
-        ) // self.config.block_size
+        ) // self.config.block_size - self.config.kv_headroom_blocks
 
     @staticmethod
     def _request_command(op: str, request: ServingRequest) -> dict:

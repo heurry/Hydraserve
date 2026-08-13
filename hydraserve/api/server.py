@@ -69,6 +69,11 @@ class _Handler(BaseHTTPRequestHandler):
                 }
                 if recovery.healthy_workers < recovery.total_workers:
                     payload["status"] = "degraded"
+            cache_stats = getattr(
+                self.hydra.generation_loop.backend, "cache_stats", None
+            )
+            if cache_stats is not None:
+                payload["kv_cache"] = cache_stats()
             routing_cost_stats = getattr(
                 self.hydra.generation_loop.backend, "routing_cost_stats", None
             )
@@ -546,6 +551,70 @@ class _Handler(BaseHTTPRequestHandler):
                     f"hydraserve_decode_load {snapshot.decode_load}",
                 ]
             )
+        cache_stats = getattr(backend, "cache_stats", None)
+        if cache_stats is not None:
+            stats = cache_stats()
+            if stats:
+                lines.extend(
+                    [
+                        "# TYPE hydraserve_kv_cache_blocks gauge",
+                        *(
+                            f'hydraserve_kv_cache_blocks{{state="{state}"}} '
+                            f"{stats.get(key, 0)}"
+                            for state, key in (
+                                ("physical_total", "physical_total_blocks"),
+                                ("physical_free", "physical_free_blocks"),
+                                ("usable_total", "usable_total_blocks"),
+                                ("allocatable_free", "allocatable_free_blocks"),
+                                ("headroom", "headroom_blocks"),
+                                ("allocated", "allocated_blocks"),
+                                ("shared", "shared_blocks"),
+                                ("high_watermark", "high_watermark_blocks"),
+                            )
+                        ),
+                        "# TYPE hydraserve_kv_allocation_failures_total counter",
+                        f"hydraserve_kv_allocation_failures_total {stats.get('allocation_failures', 0)}",
+                        "# TYPE hydraserve_kv_internal_fragmentation_tokens gauge",
+                        "hydraserve_kv_internal_fragmentation_tokens "
+                        f"{stats.get('internal_fragmentation_tokens', 0)}",
+                        "# TYPE hydraserve_prefix_cache_blocks gauge",
+                        'hydraserve_prefix_cache_blocks{state="cached"} '
+                        f"{stats.get('prefix_cached_blocks', 0)}",
+                        'hydraserve_prefix_cache_blocks{state="referenced"} '
+                        f"{stats.get('prefix_referenced_blocks', 0)}",
+                        'hydraserve_prefix_cache_blocks{state="evictable"} '
+                        f"{stats.get('prefix_evictable_blocks', 0)}",
+                        "# TYPE hydraserve_prefix_cache_events_total counter",
+                        'hydraserve_prefix_cache_events_total{event="hit"} '
+                        f"{stats.get('prefix_hits', 0)}",
+                        'hydraserve_prefix_cache_events_total{event="miss"} '
+                        f"{stats.get('prefix_misses', 0)}",
+                        'hydraserve_prefix_cache_events_total{event="admission"} '
+                        f"{stats.get('prefix_admissions', 0)}",
+                        'hydraserve_prefix_cache_events_total{event="rejected_admission"} '
+                        f"{stats.get('prefix_rejected_admissions', 0)}",
+                        'hydraserve_prefix_cache_events_total{event="eviction"} '
+                        f"{stats.get('prefix_evictions', 0)}",
+                        "# TYPE hydraserve_prefix_cache_evictions_total counter",
+                        'hydraserve_prefix_cache_evictions_total{reason="active_pressure"} '
+                        f"{stats.get('prefix_evicted_active_pressure', 0)}",
+                        'hydraserve_prefix_cache_evictions_total{reason="cache_capacity"} '
+                        f"{stats.get('prefix_evicted_cache_capacity', 0)}",
+                        'hydraserve_prefix_cache_evictions_total{reason="manual"} '
+                        f"{stats.get('prefix_evicted_manual', 0)}",
+                        "# TYPE hydraserve_prefix_cache_rejections_total counter",
+                        'hydraserve_prefix_cache_rejections_total{reason="frequency"} '
+                        f"{stats.get('prefix_rejected_frequency', 0)}",
+                        'hydraserve_prefix_cache_rejections_total{reason="capacity"} '
+                        f"{stats.get('prefix_rejected_capacity', 0)}",
+                        'hydraserve_prefix_cache_rejections_total{reason="size"} '
+                        f"{stats.get('prefix_rejected_size', 0)}",
+                        'hydraserve_prefix_cache_rejections_total{reason="length"} '
+                        f"{stats.get('prefix_rejected_length', 0)}",
+                        "# TYPE hydraserve_prefix_cache_hit_tokens_total counter",
+                        f"hydraserve_prefix_cache_hit_tokens_total {stats.get('prefix_hit_tokens', 0)}",
+                    ]
+                )
         routing_stats = getattr(backend, "routing_stats", None)
         if routing_stats is not None:
             stats = routing_stats()

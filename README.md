@@ -119,7 +119,8 @@ python -m hydraserve inspect-datasets /mnt/nvme-data/datasets/benchmark --limit 
 python -m hydraserve serve /mnt/nvme-data/models/LLM_model/Qwen3.5-4B \
   --device cuda:0 --port 8000 \
   --max-batch-size 64 --max-active-requests 256 \
-  --max-queue-size 1024 --max-queue-tokens 1048576
+  --max-queue-size 1024 --max-queue-tokens 1048576 \
+  --kv-headroom-blocks 128
 
 curl http://127.0.0.1:8000/v1/completions \
   -H 'Content-Type: application/json' \
@@ -255,6 +256,19 @@ IPC 队列，并在模型名和容量握手通过后重新加入。`/health` 和
 HTTP 408，SSE 返回 `timeout_error` event。GPU kernel 不可中断，因此 deadline 是 kernel
 边界协作式而非微秒级抢占。`/health` 与 `/metrics` 分别暴露 admission、prefill 和 active
 三层请求深度。
+
+`--kv-headroom-blocks` 从 admission 可用容量中永久保留指定物理页，防止工作集逼到最后
+一页时反复准入/失败；默认 0 保持向后兼容。headroom 仍是已分配的 GPU KV tensor，
+但普通 request 和 prefix cache 压力都不能侵占它。容量不足时先按成本策略淘汰未引用
+prefix 页，只回收满足请求所需的数量；仍不足则事务式拒绝，现有 allocation/refcount
+不变。
+
+allocator 维护物理/可准入页、高水位、allocation failure、active allocation、共享页、
+总引用、logical/reserved token 和 block-tail 内部碎片。Paged KV `audit()` 对账
+request block references + prefix owners = allocator total references，并检查 free list、
+refcount、reservation 和 prefix ownership。Prefix Cache 指标区分 active pressure、cache
+capacity、manual 淘汰，以及 frequency/capacity/size/length 拒绝；`/health` 返回完整快照，
+`/metrics` 暴露稳定低基数标签。
 
 当前 PCIe fallback 使用不经 pickle 的 typed ndarray 单-envelope SHM，header 在内容写完后
 才发布；GDN 状态通过 pinned host staging 搬运。decode worker 按实时剩余显存计算可保证

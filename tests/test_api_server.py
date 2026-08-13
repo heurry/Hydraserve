@@ -164,6 +164,29 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         def routing_cost_stats(self):
             return RouteCostStats(7, 3, 0.9, 1.2, (5,), ())
 
+        def cache_stats(self):
+            return {
+                "physical_total_blocks": 12,
+                "physical_free_blocks": 8,
+                "usable_total_blocks": 10,
+                "allocatable_free_blocks": 6,
+                "headroom_blocks": 2,
+                "allocated_blocks": 4,
+                "shared_blocks": 1,
+                "high_watermark_blocks": 7,
+                "allocation_failures": 3,
+                "internal_fragmentation_tokens": 9,
+                "prefix_cached_blocks": 2,
+                "prefix_referenced_blocks": 1,
+                "prefix_evictable_blocks": 1,
+                "prefix_hits": 5,
+                "prefix_misses": 4,
+                "prefix_admissions": 2,
+                "prefix_rejected_admissions": 1,
+                "prefix_evictions": 1,
+                "prefix_hit_tokens": 64,
+            }
+
     loop = ContinuousGenerationLoop(CapacityBackend())
     try:
         server = create_server(
@@ -187,6 +210,7 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert health["decode_workers"]["recovering"] == [1]
         assert health["routing_cost_model"]["pd_observations"] == 3
         assert health["routing_cost_model"]["collocated_drifted_buckets"] == [5]
+        assert health["kv_cache"]["headroom_blocks"] == 2
         with urlopen(base + "/metrics", timeout=3) as response:
             metrics = response.read().decode()
         assert 'hydraserve_kv_blocks{state="free"} 7' in metrics
@@ -203,6 +227,9 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             in metrics
         )
         assert 'hydraserve_route_cost_profile_drift{route="collocated"} 1' in metrics
+        assert 'hydraserve_kv_cache_blocks{state="headroom"} 2' in metrics
+        assert "hydraserve_kv_allocation_failures_total 3" in metrics
+        assert 'hydraserve_prefix_cache_events_total{event="hit"} 5' in metrics
     finally:
         server.shutdown()
         server.server_close()

@@ -50,6 +50,41 @@ def test_persistent_real_two_gpu_pd_generation() -> None:
     assert second_events[-1].finish_reason == "length"
 
 
+def test_real_pd_kv_headroom_stats_and_release_are_end_to_end() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = DisaggregatedGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=128,
+            block_size=16,
+            max_state_slots=2,
+            kv_headroom_blocks=2,
+            use_flash_attention=False,
+        )
+    )
+    loop = ContinuousGenerationLoop(
+        backend, max_batch_size=2, max_active_requests=2
+    )
+    try:
+        handles = [
+            loop.submit([1, 42, 17, 9 + index], max_new_tokens=2)
+            for index in range(2)
+        ]
+        assert all(list(handle)[-1].finish_reason == "length" for handle in handles)
+        stats = backend.cache_stats()
+        assert stats["physical_total_blocks"] == 8
+        assert stats["physical_free_blocks"] == 8
+        assert stats["usable_total_blocks"] == 6
+        assert stats["allocatable_free_blocks"] == 6
+        assert stats["headroom_blocks"] == 2
+        assert stats["active_allocations"] == 0
+        assert stats["total_references"] == 0
+        assert stats["high_watermark_blocks"] > 0
+    finally:
+        loop.close()
+
+
 def test_real_pd_seeded_sampling_and_logprobs_are_reproducible() -> None:
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         pytest.skip("two CUDA devices are required")
