@@ -39,6 +39,7 @@ class PDWorkerConfig:
     prefix_cache_min_frequency: int = 2
     kv_headroom_blocks: int = 0
     max_decode_batch_size: int = 64
+    kv_quant: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +130,7 @@ def _prefill_worker(
             state_slots=1,
             state_workspace_slots=0,
             state_memory_fraction=1.0,
+            kv_quant=config.kv_quant,
         )
         prefill_cache = PagedKVCache(
             runtime.config,
@@ -136,6 +138,7 @@ def _prefill_worker(
             device=device,
             dtype=torch.bfloat16,
             memory_plan=memory_plan,
+            kv_quant=config.kv_quant,
         )
         namespaces = (namespace,) if isinstance(namespace, str) else tuple(namespace)
         if not namespaces:
@@ -235,9 +238,11 @@ def _decode_worker(
             device=device,
             dtype=torch.bfloat16,
             use_triton=True,
-            # PARTIAL decode recomputes the whole prompt; do not require the
-            # optional prefill-only FlashAttention package on decode workers.
-            use_flash_attention=False,
+            # PARTIAL decode recomputes the whole prompt (full-attention KV must be
+            # rebuilt from the transferred recurrent state). FlashAttention is what
+            # makes that recompute fast; disabling it here silently falls back to the
+            # O(n^2) Triton paged-attention path and made 32K PD ~28x slower than DP.
+            use_flash_attention=config.use_flash_attention,
             requested_cache_tokens=config.cache_tokens,
         )
         requested_blocks = (
@@ -249,6 +254,7 @@ def _decode_worker(
             block_size=config.block_size,
             dtype=torch.bfloat16,
             device=device,
+            kv_quant=config.kv_quant,
         )
         blocks = memory_plan.planned_blocks
         if config.kv_headroom_blocks >= blocks:
@@ -281,6 +287,7 @@ def _decode_worker(
                 model_revision=revision,
             ),
             memory_plan=memory_plan,
+            kv_quant=config.kv_quant,
         )
         backend = SharedMemoryTransferBackend(namespace=namespace)
         worker = DecodeWorker(

@@ -25,7 +25,7 @@ def causal_depthwise_conv(hidden, weight, state, *, next_state=None):
         or not next_state.is_contiguous()
     ):
         raise ValueError("next convolution state must match the input state")
-    _causal_conv_kernel[(batch, sequence, channels)](
+    _causal_conv_kernel[(batch * sequence, channels)](
         hidden,
         weight,
         state,
@@ -101,9 +101,10 @@ try:
         channels,
         KERNEL: tl.constexpr,
     ):
-        batch_id = tl.program_id(0)
-        token = tl.program_id(1)
-        channel = tl.program_id(2)
+        token_batch = tl.program_id(0)
+        channel = tl.program_id(1)
+        batch_id = token_batch // sequence
+        token = token_batch % sequence
         accumulator = 0.0
         for kernel_index in range(0, KERNEL):
             source_token = token - (KERNEL - 1 - kernel_index)

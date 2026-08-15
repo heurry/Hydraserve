@@ -225,6 +225,8 @@ class QwenTextRuntime:
         *,
         paged_cache=None,
         request_id: int | None = None,
+        compute_logits: bool = True,
+        last_position_only: bool = False,
     ):
         import torch
 
@@ -262,6 +264,10 @@ class QwenTextRuntime:
 
         hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
         state.sequence_length += sequence
+        if not compute_logits:
+            return None, state
+        if last_position_only:
+            hidden = hidden[:, -1:]
         logits = self._linear(hidden, self._output_weight()).float()
         return logits, state
 
@@ -280,12 +286,17 @@ class QwenTextRuntime:
             raise ValueError("input_ids must be a non-empty [batch, tokens] tensor")
         state = RuntimeState()
         logits = None
-        for start in range(0, input_ids.shape[1], chunk_size):
+        total = input_ids.shape[1]
+        for start in range(0, total, chunk_size):
+            end = min(start + chunk_size, total)
+            is_last = end >= total
             logits, state = self.forward(
-                input_ids[:, start : start + chunk_size],
+                input_ids[:, start:end],
                 state,
                 paged_cache=paged_cache,
                 request_id=request_id,
+                compute_logits=is_last,
+                last_position_only=True,
             )
         return logits, state
 

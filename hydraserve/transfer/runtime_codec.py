@@ -5,7 +5,7 @@ from __future__ import annotations
 from hydraserve.cache.state_pool import LinearState
 from hydraserve.config import ModelConfig
 from hydraserve.model.runtime import RuntimeState
-from hydraserve.transfer.descriptor import StateTransferDescriptor
+from hydraserve.transfer.descriptor import StateTransferDescriptor, TransferMode
 from hydraserve.transfer.pipeline import HybridStateBundle
 from hydraserve.cache.kv_quantizer import Int4Tensor, dequantize_int4
 
@@ -46,15 +46,23 @@ class RuntimeStateCodec:
         )
 
     @staticmethod
-    def extract_kv(model: ModelConfig, paged_cache, request_id: int):
-        """Gather full-attention KV as ``[layers, 2, tokens, heads, dim]``."""
+    def extract_kv(model: ModelConfig, paged_cache, request_id: int, *, mode: TransferMode = TransferMode.FULL_TRANSFER):
+        """Gather full-attention KV as ``[layers, 2, tokens, heads, dim]``.
+
+        FULL transfer ships BF16 raw bits viewed as uint16 (half the FP32 size,
+        lossless round-trip); QUANTIZED still needs a floating-point tensor for
+        ``quantize_int4`` on the pipeline side.
+        """
         import torch
 
         layers = []
         for layer_index in model.full_attention_layer_indices:
             key, value = paged_cache.read(request_id, layer_index)
             layers.append(torch.stack((key, value), dim=0))
-        return torch.stack(layers, dim=0).float().cpu().numpy()
+        stacked = torch.stack(layers, dim=0)
+        if mode is TransferMode.QUANTIZED_TRANSFER:
+            return stacked.float().cpu().numpy()
+        return stacked.view(torch.uint16).cpu().numpy()
 
     @staticmethod
     def install_kv(model: ModelConfig, paged_cache, request_id: int, payload) -> None:
@@ -72,13 +80,16 @@ class RuntimeStateCodec:
         ):
             raise ValueError(f"invalid transferred KV shape {values.shape}")
         positions = torch.arange(values.shape[2], device=paged_cache.device)
+        # FULL transfer ships BF16 as uint16 raw bits; reinterpret, don't convert.
+        bf16_bits = values.dtype == np.uint16
         for slot, layer_index in enumerate(model.full_attention_layer_indices):
-            key = torch.from_numpy(values[slot, 0]).to(
-                device=paged_cache.device, dtype=paged_cache.dtype
-            )
-            value = torch.from_numpy(values[slot, 1]).to(
-                device=paged_cache.device, dtype=paged_cache.dtype
-            )
+            key = torch.from_numpy(values[slot, 0])
+            value = torch.from_numpy(values[slot, 1])
+            if bf16_bits:
+                key = key.view(torch.bfloat16)
+                value = value.view(torch.bfloat16)
+            key = key.to(device=paged_cache.device, dtype=paged_cache.dtype)
+            value = value.to(device=paged_cache.device, dtype=paged_cache.dtype)
             paged_cache.write(request_id, layer_index, positions, key, value)
 
     @staticmethod

@@ -72,6 +72,7 @@ def main() -> int:
     serve_parser.add_argument("--max-queue-size", type=int, default=1024)
     serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
+    serve_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     serve_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
     serve_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
     serve_parser.add_argument("--no-flash-attention", action="store_true")
@@ -104,6 +105,7 @@ def main() -> int:
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
+    benchmark_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     benchmark_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
     benchmark_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
@@ -224,6 +226,7 @@ def main() -> int:
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
+                kv_quant=args.kv_quant,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)
@@ -262,6 +265,7 @@ def main() -> int:
                 block_size=args.block_size,
                 dtype=torch.bfloat16,
                 device=args.device,
+                kv_quant=args.kv_quant,
             )
             blocks = memory_plan.planned_blocks
             if args.kv_headroom_blocks >= blocks:
@@ -292,6 +296,7 @@ def main() -> int:
                     model_revision=str(args.model.resolve()),
                 ),
                 memory_plan=memory_plan,
+                kv_quant=args.kv_quant,
             )
             backend = RuntimeGenerationBackend(
                 runtime,
@@ -405,6 +410,7 @@ def main() -> int:
                 prefix_cache_blocks=args.prefix_cache_blocks,
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
+                kv_quant=args.kv_quant,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)
@@ -442,6 +448,7 @@ def main() -> int:
                 block_size=args.block_size,
                 dtype=torch.bfloat16,
                 device=args.device,
+                kv_quant=args.kv_quant,
             )
             blocks = memory_plan.planned_blocks
             if args.kv_headroom_blocks >= blocks:
@@ -472,6 +479,7 @@ def main() -> int:
                     model_revision=str(args.model.resolve()),
                 ),
                 memory_plan=memory_plan,
+                kv_quant=args.kv_quant,
             )
             backend = RuntimeGenerationBackend(
                 runtime,

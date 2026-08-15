@@ -102,7 +102,9 @@ def test_quantized_transfer_packs_kv(tiny_model) -> None:
 
 
 def test_posix_shared_memory_partial_transfer(tiny_model) -> None:
-    with SharedMemoryTransferBackend(namespace="hydraserve-pytest") as backend:
+    with SharedMemoryTransferBackend(
+        namespace="hydraserve-pytest", mode=TransferMode.PARTIAL_TRANSFER
+    ) as backend:
         pipeline = TransferPipeline(backend)
         pipeline.send(9, tiny_model, 12, HybridStateBundle(_state(tiny_model)))
         descriptor, received = pipeline.receive(9, timeout=1)

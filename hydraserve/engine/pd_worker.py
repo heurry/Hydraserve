@@ -84,7 +84,8 @@ class PrefillWorker:
                 )
         if self.pipeline.backend.transfer_mode is not TransferMode.PARTIAL_TRANSFER:
             bundle.kv_cache = RuntimeStateCodec.extract_kv(
-                self.runtime.config, self.paged_cache, request.request_id
+                self.runtime.config, self.paged_cache, request.request_id,
+                mode=self.pipeline.backend.transfer_mode,
             )
         sample = sample_logits(
             logits[:, -1],

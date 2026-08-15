@@ -26,15 +26,19 @@ class PagedKVCache:
         prefix_cache: PrefixCache | None = None,
         cache_namespace: CacheNamespace = DEFAULT_NAMESPACE,
         memory_plan=None,
+        kv_quant: str | None = None,
     ) -> None:
         import torch
 
         if block_manager.block_size <= 0:
             raise ValueError("invalid block manager")
+        if kv_quant not in (None, "int8"):
+            raise ValueError("kv_quant must be None (BF16) or 'int8'")
         self.model = model
         self.block_manager = block_manager
         self.device = torch.device(device)
         self.dtype = dtype
+        self.kv_quant = kv_quant
         if prefix_cache is not None and prefix_cache.block_size != block_manager.block_size:
             raise ValueError("prefix cache and KV allocator block sizes must match")
         self.prefix_cache = prefix_cache
@@ -59,8 +63,16 @@ class PagedKVCache:
             model.num_kv_heads,
             model.head_dim,
         )
-        self.key = torch.empty(shape, device=self.device, dtype=dtype)
+        store_dtype = torch.int8 if kv_quant == "int8" else dtype
+        self.key = torch.empty(shape, device=self.device, dtype=store_dtype)
         self.value = torch.empty_like(self.key)
+        if kv_quant == "int8":
+            scale_shape = shape[:3] + (model.num_kv_heads,)
+            self.key_scales = torch.empty(scale_shape, device=self.device, dtype=torch.float32)
+            self.value_scales = torch.empty_like(self.key_scales)
+        else:
+            self.key_scales = None
+            self.value_scales = None
 
     def allocate(
         self,
@@ -277,6 +289,28 @@ class PagedKVCache:
                     raise RuntimeError("KV prefix ownership metadata is inconsistent")
         return self.stats()
 
+    def _quantize_kv(self, key, value):
+        """Per-token-per-head symmetric INT8 quantization of [tokens, heads, dim] KV."""
+        import torch
+
+        key_f = key.float()
+        value_f = value.float()
+        key_scale = key_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6) * (1.0 / 127.0)
+        value_scale = value_f.abs().amax(dim=-1, keepdim=True).clamp_min(1e-6) * (1.0 / 127.0)
+        key_q = (key_f / key_scale).round().clamp(-127, 127).to(torch.int8)
+        value_q = (value_f / value_scale).round().clamp(-127, 127).to(torch.int8)
+        return key_q, value_q, key_scale.squeeze(-1), value_scale.squeeze(-1)
+
+    def _scatter_scales(self, slot, positions, block_ids, key_scale, value_scale):
+        """Scatter per-token-per-head scales into the paged scale buffers."""
+        import torch
+
+        logical = torch.div(positions, self.block_manager.block_size, rounding_mode="floor")
+        offsets = positions.remainder(self.block_manager.block_size)
+        physical = block_ids[logical.long()]
+        self.key_scales[slot, physical.long(), offsets.long()] = key_scale
+        self.value_scales[slot, physical.long(), offsets.long()] = value_scale
+
     def write(self, request_id: int, layer_index: int, positions, key, value) -> None:
         import torch
 
@@ -302,6 +336,20 @@ class PagedKVCache:
             key = key[writable].contiguous()
             value = value[writable].contiguous()
         block_ids = torch.tensor(allocation.block_ids, device=self.device, dtype=torch.int32)
+        if self.kv_quant == "int8":
+            key, value, key_scale, value_scale = self._quantize_kv(key, value)
+            if self.device.type == "cuda":
+                from hydraserve.kernels.kv_cache import write_paged_kv
+
+                write_paged_kv(key, value, positions, block_ids, self.key[slot], self.value[slot])
+            else:
+                logical = torch.div(positions, self.block_manager.block_size, rounding_mode="floor")
+                offsets = positions.remainder(self.block_manager.block_size)
+                physical = block_ids[logical.long()]
+                self.key[slot, physical.long(), offsets.long()] = key
+                self.value[slot, physical.long(), offsets.long()] = value
+            self._scatter_scales(slot, positions, block_ids, key_scale, value_scale)
+            return
         if self.device.type == "cuda":
             from hydraserve.kernels.kv_cache import write_paged_kv
 
@@ -315,6 +363,10 @@ class PagedKVCache:
 
     def layer_cache(self, layer_index: int):
         slot = self._layer_slot(layer_index)
+        if self.kv_quant == "int8":
+            key = self.key[slot].float() * self.key_scales[slot].unsqueeze(-1)
+            value = self.value[slot].float() * self.value_scales[slot].unsqueeze(-1)
+            return key.to(self.dtype), value.to(self.dtype)
         return self.key[slot], self.value[slot]
 
     def write_decode_batch(
@@ -361,6 +413,31 @@ class PagedKVCache:
         block_table = block_table.to(
             device=self.device, dtype=torch.int32
         ).contiguous()
+        if self.kv_quant == "int8":
+            key, value, key_scale, value_scale = self._quantize_kv(key, value)
+            if self.device.type == "cuda":
+                from hydraserve.kernels.kv_cache import write_paged_kv_batch
+
+                write_paged_kv_batch(
+                    key, value, positions, block_table, self.key[slot], self.value[slot]
+                )
+            else:
+                for row, request_id in enumerate(request_ids):
+                    self.write(
+                        request_id,
+                        layer_index,
+                        positions[row : row + 1],
+                        key[row : row + 1],
+                        value[row : row + 1],
+                    )
+            block_size = self.block_manager.block_size
+            for row in range(batch):
+                logical_block = int(positions[row].item()) // block_size
+                offset = int(positions[row].item()) % block_size
+                physical = int(block_table[row, logical_block].item())
+                self.key_scales[slot, physical, offset] = key_scale[row]
+                self.value_scales[slot, physical, offset] = value_scale[row]
+            return
         if self.device.type == "cuda":
             from hydraserve.kernels.kv_cache import write_paged_kv_batch
 
@@ -409,7 +486,16 @@ class PagedKVCache:
         values = self.value[slot, physical].reshape(
             -1, self.model.num_kv_heads, self.model.head_dim
         )[:length]
-        return keys.contiguous(), values.contiguous()
+        if self.kv_quant == "int8":
+            key_scales = self.key_scales[slot, physical].reshape(
+                -1, self.model.num_kv_heads
+            )[:length]
+            value_scales = self.value_scales[slot, physical].reshape(
+                -1, self.model.num_kv_heads
+            )[:length]
+            keys = keys.float() * key_scales.unsqueeze(-1)
+            values = values.float() * value_scales.unsqueeze(-1)
+        return keys.to(self.dtype).contiguous(), values.to(self.dtype).contiguous()
 
     def batch_metadata(
         self, request_ids: Iterable[int], *, logical_lengths: Iterable[int] | None = None
@@ -455,6 +541,12 @@ class PagedKVCache:
         import torch
 
         element_size = torch.empty((), dtype=self.dtype).element_size()
+        if self.kv_quant == "int8":
+            # 1 byte per value plus 4 bytes per (token, head) scale.
+            return self.model.num_full_attention_layers * self.block_manager.block_size * (
+                2 * self.model.num_kv_heads * self.model.head_dim
+                + 2 * self.model.num_kv_heads * 4
+            )
         return (
             self.model.num_full_attention_layers
             * self.block_manager.block_size

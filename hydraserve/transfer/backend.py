@@ -115,18 +115,25 @@ class SharedMemoryTransferBackend(TransferBackend):
         bandwidth_gbps: float = 4.58,
         latency_ms: float = 0.1,
         poll_interval_s: float = 0.001,
+        mode: TransferMode = TransferMode.FULL_TRANSFER,
     ) -> None:
         if not namespace or bandwidth_gbps <= 0 or latency_ms < 0 or poll_interval_s <= 0:
             raise ValueError("invalid shared-memory backend configuration")
+        if mode is TransferMode.INTRA_GPU:
+            raise ValueError("shared-memory backend cannot serve intra-GPU transfers")
         self.namespace = namespace
         self._bandwidth = bandwidth_gbps
         self._latency = latency_ms
         self._poll_interval = poll_interval_s
+        self._mode = mode
         self._owned_names: set[str] = set()
 
     @property
     def transfer_mode(self) -> TransferMode:
-        return TransferMode.PARTIAL_TRANSFER
+        # Recomputing full-attention KV on the decode side (PARTIAL) is never
+        # cheaper than shipping it, since the recompute is a full O(n^2) prefill
+        # while the transfer is O(n). Default to FULL; QUANTIZED also available.
+        return self._mode
 
     def send(self, key: str, payload: Any, dst: int, stream: Any = None) -> None:
         if dst < 0 or not key:

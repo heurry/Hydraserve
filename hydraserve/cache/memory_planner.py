@@ -36,6 +36,7 @@ def plan_paged_kv_blocks(
     cuda_reserve_bytes: int = 512 * 1024**2,
     allocation_guard_bytes: int = 64 * 1024**2,
     free_bytes: int | None = None,
+    kv_quant: str | None = None,
 ) -> PagedKVMemoryPlan:
     """Clamp a requested cache to leave guaranteed state and CUDA headroom."""
     import torch
@@ -51,15 +52,22 @@ def plan_paged_kv_blocks(
         raise ValueError("KV memory reserves cannot be negative")
     if not 0 < state_memory_fraction <= 1:
         raise ValueError("state memory fraction must be in (0, 1]")
-    element_size = torch.empty((), dtype=dtype).element_size()
-    bytes_per_block = (
-        model.num_full_attention_layers
-        * block_size
-        * model.num_kv_heads
-        * model.head_dim
-        * 2
-        * element_size
-    )
+    if kv_quant == "int8":
+        bytes_per_block = (
+            model.num_full_attention_layers
+            * block_size
+            * (2 * model.num_kv_heads * model.head_dim + 2 * model.num_kv_heads * 4)
+        )
+    else:
+        element_size = torch.empty((), dtype=dtype).element_size()
+        bytes_per_block = (
+            model.num_full_attention_layers
+            * block_size
+            * model.num_kv_heads
+            * model.head_dim
+            * 2
+            * element_size
+        )
     if bytes_per_block <= 0:
         raise ValueError("model has no physical KV bytes per block")
     state_bytes = state_slots * model.recurrent_state_bytes
