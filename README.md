@@ -269,4 +269,5 @@ NVLink,拓扑不支持 CUDA peer access):
 
 - [main.md](main.md) — 设计目标、硬件数据与完整里程碑;
 - [docs/IMPLEMENTATION_STATUS.md](docs/IMPLEMENTATION_STATUS.md) — 逐切片实现记录;
-- [docs/BENCHMARK_2026-08-14.md](docs/BENCHMARK_2026-08-14.md) — 路由决策实测分析。
+- [docs/BENCHMARK_2026-08-14.md](docs/BENCHMARK_2026-08-14.md) — 路由决策实测分析;
+- [scripts/cloud-4gpu/](scripts/cloud-4gpu/) — 4×RTX 3090 云端压测(1P+3D vs 4×单卡)脚本。
