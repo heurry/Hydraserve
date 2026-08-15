@@ -9,7 +9,16 @@ python -m pip install -e '.[gpu]' '.[serve]'
 
 echo "== 环境自检 =="
 python -c 'import torch; print("torch", torch.__version__, "| cuda", torch.version.cuda, "| devices", torch.cuda.device_count())'
-nvidia-smi -L
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi -L
+else
+  echo "当前为无 GPU 模式（nvidia-smi 不可用）：环境安装本身不受影响，"
+  echo "也可以顺手跑 CPU 测试与模型/数据检查："
+  echo "  python -m pytest"
+  echo "  python -m hydraserve inspect-models <模型目录>"
+  echo "  python -m hydraserve inspect-datasets <数据目录>"
+  echo "完成后切到 GPU 模式再跑 smoke 与矩阵。"
+fi
 python -m hydraserve --help >/dev/null && echo "hydraserve CLI OK"
 
 echo

@@ -18,6 +18,10 @@ FA_OPTS="${FA_OPTS:---no-flash-attention}"
 mkdir -p "$LOG_DIR"
 
 echo "== GPU 数量 =="
+if ! command -v nvidia-smi >/dev/null 2>&1; then
+  echo "错误：nvidia-smi 不可用，当前可能是无 GPU 模式；请切换到 4 卡 GPU 模式后重跑"
+  exit 1
+fi
 nvidia-smi -L | tee "$LOG_DIR/gpus.txt"
 [ "$(nvidia-smi -L | wc -l)" -ge 4 ] || { echo "错误：需要至少 4 张 GPU"; exit 1; }
 
