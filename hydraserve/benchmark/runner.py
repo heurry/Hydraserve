@@ -52,6 +52,7 @@ class BenchmarkSummary:
     tpot_ms: dict[str, float]
     latency_ms: dict[str, float]
     route_counts: dict[str, int]
+    prefix_cache_stats: dict[str, int | float]
     results: tuple[RequestMetrics, ...]
 
     def to_dict(self) -> dict:
@@ -69,6 +70,7 @@ class BenchmarkSummary:
             "tpot_ms": self.tpot_ms,
             "latency_ms": self.latency_ms,
             "route_counts": self.route_counts,
+            "prefix_cache_stats": self.prefix_cache_stats,
             "results": [asdict(result) for result in self.results],
         }
 
@@ -90,6 +92,30 @@ def _percentiles(values: Iterable[float]) -> dict[str, float]:
         return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
     return {name: value(percentile) for name, percentile in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))}
+
+
+def _prefix_cache_stats(generation_loop) -> dict[str, int | float]:
+    """Collect prefix-cache hit/miss counters from the serving backend."""
+    backend = getattr(generation_loop, "backend", None)
+    stats_fn = getattr(backend, "cache_stats", None)
+    if stats_fn is None:
+        return {}
+    try:
+        stats = stats_fn()
+    except Exception:
+        return {}
+    hits = int(stats.get("prefix_hits", 0))
+    misses = int(stats.get("prefix_misses", 0))
+    total = hits + misses
+    return {
+        "hits": hits,
+        "misses": misses,
+        "hit_tokens": int(stats.get("prefix_hit_tokens", 0)),
+        "hit_rate": round(hits / total, 6) if total else 0.0,
+        "cached_blocks": int(stats.get("prefix_cached_blocks", 0)),
+        "referenced_blocks": int(stats.get("prefix_referenced_blocks", 0)),
+        "evictable_blocks": int(stats.get("prefix_evictable_blocks", 0)),
+    }
 
 
 def run_benchmark(
@@ -276,5 +302,6 @@ def run_benchmark(
         ),
         latency_ms=_percentiles(result.latency_ms for result in succeeded),
         route_counts=route_counts,
+        prefix_cache_stats=_prefix_cache_stats(generation_loop),
         results=results,
     )

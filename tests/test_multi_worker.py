@@ -51,17 +51,21 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._route_decisions = {}
         self._lost_requests = set()
         self._state_lock = RLock()
-        self._prefill_healthy = True
+        self._prefill_healthy = [True]
         self._collocated_count = 0
         self._pd_count = 0
         self._pd_failures = 0
         self._closed = False
-        self._prefill_lock = Lock()
-        self._prefill_recovery_thread = None
-        self._prefill_recovering = False
-        self._prefill_recovery_attempts = 0
-        self._prefill_recovery_successes = 0
-        self._prefill_recovery_failures = 0
+        self._prefill_locks = [Lock()]
+        self._prefill_processes = [SimpleNamespace(is_alive=lambda: True)]
+        self._prefill_commands = [Queue()]
+        self._prefill_responses = [Queue()]
+        self._prefill_recovering = [False]
+        self._prefill_recovery_threads = [None]
+        self._prefill_recovery_attempts = [0]
+        self._prefill_recovery_successes = [0]
+        self._prefill_recovery_failures = [0]
+        self._prefill_round_robin = 0
         self._recovery_stop = Event()
         self._recovering_workers = set()
         self._recovery_threads = {}
@@ -273,14 +277,14 @@ def test_dead_prefill_worker_fails_fast_and_schedules_recovery() -> None:
             return False
 
     backend = FakeMultiWorkerBackend()
-    backend._prefill = DeadProcess()
-    backend._prefill_commands = Queue()
-    backend._prefill_responses = Queue()
+    backend._prefill_processes = [DeadProcess()]
+    backend._prefill_commands = [Queue()]
+    backend._prefill_responses = [Queue()]
     backend.operation_timeout = 30
     scheduled = []
-    backend._schedule_prefill_recovery = lambda: scheduled.append(True)
+    backend._schedule_prefill_recovery = lambda index: scheduled.append(True)
 
-    with pytest.raises(WorkerUnavailableError, match="prefill worker is not running"):
+    with pytest.raises(WorkerUnavailableError, match="prefill worker 0 is not running"):
         backend._prefill_rpc({"op": "prefill"}, 1)
 
     assert not backend.routing_stats().prefill_healthy
@@ -294,15 +298,15 @@ def test_prefill_recovery_retries_and_restores_pd_routing_health() -> None:
             super().__init__()
             self.restart_calls = 0
 
-        def _restart_prefill_worker_once(self):
+        def _restart_prefill_worker_once(self, index):
             self.restart_calls += 1
             if self.restart_calls == 1:
                 raise RuntimeError("prefill startup failed")
 
     backend = RecoveringPrefill()
-    backend._prefill_healthy = False
-    backend._prefill_recovering = True
-    backend._recover_prefill_worker()
+    backend._prefill_healthy = [False]
+    backend._prefill_recovering = [True]
+    backend._recover_prefill_worker(0)
     stats = backend.prefill_recovery_stats()
 
     assert backend.restart_calls == 2
@@ -315,7 +319,7 @@ def test_prefill_recovery_retries_and_restores_pd_routing_health() -> None:
 
 def test_unhealthy_prefill_worker_forces_new_request_to_collocated_route() -> None:
     backend = FakeMultiWorkerBackend()
-    backend._prefill_healthy = False
+    backend._prefill_healthy = [False]
     request = ServingRequest(88, tuple(range(20)), 2)
 
     assert backend.admit(request).admitted

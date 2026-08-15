@@ -462,22 +462,28 @@ class PrefixCache:
         return tuple(evicted)
 
     def _count_evictable(self, protected: set[int]) -> int:
-        def visit(node: _RadixNode) -> tuple[bool, int]:
-            blocked = id(node) in protected or node.references > 0
-            count_blocks = 0
-            for child in node.children.values():
-                child_blocked, child_count = visit(child)
-                blocked = blocked or child_blocked
-                count_blocks += child_count
-            if not blocked and node.block_id is not None:
-                count_blocks += 1
-            return blocked, count_blocks
-
+        # Iterative post-order so a 128K-token prefix (thousands of blocks) does
+        # not overflow the Python recursion limit.
         total = 0
         for root in self._roots.values():
-            for child in root.children.values():
-                _, count_blocks = visit(child)
-                total += count_blocks
+            nodes: list[_RadixNode] = []
+            stack = list(root.children.values())
+            while stack:
+                node = stack.pop()
+                nodes.append(node)
+                stack.extend(node.children.values())
+            blocked: dict[int, bool] = {}
+            count_blocks = 0
+            for node in reversed(nodes):
+                is_blocked = id(node) in protected or node.references > 0
+                if not is_blocked:
+                    is_blocked = any(
+                        blocked.get(id(child), False) for child in node.children.values()
+                    )
+                blocked[id(node)] = is_blocked
+                if not is_blocked and node.block_id is not None:
+                    count_blocks += 1
+            total += count_blocks
         return total
 
     @staticmethod
@@ -494,16 +500,25 @@ class PrefixCache:
 
     @classmethod
     def _leaves(cls, node: _RadixNode) -> list[_RadixNode]:
-        if not node.children:
-            return [] if node.parent is None else [node]
         leaves: list[_RadixNode] = []
-        for child in node.children.values():
-            leaves.extend(cls._leaves(child))
+        stack = [node]
+        while stack:
+            current = stack.pop()
+            if not current.children:
+                if current.parent is not None:
+                    leaves.append(current)
+            else:
+                stack.extend(current.children.values())
         return leaves
 
     @classmethod
     def _nodes(cls, node: _RadixNode) -> list[_RadixNode]:
-        nodes = [] if node.parent is None else [node]
-        for child in node.children.values():
-            nodes.extend(cls._nodes(child))
+        nodes: list[_RadixNode] = []
+        if node.parent is not None:
+            nodes.append(node)
+        stack = list(node.children.values())
+        while stack:
+            current = stack.pop()
+            nodes.append(current)
+            stack.extend(current.children.values())
         return nodes

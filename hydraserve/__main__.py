@@ -59,6 +59,7 @@ def main() -> int:
     serve_parser.add_argument("--device", default="cuda:0")
     serve_parser.add_argument("--decode-device", default="cuda:1")
     serve_parser.add_argument("--decode-devices", nargs="+")
+    serve_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
     serve_mode = serve_parser.add_mutually_exclusive_group()
     serve_mode.add_argument("--pd", action="store_true")
     serve_mode.add_argument("--adaptive", action="store_true")
@@ -97,6 +98,7 @@ def main() -> int:
     benchmark_parser.add_argument("--device", default="cuda:0")
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
     benchmark_parser.add_argument("--decode-devices", nargs="+")
+    benchmark_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
     benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
     benchmark_mode.add_argument("--pd", action="store_true")
     benchmark_mode.add_argument("--adaptive", action="store_true")
@@ -199,6 +201,7 @@ def main() -> int:
                     str(args.model),
                     tuple(args.decode_devices),
                     prefill_device=args.device,
+                    prefill_devices=tuple(args.prefill_devices) if args.prefill_devices else (),
                     cache_tokens_per_worker=args.cache_tokens,
                     block_size=args.block_size,
                     max_state_slots_per_worker=max_active_requests,
@@ -208,6 +211,7 @@ def main() -> int:
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                     kv_headroom_blocks=args.kv_headroom_blocks,
+                    kv_quant=args.kv_quant,
                 ),
                 router=router,
             )

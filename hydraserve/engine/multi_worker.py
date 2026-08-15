@@ -41,6 +41,7 @@ class PDClusterConfig:
     model_dir: str
     decode_devices: tuple[str, ...]
     prefill_device: str = "cuda:0"
+    prefill_devices: tuple[str, ...] = ()
     cache_tokens_per_worker: int = 65_536
     block_size: int = 16
     max_state_slots_per_worker: int = 64
@@ -51,13 +52,18 @@ class PDClusterConfig:
     kv_headroom_blocks: int = 0
     topologies: tuple[WorkerTopology, ...] = ()
     max_decode_batch_size_per_worker: int = 64
+    kv_quant: str | None = None
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
             raise ValueError("cluster requires a model and decode workers")
         if len(set(self.decode_devices)) != len(self.decode_devices):
             raise ValueError("decode devices must be unique")
-        if self.prefill_device in self.decode_devices:
+        if not self.prefill_devices:
+            object.__setattr__(self, "prefill_devices", (self.prefill_device,))
+        if len(set(self.prefill_devices)) != len(self.prefill_devices):
+            raise ValueError("prefill devices must be unique")
+        if set(self.prefill_devices) & set(self.decode_devices):
             raise ValueError("prefill and decode devices must be distinct")
         if min(
             self.cache_tokens_per_worker,
@@ -81,7 +87,7 @@ class PDClusterConfig:
     def worker_config(self, worker_index: int) -> PDWorkerConfig:
         return PDWorkerConfig(
             self.model_dir,
-            prefill_device=self.prefill_device,
+            prefill_device=self.prefill_devices[0],
             decode_device=self.decode_devices[worker_index],
             cache_tokens=self.cache_tokens_per_worker,
             block_size=self.block_size,
@@ -95,6 +101,25 @@ class PDClusterConfig:
             prefix_cache_blocks=self.prefix_cache_blocks,
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
             kv_headroom_blocks=self.kv_headroom_blocks,
+            kv_quant=self.kv_quant,
+        )
+
+    def prefill_config(self, index: int) -> PDWorkerConfig:
+        """Config for the index-th prefill worker (single state slot, no decode)."""
+        return PDWorkerConfig(
+            self.model_dir,
+            prefill_device=self.prefill_devices[index],
+            decode_device=self.decode_devices[0],
+            cache_tokens=self.cache_tokens_per_worker,
+            block_size=self.block_size,
+            use_flash_attention=self.use_flash_attention,
+            prefill_chunk_size=self.prefill_chunk_size,
+            max_state_slots=1,
+            max_decode_batch_size=1,
+            prefix_cache_blocks=self.prefix_cache_blocks,
+            prefix_cache_min_frequency=self.prefix_cache_min_frequency,
+            kv_headroom_blocks=self.kv_headroom_blocks,
+            kv_quant=self.kv_quant,
         )
 
 
@@ -159,9 +184,10 @@ class MultiWorkerGenerationBackend:
             f"{self.namespace}-decode-{index}" for index in range(worker_count)
         )
         self._context = mp.get_context("spawn")
-        self._prefill_commands = self._context.Queue()
-        self._prefill_responses = self._context.Queue()
-        self._prefill_lock = Lock()
+        prefill_count = len(config.prefill_devices)
+        self._prefill_commands = [self._context.Queue() for _ in range(prefill_count)]
+        self._prefill_responses = [self._context.Queue() for _ in range(prefill_count)]
+        self._prefill_locks = [Lock() for _ in range(prefill_count)]
         self._decode_commands = [self._context.Queue() for _ in range(worker_count)]
         self._decode_responses = [self._context.Queue() for _ in range(worker_count)]
         self._decode_locks = [Lock() for _ in range(worker_count)]
@@ -169,7 +195,10 @@ class MultiWorkerGenerationBackend:
             self._new_decode_process(index)
             for index in range(worker_count)
         ]
-        self._prefill = self._new_prefill_process()
+        self._prefill_processes = [
+            self._new_prefill_process(index)
+            for index in range(prefill_count)
+        ]
         total_blocks = (
             config.cache_tokens_per_worker + config.block_size - 1
         ) // config.block_size - config.kv_headroom_blocks
@@ -199,7 +228,7 @@ class MultiWorkerGenerationBackend:
         self._route_decisions: dict[int, RouteDecision] = {}
         self._lost_requests: set[int] = set()
         self._state_lock = RLock()
-        self._prefill_healthy = True
+        self._prefill_healthy = [True] * prefill_count
         self._closed = False
         self._collocated_count = 0
         self._pd_count = 0
@@ -210,26 +239,31 @@ class MultiWorkerGenerationBackend:
         self._recovery_attempts = 0
         self._recovery_successes = 0
         self._recovery_failures = 0
-        self._prefill_recovery_thread: Thread | None = None
-        self._prefill_recovering = False
-        self._prefill_recovery_attempts = 0
-        self._prefill_recovery_successes = 0
-        self._prefill_recovery_failures = 0
+        self._prefill_recovering = [False] * prefill_count
+        self._prefill_recovery_threads: list[Thread | None] = [None] * prefill_count
+        self._prefill_recovery_attempts = [0] * prefill_count
+        self._prefill_recovery_successes = [0] * prefill_count
+        self._prefill_recovery_failures = [0] * prefill_count
+        self._prefill_round_robin = 0
         self._replay_mismatches = 0
 
         for process in self._decode_processes:
             process.start()
-        self._prefill.start()
+        for process in self._prefill_processes:
+            process.start()
         try:
             decode_ready = [
                 self._get(queue, startup_timeout) for queue in self._decode_responses
             ]
-            prefill_ready = self._get(self._prefill_responses, startup_timeout)
+            prefill_ready = [
+                self._get(queue, startup_timeout) for queue in self._prefill_responses
+            ]
             for result in decode_ready:
                 self._check(result, "ready")
-            self._check(prefill_ready, "ready")
+            for result in prefill_ready:
+                self._check(result, "ready")
             names = {result["model_name"] for result in decode_ready}
-            names.add(prefill_ready["model_name"])
+            names.update(result["model_name"] for result in prefill_ready)
             if len(names) != 1:
                 raise RuntimeError("cluster workers loaded different models")
             self.model_name = names.pop()
@@ -534,7 +568,7 @@ class MultiWorkerGenerationBackend:
                 self._collocated_count,
                 self._pd_count,
                 self._pd_failures,
-                self._prefill_healthy,
+                any(self._prefill_healthy),
             )
 
     def routing_cost_stats(self):
@@ -562,11 +596,11 @@ class MultiWorkerGenerationBackend:
         self._prefill_available()
         with self._state_lock:
             return PrefillRecoveryStats(
-                self._prefill_healthy,
-                self._prefill_recovery_attempts,
-                self._prefill_recovery_successes,
-                self._prefill_recovery_failures,
-                self._prefill_recovering,
+                all(self._prefill_healthy),
+                sum(self._prefill_recovery_attempts),
+                sum(self._prefill_recovery_successes),
+                sum(self._prefill_recovery_failures),
+                any(self._prefill_recovering),
             )
 
     def transfer_validation_stats(self):
@@ -580,21 +614,22 @@ class MultiWorkerGenerationBackend:
             return
         self._closed = True
         self._recovery_stop.set()
-        with self._prefill_lock:
-            self._prefill_commands.put({"op": "shutdown"})
+        for commands in self._prefill_commands:
+            commands.put({"op": "shutdown"})
         for commands in self._decode_commands:
             commands.put({"op": "shutdown"})
         if not force:
-            try:
-                self._get(self._prefill_responses, 10.0)
-            except Exception:
-                pass
+            for responses in self._prefill_responses:
+                try:
+                    self._get(responses, 10.0)
+                except Exception:
+                    pass
             for responses in self._decode_responses:
                 try:
                     self._get(responses, 10.0)
                 except Exception:
                     pass
-        for process in (self._prefill, *self._decode_processes):
+        for process in (*self._prefill_processes, *self._decode_processes):
             process.join(10)
             if process.is_alive():
                 process.terminate()
@@ -661,80 +696,96 @@ class MultiWorkerGenerationBackend:
         self._update_worker_capacity(worker_id, result)
         return result
 
+    def _pick_prefill_worker(self) -> int:
+        with self._state_lock:
+            count = len(self._prefill_processes)
+            for offset in range(count):
+                index = (self._prefill_round_robin + offset) % count
+                if self._prefill_healthy[index]:
+                    self._prefill_round_robin = (index + 1) % count
+                    return index
+            return self._prefill_round_robin % count
+
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
+        index = self._pick_prefill_worker()
         failure = None
-        with self._prefill_lock:
+        with self._prefill_locks[index]:
             try:
-                if not self._prefill.is_alive():
-                    raise WorkerUnavailableError("prefill worker is not running")
-                self._prefill_commands.put(command)
-                result = self._get_prefill_response(self.operation_timeout)
+                if not self._prefill_processes[index].is_alive():
+                    raise WorkerUnavailableError(
+                        f"prefill worker {index} is not running"
+                    )
+                self._prefill_commands[index].put(command)
+                result = self._get_prefill_response(index, self.operation_timeout)
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc
         if failure is not None:
             with self._state_lock:
-                if self._prefill_healthy:
+                if self._prefill_healthy[index]:
                     self._pd_failures += 1
-                self._prefill_healthy = False
-            self._schedule_prefill_recovery()
+                self._prefill_healthy[index] = False
+            self._schedule_prefill_recovery(index)
             raise failure
         self._check(result, "prefill", request_id)
         return result
 
     def _prefill_available(self) -> bool:
         with self._state_lock:
-            healthy = self._prefill_healthy
+            healthy = any(self._prefill_healthy)
             closed = self._closed
-        process = getattr(self, "_prefill", None)
-        if not healthy or closed or process is None:
+        if not healthy or closed:
             return healthy and not closed
-        if process.is_alive():
-            return True
+        for index, process in enumerate(self._prefill_processes):
+            if self._prefill_healthy[index] and not process.is_alive():
+                with self._state_lock:
+                    if self._prefill_healthy[index]:
+                        self._prefill_healthy[index] = False
+                        self._pd_failures += 1
+                self._schedule_prefill_recovery(index)
         with self._state_lock:
-            if self._prefill_healthy:
-                self._prefill_healthy = False
-                self._pd_failures += 1
-        self._schedule_prefill_recovery()
-        return False
+            return any(self._prefill_healthy) and not closed
 
-    def _get_prefill_response(self, timeout: float):
+    def _get_prefill_response(self, index: int, timeout: float):
         deadline = monotonic() + timeout
         while True:
-            if not self._prefill.is_alive():
-                raise WorkerUnavailableError("prefill worker exited during RPC")
+            if not self._prefill_processes[index].is_alive():
+                raise WorkerUnavailableError(
+                    f"prefill worker {index} exited during RPC"
+                )
             remaining = deadline - monotonic()
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for prefill worker")
             try:
-                return self._prefill_responses.get(timeout=min(0.1, remaining))
+                return self._prefill_responses[index].get(timeout=min(0.1, remaining))
             except Empty:
                 continue
 
-    def _schedule_prefill_recovery(self) -> None:
+    def _schedule_prefill_recovery(self, index: int) -> None:
         with self._state_lock:
-            if self._closed or self._prefill_recovering:
+            if self._closed or self._prefill_recovering[index]:
                 return
-            self._prefill_recovering = True
+            self._prefill_recovering[index] = True
             thread = Thread(
                 target=self._recover_prefill_worker,
-                name="hydraserve-recover-prefill",
+                args=(index,),
+                name=f"hydraserve-recover-prefill-{index}",
                 daemon=True,
             )
-            self._prefill_recovery_thread = thread
+            self._prefill_recovery_threads[index] = thread
         thread.start()
 
-    def _recover_prefill_worker(self) -> None:
+    def _recover_prefill_worker(self, index: int) -> None:
         try:
             for attempt in range(self.max_worker_restarts):
                 if self._recovery_stop.is_set():
                     return
                 with self._state_lock:
-                    self._prefill_recovery_attempts += 1
+                    self._prefill_recovery_attempts[index] += 1
                 try:
-                    self._restart_prefill_worker_once()
+                    self._restart_prefill_worker_once(index)
                 except Exception:
                     with self._state_lock:
-                        self._prefill_recovery_failures += 1
+                        self._prefill_recovery_failures[index] += 1
                     delay = self.worker_restart_backoff_s * (2**attempt)
                     if self._recovery_stop.wait(delay):
                         return
@@ -742,28 +793,28 @@ class MultiWorkerGenerationBackend:
                 if self._recovery_stop.is_set():
                     return
                 with self._state_lock:
-                    self._prefill_healthy = True
-                    self._prefill_recovery_successes += 1
+                    self._prefill_healthy[index] = True
+                    self._prefill_recovery_successes[index] += 1
                 return
         finally:
             with self._state_lock:
-                self._prefill_recovering = False
-                self._prefill_recovery_thread = None
+                self._prefill_recovering[index] = False
+                self._prefill_recovery_threads[index] = None
 
-    def _restart_prefill_worker_once(self) -> None:
-        with self._prefill_lock:
+    def _restart_prefill_worker_once(self, index: int) -> None:
+        with self._prefill_locks[index]:
             if self._recovery_stop.is_set():
                 return
-            previous = self._prefill
+            previous = self._prefill_processes[index]
             if previous.is_alive():
                 previous.terminate()
             previous.join(10)
-            self._prefill_commands = self._context.Queue()
-            self._prefill_responses = self._context.Queue()
-            process = self._new_prefill_process()
-            self._prefill = process
+            self._prefill_commands[index] = self._context.Queue()
+            self._prefill_responses[index] = self._context.Queue()
+            process = self._new_prefill_process(index)
+            self._prefill_processes[index] = process
             process.start()
-            result = self._get_prefill_response(self.startup_timeout)
+            result = self._get_prefill_response(index, self.startup_timeout)
             self._check(result, "ready")
             if result.get("model_name") != self.model_name:
                 raise RuntimeError("restarted prefill worker loaded a different model")
@@ -870,16 +921,16 @@ class MultiWorkerGenerationBackend:
             name=f"hydraserve-decode-{worker_id}",
         )
 
-    def _new_prefill_process(self):
+    def _new_prefill_process(self, index: int):
         return self._context.Process(
             target=_prefill_worker,
             args=(
-                self.config.worker_config(0),
+                self.config.prefill_config(index),
                 self._namespaces,
-                self._prefill_commands,
-                self._prefill_responses,
+                self._prefill_commands[index],
+                self._prefill_responses[index],
             ),
-            name="hydraserve-prefill",
+            name=f"hydraserve-prefill-{index}",
         )
 
     def _prefix_match(self, request: ServingRequest, worker_id: int) -> int:
