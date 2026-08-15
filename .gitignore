@@ -7,4 +7,3 @@ htmlcov/
 .venv/
 dist/
 build/
-benchmark_output/

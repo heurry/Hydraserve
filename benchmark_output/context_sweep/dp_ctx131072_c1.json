@@ -1,0 +1,54 @@
+{
+  "requests": 1,
+  "succeeded": 1,
+  "failed": 0,
+  "wall_time_s": 74.13933038897812,
+  "request_throughput": 0.013488117504614856,
+  "output_token_throughput": 0.4316197601476754,
+  "warmup_requests": 1,
+  "offered_request_rate": null,
+  "arrival_pattern": "burst",
+  "ttft_ms": {
+    "p50": 65353.82499918342,
+    "p95": 65353.82499918342,
+    "p99": 65353.82499918342
+  },
+  "tpot_ms": {
+    "p50": 261.6263724142505,
+    "p95": 261.6263724142505,
+    "p99": 261.6263724142505
+  },
+  "latency_ms": {
+    "p50": 73464.24254402518,
+    "p95": 73464.24254402518,
+    "p99": 73464.24254402518
+  },
+  "route_counts": {
+    "collocated": 1
+  },
+  "results": [
+    {
+      "sample_id": "synthetic-1",
+      "request_id": 1,
+      "prompt_tokens": 131072,
+      "completion_tokens": 32,
+      "ttft_ms": 65353.82499918342,
+      "tpot_ms": 261.6263724142505,
+      "latency_ms": 73464.24254402518,
+      "finish_reason": "length",
+      "error": null,
+      "route": "collocated",
+      "route_reason": "fixed_collocated",
+      "worker_id": 0,
+      "route_collocated_cost_ms": null,
+      "route_pd_cost_ms": null,
+      "route_estimated_savings_ms": null,
+      "route_cost_confidence": null,
+      "route_decode_load": 0.0,
+      "route_prefill_queue_ahead_ms": 0.0,
+      "route_observed_prefill_service_ms": null,
+      "admission_wait_ms": 39.90304097533226,
+      "observed_prefill_queue_wait_ms": null
+    }
+  ]
+}

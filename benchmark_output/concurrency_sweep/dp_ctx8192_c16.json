@@ -1,0 +1,16 @@
+{
+  "requests": 0,
+  "succeeded": 0,
+  "failed": 0,
+  "wall_time_s": 0.00032532960176467896,
+  "request_throughput": 0.0,
+  "output_token_throughput": 0.0,
+  "warmup_requests": 8,
+  "offered_request_rate": null,
+  "arrival_pattern": "burst",
+  "ttft_ms": {},
+  "tpot_ms": {},
+  "latency_ms": {},
+  "route_counts": {},
+  "results": []
+}
