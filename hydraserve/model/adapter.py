@@ -1,30 +1,30 @@
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Iterable
+from typing import Any, Protocol, runtime_checkable
 
-from hydraserve.config import LayerKind, ModelConfig
+from hydraserve.config import ModelConfig
 
 
-class ModelAdapter(ABC):
-    """Boundary between engine scheduling and a concrete model runtime."""
+@runtime_checkable
+class ModelAdapter(Protocol):
+    """Structural contract consumed by HydraServe generation backends."""
 
-    def __init__(self, config: ModelConfig) -> None:
-        self.config = config
+    @property
+    def config(self) -> ModelConfig: ...
 
-    def layer_type(self, layer_index: int) -> LayerKind:
-        if not 0 <= layer_index < self.config.num_hidden_layers:
-            raise IndexError(f"layer {layer_index} is out of range")
-        return self.config.layer_types[layer_index]
+    @property
+    def device(self) -> Any: ...
 
-    @abstractmethod
-    def prefill_layer(
-        self, layer_index: int, hidden_states: Any, positions: Iterable[int]
-    ) -> tuple[Any, dict[str, Any]]:
-        """Return next hidden states and the transferable state for this layer."""
+    @property
+    def input_device(self) -> Any: ...
 
-    @abstractmethod
-    def decode_token(
-        self, token_id: int, kv_cache: Any, recurrent_state: Any
-    ) -> tuple[Any, Any]:
-        """Return logits and updated recurrent state."""
+    def prefill(
+        self,
+        input_ids,
+        *,
+        chunk_size: int,
+        paged_cache=None,
+        request_id: int | None = None,
+    ): ...
+
+    def decode_batch(self, input_ids, states, paged_cache, request_ids): ...
