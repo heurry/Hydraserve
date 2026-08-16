@@ -1,0 +1,15 @@
+{
+  "collocated": {
+    "fixed_ms": 28.075501691917207,
+    "linear_ms_per_token": 0.3720540365424588,
+    "quadratic_ms_per_token2": 0.00043369855004635356,
+    "decode_load_scale": 0.1571279209918884
+  },
+  "pd_disaggregated": {
+    "fixed_ms": 216.26650429730614,
+    "linear_ms_per_token": 1.478002962857347,
+    "quadratic_ms_per_token2": 0.00036159295511324613,
+    "decode_load_scale": 0.0
+  },
+  "force_pd_tokens": 4096
+}
