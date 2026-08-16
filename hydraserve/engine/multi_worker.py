@@ -819,12 +819,16 @@ class MultiWorkerGenerationBackend:
     def _pick_prefill_worker(self) -> int:
         with self._state_lock:
             count = len(self._prefill_processes)
-            for offset in range(count):
-                index = (self._prefill_round_robin + offset) % count
-                if self._prefill_healthy[index]:
-                    self._prefill_round_robin = (index + 1) % count
-                    return index
-            return self._prefill_round_robin % count
+            candidates = [
+                index for index in range(count) if self._prefill_healthy[index]
+            ]
+            if not candidates:
+                return self._prefill_round_robin % count
+            # Least-loaded dispatch: the worker with the fewest in-flight
+            # commands gets the next long prefill, keeping the nP pool balanced.
+            index = min(candidates, key=lambda i: self._prefill_pending[i])
+            self._prefill_round_robin = (index + 1) % count
+            return index
 
     def _pick_serve_prefill_worker(self) -> int | None:
         """Pick an idle prefill worker for a collocated short request (W4).

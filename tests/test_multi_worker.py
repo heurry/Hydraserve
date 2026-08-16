@@ -338,3 +338,17 @@ def test_unhealthy_prefill_worker_forces_new_request_to_collocated_route() -> No
     assert request.route == "collocated"
     assert request.route_reason == "prefill_unavailable"
     backend.release(request.request_id)
+
+
+def test_pick_prefill_worker_prefers_least_loaded() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend._prefill_processes = [None, None]
+    backend._prefill_healthy = [True, True]
+    backend._prefill_round_robin = 0
+    backend._prefill_pending = [2, 0]
+    assert backend._pick_prefill_worker() == 1
+    backend._prefill_pending = [0, 3]
+    assert backend._pick_prefill_worker() == 0
+    backend._prefill_healthy = [False, True]
+    backend._prefill_pending = [0, 5]
+    assert backend._pick_prefill_worker() == 1

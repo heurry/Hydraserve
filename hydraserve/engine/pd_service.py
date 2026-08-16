@@ -227,8 +227,39 @@ def _prefill_worker(
             }
 
         responses.put({"op": "ready", "model_name": runtime.config.name})
+        # W5: short-request operations (admission, decode steps, collocated
+        # prepare) jump ahead of queued long prefills instead of stalling
+        # behind the multi-second GPU work. A short-op budget keeps a
+        # continuous short burst from starving the long prefill queue.
+        from collections import deque
+        from queue import Empty
+
+        SHORT_OPS = {"decode", "reserve", "release", "collocated_prepare"}
+        pending_short = deque()
+        pending_long = deque()
+        short_budget = 64
         while True:
-            command = commands.get()
+            while True:
+                try:
+                    queued = commands.get_nowait()
+                except Empty:
+                    break
+                if queued.get("op") in SHORT_OPS:
+                    pending_short.append(queued)
+                else:
+                    pending_long.append(queued)
+            if pending_short and short_budget > 0:
+                command = pending_short.popleft()
+                short_budget -= 1
+            elif pending_long:
+                command = pending_long.popleft()
+                short_budget = 64
+            else:
+                command = commands.get()
+                if command.get("op") in SHORT_OPS:
+                    short_budget = max(0, short_budget - 1)
+                else:
+                    short_budget = 64
             operation = command["op"]
             if operation == "shutdown":
                 for request_id in tuple(set(states) | reservations):
