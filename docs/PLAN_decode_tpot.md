@@ -69,6 +69,18 @@ prefill 无关——所以 plan 原定的 W4/W5/W6(prefill 侧杠杆,为 128K �
 
 ### 5.4 里程碑
 
-- M1:kernel correctness 对齐 + 单卡微基准测出 ≥1.3× 加速;
-- M2:端到端 TPOT p99 压到 <400ms,画出 4×DP / 2P+2D 的新帕累托点;
+- ✅ **M1 已完成(2026-08-16,单卡)**:
+  - correctness:12 个配置(block_t 64/128 × num_splits 2/4/8 × num_warps 4/8)
+    全部对齐旧 kernel 与 CPU reference(max diff ≤5e-4);新增 6 个 pytest 用例;
+  - 微基准(64K context):batch 1/4/8 = **15.3× / 4.83× / 4.43×**;
+  - 端到端 A/B(单卡 64K 混合负载,c4、固定交错序、prefix cache 开):
+    **TPOT p99 448.4 → 346.4ms(−23%,<400ms)**,TPOT p50 162.5 → 66.5ms(−59%),
+    长请求 TPOT p50 178 → 71.7ms(−60%),吞吐 17.0 → 21.4 tok/s(+26%)。
+    注意:本地 A/B 是 c4 + 固定顺序,云端标准是 **c16 + seed 42 随机打乱**,
+    方向可迁移,收官数据必须按云端标准配置重跑。
+- **M2(待云端)**:按 [BENCHMARK_2026-08-16_PARETO.md](BENCHMARK_2026-08-16_PARETO.md)
+  的标准配置(72 条 seed 42 随机打乱、c16、int8 KV、prefix 4000、chunk 65536、
+  burst、128 输出)重跑 **2P+2D 与 4×DP**,确认两者 TPOT p99 <400ms 且吞吐
+  ≥18 tok/s,更新帕累托图。A/B 开关:`HYDRASERVE_PAGED_ATTENTION=reference`
+  回退旧 kernel。
 - M3(可选):叠加 INT4 KV 或投机解码,继续逼近。

@@ -112,3 +112,39 @@ def test_triton_paged_attention_matches_reference(
     expected = reference_paged_attention(query, key, value, table, sequence_lengths)
     actual = triton_paged_attention(query, key, value, table, sequence_lengths)
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+
+@pytest.mark.parametrize("block_t", [64, 128])
+@pytest.mark.parametrize("num_splits", [2, 4, 8])
+def test_triton_paged_attention_splitk_matches_reference(
+    num_splits: int, block_t: int
+) -> None:
+    from hydraserve.kernels.paged_attention import paged_attention_splitk
+
+    torch.manual_seed(4)
+    batch, query_heads, kv_heads, head_dim = 3, 8, 2, 32
+    block_size = 4
+    lengths = [1, 40, 79]
+    table_width = (max(lengths) + block_size - 1) // block_size
+    physical_blocks = batch * table_width
+    query = torch.randn(batch, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(
+        physical_blocks, block_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    value = torch.randn_like(key)
+    table = torch.arange(
+        physical_blocks, device="cuda", dtype=torch.int32
+    ).reshape(batch, table_width)
+    table[1] = table[1].flip(0)
+    sequence_lengths = torch.tensor(lengths, device="cuda", dtype=torch.int32)
+    expected = reference_paged_attention(query, key, value, table, sequence_lengths)
+    actual = paged_attention_splitk(
+        query,
+        key,
+        value,
+        table,
+        sequence_lengths,
+        num_splits=num_splits,
+        block_t=block_t,
+    )
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)

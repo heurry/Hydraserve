@@ -475,9 +475,21 @@ class QwenTextRuntime:
             logical_positions=logical_positions,
         )
         key_pages, value_pages = paged_cache.layer_cache(layer_index)
-        from hydraserve.kernels.paged_attention import paged_attention
+        from hydraserve.kernels.paged_attention import (
+            paged_attention,
+            paged_attention_splitk,
+        )
 
-        attention = paged_attention(query[:, 0], key_pages, value_pages, table, lengths)[:, None]
+        # FlashDecoding-style split-K decode attention is the default; set
+        # HYDRASERVE_PAGED_ATTENTION=reference to fall back to the original
+        # sequential kernel for A/B comparisons.
+        import os
+
+        if os.environ.get("HYDRASERVE_PAGED_ATTENTION") == "reference":
+            attention = paged_attention(query[:, 0], key_pages, value_pages, table, lengths)
+        else:
+            attention = paged_attention_splitk(query[:, 0], key_pages, value_pages, table, lengths)
+        attention = attention[:, None]
         attention = attention.reshape(batch, 1, -1) * torch.sigmoid(
             output_gate.reshape(batch, 1, -1)
         )
