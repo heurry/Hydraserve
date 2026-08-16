@@ -198,9 +198,7 @@ class PrefixCache:
         if full_blocks == 0:
             return PrefixMatch(0, ())
         canonical_tokens = tokens[: full_blocks * self.block_size]
-        frequency_key = (namespace, canonical_tokens)
         with self._lock:
-            frequency = self._record_frequency(frequency_key)
             root = self._root(namespace)
             node = root
             existing_path: list[_RadixNode] = []
@@ -212,36 +210,80 @@ class PrefixCache:
                 child = node.children.get(token_block)
                 if child is None:
                     new_blocks += 1
-                    node = _RadixNode(token_block, parent=node)
+                    child = _RadixNode(token_block, parent=node)
+                    node.children[token_block] = child
+                    node = child
                     continue
                 if child.block_id is not None and child.block_id != blocks[index]:
                     raise ValueError("the same token prefix is already mapped to another KV block")
                 existing_path.append(child)
                 node = child
+            shared_blocks = len(existing_path)
+            # Frequency is counted on the shared prefix, not the full prompt
+            # sequence: distinct tails must not stop a reused prefix from
+            # passing the doorkeeper. With no shared path yet, record the full
+            # sequence so an identical second sighting is admitted. A fresh
+            # shared-prefix key gets +1 because the tree path itself proves
+            # one earlier sighting.
+            if shared_blocks:
+                shared_key = (
+                    namespace,
+                    canonical_tokens[: shared_blocks * self.block_size],
+                )
+                first_recording = self._frequency.get(shared_key) is None
+                frequency = self._record_frequency(shared_key)
+                if first_recording:
+                    frequency += 1
+            else:
+                frequency = self._record_frequency((namespace, canonical_tokens))
 
-            candidate = PrefixCandidate(
-                namespace=namespace,
-                token_ids=canonical_tokens,
-                blocks=full_blocks,
-                block_size=self.block_size,
-                frequency=frequency,
-                recompute_cost_ms=float(
-                    recompute_cost_ms
-                    if recompute_cost_ms is not None
-                    else full_blocks * self.block_size
-                ),
-                bytes_per_block=bytes_per_block,
-                cache_capacity_blocks=self.max_blocks,
+            def candidate(blocks_count: int, freq: int) -> PrefixCandidate:
+                return PrefixCandidate(
+                    namespace=namespace,
+                    token_ids=canonical_tokens[: blocks_count * self.block_size],
+                    blocks=blocks_count,
+                    block_size=self.block_size,
+                    frequency=freq,
+                    recompute_cost_ms=float(
+                        recompute_cost_ms
+                        if recompute_cost_ms is not None
+                        else blocks_count * self.block_size
+                    ),
+                    bytes_per_block=bytes_per_block,
+                    cache_capacity_blocks=self.max_blocks,
+                )
+
+            # Admit the full entry first; fall back to the shared prefix so a
+            # fresh tail never hides a reusable prefix behind the doorkeeper.
+            full_frequency = frequency if shared_blocks == full_blocks else 1
+            admitted_blocks = 0
+            admitted, reason = self.policy.admit(
+                candidate(full_blocks, full_frequency)
             )
-            admitted, reason = self.policy.admit(candidate)
-            if not admitted:
+            if admitted:
+                admitted_blocks = full_blocks
+            elif shared_blocks:
+                admitted, reason = self.policy.admit(
+                    candidate(shared_blocks, frequency)
+                )
+                if admitted:
+                    admitted_blocks = shared_blocks
+            if not admitted_blocks:
                 self._rejected_admissions += 1
                 self._record_rejection(reason)
+                self._prune_blockless_leaves()
                 return PrefixMatch(0, (), admitted=False, reason=reason)
 
+            admitted_candidate = candidate(admitted_blocks, frequency)
             evicted: tuple[int, ...] = ()
             if self.max_blocks is not None:
-                required = max(0, self._cached_blocks + new_blocks - self.max_blocks)
+                refillable = sum(
+                    1 for path_node in existing_path if path_node.block_id is None
+                )
+                new_cached = refillable + (
+                    new_blocks if admitted_blocks > shared_blocks else 0
+                )
+                required = max(0, self._cached_blocks + new_cached - self.max_blocks)
                 protected = {id(path_node) for path_node in existing_path}
                 available = self._count_evictable(protected)
                 if required > available:
@@ -256,8 +298,9 @@ class PrefixCache:
                 evicted = self._evict_locked(required, protected, "cache_capacity")
 
             node = root
-            cost_per_block = candidate.recompute_cost_ms / full_blocks
-            for index in range(full_blocks):
+            cost_per_block = admitted_candidate.recompute_cost_ms / admitted_blocks
+            inserted_indices: list[int] = []
+            for index in range(admitted_blocks):
                 token_block = canonical_tokens[
                     index * self.block_size : (index + 1) * self.block_size
                 ]
@@ -265,6 +308,8 @@ class PrefixCache:
                 if child is None:
                     child = _RadixNode(token_block, parent=node)
                     node.children[token_block] = child
+                if child.block_id is None:
+                    inserted_indices.append(index)
                     self._cached_blocks += 1
                 child.block_id = blocks[index]
                 child.last_access = next(self._clock)
@@ -274,10 +319,10 @@ class PrefixCache:
                 child.bytes_per_block = bytes_per_block
                 node = child
             self._admissions += 1
-            inserted = blocks[full_blocks - new_blocks : full_blocks]
+            inserted = tuple(blocks[index] for index in inserted_indices)
             return PrefixMatch(
-                full_blocks * self.block_size,
-                blocks[:full_blocks],
+                admitted_blocks * self.block_size,
+                blocks[:admitted_blocks],
                 evicted_block_ids=evicted,
                 inserted_block_ids=inserted,
             )
@@ -367,6 +412,36 @@ class PrefixCache:
     def _record_rejection(self, reason: str | None) -> None:
         key = reason or "unspecified"
         self._rejection_reasons[key] = self._rejection_reasons.get(key, 0) + 1
+
+    def _prune_blockless_leaves(self) -> None:
+        """Bound metadata growth from rejected scans.
+
+        Rejected inserts leave block-less radix nodes behind so a second
+        sighting of the same prefix can refill them; prune the leaf excess
+        once the total exceeds the frequency-metadata budget.
+        """
+        blockless = sum(
+            1
+            for root in self._roots.values()
+            for node in self._nodes(root)
+            if node.block_id is None
+        )
+        excess = blockless - self.max_frequency_entries
+        if excess <= 0:
+            return
+        victims = [
+            (namespace, node)
+            for namespace, root in self._roots.items()
+            for node in self._leaves(root)
+            if node.block_id is None
+        ][:excess]
+        for _, victim in victims:
+            parent = victim.parent
+            if parent is not None and victim.token_block is not None:
+                parent.children.pop(victim.token_block, None)
+        for namespace, root in tuple(self._roots.items()):
+            if not root.children:
+                self._roots.pop(namespace, None)
 
     def _record_frequency(
         self, key: tuple[CacheNamespace, tuple[int, ...]]

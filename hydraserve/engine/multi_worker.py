@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import multiprocessing as mp
+from pathlib import Path
 from queue import Empty
 from threading import Event, Lock, RLock, Thread
 from time import monotonic
@@ -53,6 +54,7 @@ class PDClusterConfig:
     topologies: tuple[WorkerTopology, ...] = ()
     max_decode_batch_size_per_worker: int = 64
     kv_quant: str | None = None
+    worker_log_dir: str = ""
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
@@ -184,6 +186,8 @@ class MultiWorkerGenerationBackend:
             f"{self.namespace}-decode-{index}" for index in range(worker_count)
         )
         self._context = mp.get_context("spawn")
+        if config.worker_log_dir:
+            Path(config.worker_log_dir).mkdir(parents=True, exist_ok=True)
         prefill_count = len(config.prefill_devices)
         self._prefill_commands = [self._context.Queue() for _ in range(prefill_count)]
         self._prefill_responses = [self._context.Queue() for _ in range(prefill_count)]
@@ -258,10 +262,20 @@ class MultiWorkerGenerationBackend:
             prefill_ready = [
                 self._get(queue, startup_timeout) for queue in self._prefill_responses
             ]
-            for result in decode_ready:
-                self._check(result, "ready")
-            for result in prefill_ready:
-                self._check(result, "ready")
+            for index, result in enumerate(decode_ready):
+                try:
+                    self._check(result, "ready")
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"decode worker {index} failed startup: {exc}"
+                    ) from exc
+            for index, result in enumerate(prefill_ready):
+                try:
+                    self._check(result, "ready")
+                except RuntimeError as exc:
+                    raise RuntimeError(
+                        f"prefill worker {index} failed startup: {exc}"
+                    ) from exc
             names = {result["model_name"] for result in decode_ready}
             names.update(result["model_name"] for result in prefill_ready)
             if len(names) != 1:
@@ -917,6 +931,7 @@ class MultiWorkerGenerationBackend:
                 self._decode_commands[worker_id],
                 self._decode_responses[worker_id],
                 worker_id,
+                self._worker_log_path("decode", worker_id),
             ),
             name=f"hydraserve-decode-{worker_id}",
         )
@@ -929,9 +944,15 @@ class MultiWorkerGenerationBackend:
                 self._namespaces,
                 self._prefill_commands[index],
                 self._prefill_responses[index],
+                self._worker_log_path("prefill", index),
             ),
             name=f"hydraserve-prefill-{index}",
         )
+
+    def _worker_log_path(self, kind: str, index: int) -> str | None:
+        if not self.config.worker_log_dir:
+            return None
+        return str(Path(self.config.worker_log_dir) / f"{kind}-{index}.log")
 
     def _prefix_match(self, request: ServingRequest, worker_id: int) -> int:
         if self.prefix_affinity is not None:

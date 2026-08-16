@@ -126,3 +126,36 @@ def test_frequency_doorkeeper_metadata_is_bounded() -> None:
     for token in range(20):
         cache.insert((token,), (token,))
     assert cache.stats().frequency_entries <= 2
+
+
+def test_doorkeeper_admits_shared_prefix_across_distinct_tails() -> None:
+    """Bug B regression: a reused prefix must pass the frequency doorkeeper
+    even when each full prompt has a distinct tail."""
+    cache = PrefixCache(
+        block_size=2,
+        policy=CostAwarePrefixPolicy(minimum_frequency=2),
+    )
+    first = cache.insert((1, 2, 5, 6), (10, 11))
+    assert not first.admitted
+    second = cache.insert((1, 2, 7, 8), (20, 21))
+    assert second.admitted
+    assert second.matched_tokens == 2
+    assert second.inserted_block_ids == (20,)
+    third = cache.match((1, 2, 9, 10))
+    assert third.matched_tokens == 2
+    assert third.block_ids == (20,)
+    stats = cache.stats()
+    assert stats.cached_blocks == 1
+    assert stats.admissions == 1
+    assert stats.rejected_admissions == 1
+
+
+def test_doorkeeper_still_rejects_a_single_distinct_tail() -> None:
+    cache = PrefixCache(
+        block_size=2,
+        policy=CostAwarePrefixPolicy(minimum_frequency=2),
+    )
+    result = cache.insert((1, 2, 5, 6), (10, 11))
+    assert not result.admitted
+    assert "frequency" in result.reason
+    assert cache.stats().cached_blocks == 0

@@ -60,6 +60,7 @@ def main() -> int:
     serve_parser.add_argument("--decode-device", default="cuda:1")
     serve_parser.add_argument("--decode-devices", nargs="+")
     serve_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
+    serve_parser.add_argument("--worker-log-dir", default="", help="capture per-worker stderr into this directory")
     serve_mode = serve_parser.add_mutually_exclusive_group()
     serve_mode.add_argument("--pd", action="store_true")
     serve_mode.add_argument("--adaptive", action="store_true")
@@ -99,6 +100,7 @@ def main() -> int:
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
     benchmark_parser.add_argument("--decode-devices", nargs="+")
     benchmark_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
+    benchmark_parser.add_argument("--worker-log-dir", default="", help="capture per-worker stderr into this directory")
     benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
     benchmark_mode.add_argument("--pd", action="store_true")
     benchmark_mode.add_argument("--adaptive", action="store_true")
@@ -212,6 +214,7 @@ def main() -> int:
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
+                    worker_log_dir=args.worker_log_dir,
                 ),
                 router=router,
             )
@@ -231,6 +234,7 @@ def main() -> int:
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
+                worker_log_dir=args.worker_log_dir,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)
@@ -415,6 +419,7 @@ def main() -> int:
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
+                worker_log_dir=args.worker_log_dir,
             )
             backend = (
                 AdaptiveGenerationBackend(worker_config, router=router)

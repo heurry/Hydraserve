@@ -40,6 +40,7 @@ class PDWorkerConfig:
     kv_headroom_blocks: int = 0
     max_decode_batch_size: int = 64
     kv_quant: str | None = None
+    worker_log_dir: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,7 +99,12 @@ def _prefill_worker(
     namespace: str | tuple[str, ...],
     commands,
     responses,
+    stderr_path: str | None = None,
 ) -> None:
+    if stderr_path:
+        import sys
+
+        sys.stderr = open(stderr_path, "a", buffering=1)
     backends = []
     try:
         import torch
@@ -147,6 +153,9 @@ def _prefill_worker(
         for worker_index, worker_namespace in enumerate(namespaces):
             backend = SharedMemoryTransferBackend(namespace=worker_namespace)
             backends.append(backend)
+            # ``dst_gpu`` is a logical mailbox id (decode index + 1) shared by
+            # every prefill worker and the matching decode worker; it is not
+            # the physical GPU number and must stay consistent across nP.
             workers.append(
                 PrefillWorker(
                     runtime,
@@ -212,7 +221,12 @@ def _decode_worker(
     commands,
     responses,
     worker_index: int = 0,
+    stderr_path: str | None = None,
 ) -> None:
+    if stderr_path:
+        import sys
+
+        sys.stderr = open(stderr_path, "a", buffering=1)
     backend = None
     try:
         import torch
@@ -1110,6 +1124,7 @@ class DisaggregatedGenerationBackend:
                 self.namespace,
                 self._prefill_commands,
                 self._prefill_responses,
+                self._worker_log_path("prefill"),
             ),
             name="hydraserve-prefill",
         )
@@ -1122,9 +1137,17 @@ class DisaggregatedGenerationBackend:
                 self.namespace,
                 self._decode_commands,
                 self._decode_responses,
+                0,
+                self._worker_log_path("decode"),
             ),
             name="hydraserve-decode",
         )
+
+    def _worker_log_path(self, kind: str) -> str | None:
+        if not self.config.worker_log_dir:
+            return None
+        Path(self.config.worker_log_dir).mkdir(parents=True, exist_ok=True)
+        return str(Path(self.config.worker_log_dir) / f"{kind}.log")
 
     def close(self, *, force: bool = False) -> None:
         if self._closed:
