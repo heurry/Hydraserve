@@ -92,7 +92,10 @@ def paged_prefill_attention(
     if query.is_cuda:
         import os
 
-        if os.environ.get("HYDRASERVE_PAGED_PREFILL") == "reference":
+        if (
+            os.environ.get("HYDRASERVE_PAGED_PREFILL") == "reference"
+            or head_dim < 16
+        ):
             output = paged_attention(
                 flattened, key_cache, value_cache, tables, lengths
             )

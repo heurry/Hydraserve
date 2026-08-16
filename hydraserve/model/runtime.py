@@ -467,7 +467,14 @@ class QwenTextRuntime:
         entry = self._decode_graphs.get(key)
         if entry is None and not self._decode_graph_failed.get(key, False):
             entry = self._capture_decode_graph(
-                key, input_ids, states, paged_cache, request_ids, pooled_batch
+                key,
+                input_ids,
+                states,
+                paged_cache,
+                request_ids,
+                pooled_batch,
+                table,
+                lengths,
             )
             if entry is not None:
                 self._decode_graphs[key] = entry
@@ -498,7 +505,15 @@ class QwenTextRuntime:
         return entry["logits"], states
 
     def _capture_decode_graph(
-        self, key, input_ids, states, paged_cache, request_ids, pooled_batch
+        self,
+        key,
+        input_ids,
+        states,
+        paged_cache,
+        request_ids,
+        pooled_batch,
+        table=None,
+        lengths=None,
     ) -> dict | None:
         import torch
 
@@ -579,7 +594,8 @@ class QwenTextRuntime:
             dtype=torch.long,
         )
         static["positions"].copy_(positions)
-        table, lengths = paged_cache.batch_metadata(request_ids)
+        if table is None or lengths is None:
+            table, lengths = paged_cache.batch_metadata(request_ids)
         static["table"].copy_(table)
         static["lengths"].copy_(lengths)
         try:
@@ -693,7 +709,10 @@ class QwenTextRuntime:
         # sequential kernel for A/B comparisons.
         import os
 
-        if os.environ.get("HYDRASERVE_PAGED_ATTENTION") == "reference":
+        if (
+            os.environ.get("HYDRASERVE_PAGED_ATTENTION") == "reference"
+            or config.head_dim < 16
+        ):
             attention = paged_attention(query[:, 0], key_pages, value_pages, table, lengths)
         else:
             attention = paged_attention_splitk(query[:, 0], key_pages, value_pages, table, lengths)
