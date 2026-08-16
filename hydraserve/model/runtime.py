@@ -66,6 +66,8 @@ class QwenTextRuntime:
         self.use_triton = use_triton
         self.use_flash_attention = use_flash_attention
         self._runtime_device = device
+        self._decode_graphs: dict = {}
+        self._decode_graph_failed: dict = {}
         self._validate_weight_shapes()
 
     @classmethod
@@ -316,31 +318,55 @@ class QwenTextRuntime:
             else state_pool.batch(request_ids, states)
         )
         with context as pooled_batch:
+            if pooled_batch is not None and self._use_cuda_graphs():
+                return self._decode_batch_graph(
+                    input_ids, states, paged_cache, request_ids, pooled_batch
+                )
             return self._decode_batch_transaction(
                 input_ids, states, paged_cache, request_ids, pooled_batch
             )
 
     def _decode_batch_transaction(
-        self, input_ids, states, paged_cache, request_ids, pooled_batch
+        self,
+        input_ids,
+        states,
+        paged_cache,
+        request_ids,
+        pooled_batch,
+        *,
+        static: dict | None = None,
+        advance_sequence: bool = True,
     ):
         import torch
 
         batch = input_ids.shape[0]
-        positions = torch.tensor(
-            [[state.sequence_length] for state in states],
-            device=self.device,
-            dtype=torch.long,
-        )
+        if static is None:
+            positions = torch.tensor(
+                [[state.sequence_length] for state in states],
+                device=self.device,
+                dtype=torch.long,
+            )
+        else:
+            positions = static["positions"]
         embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
-        if input_ids.device != embedding.device:
+        if static is None and input_ids.device != embedding.device:
             input_ids = input_ids.to(embedding.device)
+        elif static is not None:
+            input_ids = static["input_ids"]
         hidden = self._embedding(input_ids, embedding)
         combined = RuntimeState()
-        paged_metadata = (
-            paged_cache.batch_metadata(request_ids)
-            if self.config.num_full_attention_layers
-            else None
-        )
+        if static is None:
+            paged_metadata = (
+                paged_cache.batch_metadata(request_ids)
+                if self.config.num_full_attention_layers
+                else None
+            )
+        else:
+            paged_metadata = (
+                (static["table"], static["lengths"])
+                if self.config.num_full_attention_layers
+                else None
+            )
         logical_positions = tuple(state.sequence_length for state in states)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
@@ -389,6 +415,8 @@ class QwenTextRuntime:
         # The output projection is part of the transaction: do not publish state
         # if it fails after all transformer layers have run.
         logits = self._linear(hidden, self._output_weight()).float()
+        if static is not None:
+            static["logits"].copy_(logits)
         if pooled_batch is None:
             for layer_index, recurrent in combined.recurrent.items():
                 convolution = combined.convolution[layer_index]
@@ -405,9 +433,189 @@ class QwenTextRuntime:
                     layer_index, recurrent, combined.convolution[layer_index]
                 )
             pooled_batch.commit()
+        if advance_sequence:
+            for state in states:
+                state.sequence_length += 1
+        if static is not None:
+            return static["logits"], states
+        return logits, states
+
+    def _use_cuda_graphs(self) -> bool:
+        import os
+
+        import torch
+
+        return (
+            os.environ.get("HYDRASERVE_CUDA_GRAPH", "1") != "0"
+            and torch.cuda.is_available()
+        )
+
+    def _decode_batch_graph(
+        self, input_ids, states, paged_cache, request_ids, pooled_batch
+    ):
+        """Replay a captured decode step for this batch shape.
+
+        Host-side inputs (token ids, positions, block table, lengths) are
+        copied into static buffers before each replay; the captured region
+        covers embedding through logits including the pooled state commit.
+        """
+        import torch
+
+        batch = input_ids.shape[0]
+        table, lengths = paged_cache.batch_metadata(request_ids)
+        key = (batch, table.shape[1])
+        entry = self._decode_graphs.get(key)
+        if entry is None and not self._decode_graph_failed.get(key, False):
+            entry = self._capture_decode_graph(
+                key, input_ids, states, paged_cache, request_ids, pooled_batch
+            )
+            if entry is not None:
+                self._decode_graphs[key] = entry
+            else:
+                self._decode_graph_failed[key] = True
+        if entry is None:
+            return self._decode_batch_transaction(
+                input_ids, states, paged_cache, request_ids, pooled_batch
+            )
+        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        ids = (
+            input_ids
+            if input_ids.device == embedding.device
+            else input_ids.to(embedding.device)
+        )
+        entry["input_ids"].copy_(ids)
+        positions = torch.tensor(
+            [[state.sequence_length] for state in states],
+            device=self.device,
+            dtype=torch.long,
+        )
+        entry["positions"].copy_(positions)
+        entry["table"].copy_(table)
+        entry["lengths"].copy_(lengths)
+        entry["graph"].replay()
         for state in states:
             state.sequence_length += 1
-        return logits, states
+        return entry["logits"], states
+
+    def _capture_decode_graph(
+        self, key, input_ids, states, paged_cache, request_ids, pooled_batch
+    ) -> dict | None:
+        import torch
+
+        batch, width = key
+        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        static = {
+            "input_ids": torch.empty(
+                (batch, 1), device=embedding.device, dtype=torch.long
+            ),
+            "positions": torch.empty(
+                (batch, 1), device=self.device, dtype=torch.long
+            ),
+            "table": torch.empty(
+                (batch, width), device=self.device, dtype=torch.int32
+            ),
+            "lengths": torch.empty((batch,), device=self.device, dtype=torch.int32),
+            "logits": torch.empty(
+                (batch, 1, self.config.vocab_size),
+                device=self.device,
+                dtype=torch.float32,
+            ),
+        }
+        # The warmup and capture passes execute the transaction for real and
+        # would corrupt live state; snapshot the touched pool slots and KV
+        # pages and restore them afterwards.
+        block_size = paged_cache.block_manager.block_size
+        slot_snapshot = []
+        for state in states:
+            recurrent = {
+                index: state.recurrent[index].clone()
+                for index in self.config.linear_layer_indices
+            }
+            convolution = {
+                index: state.convolution[index].clone()
+                for index in self.config.linear_layer_indices
+            }
+            slot_snapshot.append((state, recurrent, convolution))
+        kv_snapshot = []
+        for state, request_id in zip(states, request_ids):
+            allocation = paged_cache.block_manager.get(request_id)
+            block = allocation.block_ids[
+                state.sequence_length // block_size
+            ]
+            for layer_index in self.config.full_attention_layer_indices:
+                key_pages, value_pages = paged_cache.layer_cache(layer_index)
+                kv_snapshot.append((key_pages, block, key_pages[block].clone()))
+                kv_snapshot.append((value_pages, block, value_pages[block].clone()))
+        # The batch workspace is gathered once at context entry; the warmup
+        # passes advance it in place, so it must be restored before the replay.
+        workspace_snapshot = (
+            pooled_batch.recurrent.clone(),
+            pooled_batch.convolution.clone(),
+            pooled_batch.next_convolution.clone(),
+        )
+
+        def restore():
+            for state, recurrent, convolution in slot_snapshot:
+                for index in self.config.linear_layer_indices:
+                    state.recurrent[index].copy_(recurrent[index])
+                    state.convolution[index].copy_(convolution[index])
+            for pages, block, snapshot in kv_snapshot:
+                pages[block].copy_(snapshot)
+            pooled_batch.recurrent.copy_(workspace_snapshot[0])
+            pooled_batch.convolution.copy_(workspace_snapshot[1])
+            pooled_batch.next_convolution.copy_(workspace_snapshot[2])
+
+        # Fill the static inputs with the real current values so the warmup
+        # passes execute a valid step (correct positions and block tables).
+        ids = (
+            input_ids
+            if input_ids.device == embedding.device
+            else input_ids.to(embedding.device)
+        )
+        static["input_ids"].copy_(ids)
+        positions = torch.tensor(
+            [[state.sequence_length] for state in states],
+            device=self.device,
+            dtype=torch.long,
+        )
+        static["positions"].copy_(positions)
+        table, lengths = paged_cache.batch_metadata(request_ids)
+        static["table"].copy_(table)
+        static["lengths"].copy_(lengths)
+        try:
+            graph = torch.cuda.CUDAGraph()
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    self._decode_batch_transaction(
+                        input_ids,
+                        states,
+                        paged_cache,
+                        request_ids,
+                        pooled_batch,
+                        static=static,
+                        advance_sequence=False,
+                    )
+            torch.cuda.current_stream().wait_stream(stream)
+            with torch.cuda.graph(graph):
+                self._decode_batch_transaction(
+                    input_ids,
+                    states,
+                    paged_cache,
+                    request_ids,
+                    pooled_batch,
+                    static=static,
+                    advance_sequence=False,
+                )
+        except Exception:
+            # Any host sync or dynamic shape inside the capture region makes
+            # this batch shape permanently eager.
+            restore()
+            return None
+        restore()
+        static["graph"] = graph
+        return static
 
     @staticmethod
     def _shared_state_pool(states):

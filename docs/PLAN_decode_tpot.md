@@ -84,3 +84,23 @@ prefill 无关——所以 plan 原定的 W4/W5/W6(prefill 侧杠杆,为 128K �
   ≥18 tok/s,更新帕累托图。A/B 开关:`HYDRASERVE_PAGED_ATTENTION=reference`
   回退旧 kernel。
 - M3(可选):叠加 INT4 KV 或投机解码,继续逼近。
+
+## 6. 杠杆 A 结果与 B3-lite 结论(2026-08-16,单卡)
+
+**A(CUDA Graph decode)已实现并位级验证**:
+
+- [runtime.py](../hydraserve/model/runtime.py) 按 (batch, 表宽) 惰性捕获 decode 步;
+  静态输入缓冲(token/位置/页表/长度)+ replay;捕获副作用(池槽位、KV 页、
+  batch 工作区)快照/恢复——捕获期 warmup 会真实执行事务 4 次,不恢复即污染状态;
+- 真实 4B 上 8 步 graph vs eager:logits/recurrent **位级一致**(diff 0.0);
+- 收益 7.5%(2K/4K 上下文 19.3→17.9 ms/步),低于预期:profile 中的 host 开销
+  大头在 decode_batch 之外(serving loop 调度/采样/tokenizer)。若继续收割,
+  下一项是采样路径优化或把调度纳入图;默认开,`HYDRASERVE_CUDA_GRAPH=0` 回退。
+
+**B3-lite 已穷尽,无收益**:
+
+- `loop_unroll_factor` 在 triton 3.0 不受支持;`num_stages=2` 仅 15.52→15.41s
+  (0.7%,噪声)——逐 token 串行依赖使流水化无效;
+- 结论:B3 的真实解是 **chunkwise 仿射扫描**(S' = (aI − βkkᵀ)S + βkvᵀ 的关联
+  扫描,chunk 内并行,参考 fla 的 chunked delta rule),研究级 kernel,建议独立
+  立项,不在本轮继续。
