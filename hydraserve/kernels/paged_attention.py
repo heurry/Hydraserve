@@ -90,9 +90,16 @@ def paged_prefill_attention(
     ).reshape(-1).contiguous()
     flattened = query.reshape(batch * tokens, query_heads, head_dim).contiguous()
     if query.is_cuda:
-        output = paged_attention(
-            flattened, key_cache, value_cache, tables, lengths
-        )
+        import os
+
+        if os.environ.get("HYDRASERVE_PAGED_PREFILL") == "reference":
+            output = paged_attention(
+                flattened, key_cache, value_cache, tables, lengths
+            )
+        else:
+            output = paged_prefill_attention_tiled(
+                query, key_cache, value_cache, block_table, query_start=starts
+            )
     else:
         from hydraserve.kernels.reference import paged_attention as reference_paged_attention
 
@@ -442,3 +449,187 @@ try:
 except ImportError:
     _paged_attention_split_kernel = None
     _paged_attention_reduce_kernel = None
+
+
+
+def paged_prefill_attention_tiled(
+    query, key_cache, value_cache, block_table, *, query_start
+):
+    """Block-causal prefill attention with KV-tile reuse (B2).
+
+    One program per (request, query tile, query head): each KV tile is
+    loaded once and reused across BLOCK_M queries, replacing the per-query
+    program of the flattened decode-kernel path. Causal masking is
+    elementwise (key position <= query position); tiles beyond the block
+    table width are masked out of the loads.
+    """
+    import torch
+    import triton
+
+    if query.ndim != 4 or block_table.ndim != 2:
+        raise ValueError("query/table must be [B,T,H,D] and [B,blocks]")
+    if query.device != key_cache.device or not query.is_cuda:
+        raise ValueError("tiled paged prefill requires CUDA tensors")
+    if not all(t.is_contiguous() for t in (query, key_cache, value_cache, block_table)):
+        raise ValueError("tiled paged prefill requires contiguous tensors")
+    batch, tokens, query_heads, head_dim = query.shape
+    _, block_size, kv_heads, cache_dim = key_cache.shape
+    if cache_dim != head_dim or query_heads % kv_heads:
+        raise ValueError("incompatible attention heads or head dimension")
+    if block_size & (block_size - 1):
+        raise ValueError("block_size must be a power of two")
+    starts = torch.as_tensor(query_start, device=query.device, dtype=torch.int32)
+    if starts.ndim == 0:
+        starts = starts.expand(batch)
+    if starts.shape != (batch,) or bool((starts < 0).any()):
+        raise ValueError("query_start must be non-negative scalar or [batch]")
+    starts = starts.contiguous()
+    max_context = block_table.shape[1] * block_size
+    block_m, block_n = 32, 32
+    output = torch.empty_like(query)
+    _paged_prefill_tiled_kernel[
+        (batch, triton.cdiv(tokens, block_m), query_heads)
+    ](
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        starts,
+        output,
+        query.stride(0),
+        query.stride(1),
+        query.stride(2),
+        key_cache.stride(0),
+        key_cache.stride(1),
+        key_cache.stride(2),
+        block_table.stride(0),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        tokens,
+        query_heads,
+        kv_heads,
+        head_dim,
+        SCALE=head_dim**-0.5,
+        BLOCK_SIZE=block_size,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        MAX_CONTEXT=max_context,
+        num_warps=4,
+    )
+    return output
+
+
+try:
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def _paged_prefill_tiled_kernel(
+        query_ptr,
+        key_ptr,
+        value_ptr,
+        table_ptr,
+        starts_ptr,
+        output_ptr,
+        stride_qb,
+        stride_qt,
+        stride_qh,
+        stride_cb,
+        stride_ct,
+        stride_ch,
+        stride_tb,
+        stride_ob,
+        stride_ot,
+        stride_oh,
+        tokens,
+        query_heads,
+        kv_heads,
+        head_dim,
+        SCALE: tl.constexpr,
+        BLOCK_SIZE: tl.constexpr,
+        BLOCK_D: tl.constexpr,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+        MAX_CONTEXT: tl.constexpr,
+    ):
+        request = tl.program_id(0)
+        query_tile = tl.program_id(1)
+        query_head = tl.program_id(2)
+        rows = query_tile * BLOCK_M + tl.arange(0, BLOCK_M)
+        row_mask = rows < tokens
+        dimensions = tl.arange(0, BLOCK_D)
+        dimension_mask = dimensions < head_dim
+        group_size = query_heads // kv_heads
+        kv_head = query_head // group_size
+        query = tl.load(
+            query_ptr
+            + request * stride_qb
+            + rows[:, None] * stride_qt
+            + query_head * stride_qh
+            + dimensions[None, :],
+            mask=row_mask[:, None] & dimension_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+        start = tl.load(starts_ptr + request)
+        q_positions = (start + rows)[:, None]
+        maximum = tl.full((BLOCK_M, 1), float("-inf"), dtype=tl.float32)
+        denominator = tl.zeros((BLOCK_M, 1), dtype=tl.float32)
+        accumulator = tl.zeros((BLOCK_M, BLOCK_D), dtype=tl.float32)
+        keys = tl.arange(0, BLOCK_N)
+        for tile_index in tl.range(0, MAX_CONTEXT // BLOCK_N, 1, num_stages=1):
+            key_positions = tile_index * BLOCK_N + keys
+            in_table = key_positions < MAX_CONTEXT
+            logical_block = key_positions // BLOCK_SIZE
+            block_offset = key_positions % BLOCK_SIZE
+            physical_block = tl.load(
+                table_ptr + request * stride_tb + logical_block,
+                mask=in_table,
+                other=0,
+            )
+            cache_offsets = (
+                physical_block[:, None] * stride_cb
+                + block_offset[:, None] * stride_ct
+                + kv_head * stride_ch
+                + dimensions[None, :]
+            )
+            tile_mask = in_table[:, None] & dimension_mask[None, :]
+            key = tl.load(
+                key_ptr + cache_offsets,
+                mask=tile_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            scores = tl.dot(query, tl.trans(key)) * SCALE
+            causal = in_table[None, :] & (key_positions[None, :] <= q_positions)
+            scores = tl.where(causal, scores, float("-inf"))
+            tile_maximum = tl.max(scores, axis=1)[:, None]
+            next_maximum = tl.maximum(maximum, tile_maximum)
+            old_scale = tl.where(
+                next_maximum == maximum, 1.0, tl.exp(maximum - next_maximum)
+            )
+            probability = tl.where(causal, tl.exp(scores - next_maximum), 0.0)
+            value = tl.load(
+                value_ptr + cache_offsets,
+                mask=tile_mask,
+                other=0.0,
+                eviction_policy="evict_first",
+            ).to(tl.float32)
+            accumulator = accumulator * old_scale + tl.dot(probability, value)
+            denominator = denominator * old_scale + tl.sum(
+                probability, axis=1
+            )[:, None]
+            maximum = next_maximum
+        result = accumulator / denominator
+        tl.store(
+            output_ptr
+            + request * stride_ob
+            + rows[:, None] * stride_ot
+            + query_head * stride_oh
+            + dimensions[None, :],
+            result,
+            mask=row_mask[:, None] & dimension_mask[None, :],
+        )
+except ImportError:
+    _paged_prefill_tiled_kernel = None

@@ -217,3 +217,33 @@ def test_cuda_graph_decode_matches_eager(tiny_model, monkeypatch) -> None:
         torch.testing.assert_close(
             graph_state[index], eager_state[index], atol=1e-5, rtol=1e-5
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("tokens", [17, 96])
+def test_triton_paged_prefill_tiled_matches_flattened_path(tokens: int) -> None:
+    from hydraserve.kernels.paged_attention import (
+        paged_prefill_attention,
+        paged_prefill_attention_tiled,
+    )
+
+    torch.manual_seed(13)
+    batch, query_heads, kv_heads, head_dim, block_size = 2, 8, 2, 32, 4
+    starts = torch.tensor([40, 96], device="cuda", dtype=torch.int32)
+    max_blocks = (max(starts).item() + tokens + block_size - 1) // block_size
+    physical_blocks = batch * max_blocks
+    query = torch.randn(
+        batch, tokens, query_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    key = torch.randn(
+        physical_blocks, block_size, kv_heads, head_dim,
+        device="cuda", dtype=torch.bfloat16,
+    )
+    value = torch.randn_like(key)
+    table = torch.arange(
+        physical_blocks, device="cuda", dtype=torch.int32
+    ).reshape(batch, max_blocks)
+    table[0] = table[0].flip(0)
+    expected = paged_prefill_attention(query, key, value, table, query_start=starts)
+    actual = paged_prefill_attention_tiled(query, key, value, table, query_start=starts)
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
