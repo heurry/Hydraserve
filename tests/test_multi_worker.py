@@ -66,6 +66,8 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._prefill_recovery_successes = [0]
         self._prefill_recovery_failures = [0]
         self._prefill_round_robin = 0
+        self._prefill_serve_round_robin = 0
+        self._prefill_bound = {}
         self._recovery_stop = Event()
         self._recovering_workers = set()
         self._recovery_threads = {}
@@ -92,6 +94,15 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         if expected_op == "decode":
             ids = tuple(command["request_ids"])
             return {"op": "decode", "request_ids": ids, "token_ids": ids}
+        return {"op": expected_op, "request_id": request_id}
+
+    def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+        # W4 prefill-worker collocated serving is not exercised by these unit
+        # tests; always decline so collocated requests fall through to decode
+        # workers (the pre-W4 path under test).
+        self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+        if expected_op == "admission":
+            return {"op": "admission", "admitted": False, "retryable": False}
         return {"op": expected_op, "request_id": request_id}
 
 

@@ -155,10 +155,13 @@ class CostRouterConfig:
     drift_ratio_threshold: float = 1.5
     drift_min_observations: int = 5
     fail_closed_on_drift: bool = True
+    force_pd_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.minimum_pd_prompt_tokens <= 0:
             raise ValueError("minimum PD prompt length must be positive")
+        if self.force_pd_tokens < 0:
+            raise ValueError("force-PD prompt threshold cannot be negative")
         if self.minimum_savings_ms < 0:
             raise ValueError("minimum route savings cannot be negative")
         if not 0 <= self.minimum_savings_ratio < 1:
@@ -293,6 +296,11 @@ class CostAwareRouter:
         bucket = self._bucket(prompt_tokens)
         if not decode_has_slot:
             route, reason = Route.COLLOCATED, RouteReason.NO_DECODE_SLOT
+        elif (
+            self.config.force_pd_tokens
+            and prompt_tokens >= self.config.force_pd_tokens
+        ):
+            route, reason = Route.PD_DISAGGREGATED, RouteReason.FORCED_LONG_PROMPT
         elif prompt_tokens < self.config.minimum_pd_prompt_tokens:
             route, reason = Route.COLLOCATED, RouteReason.COST_MODEL_CONSERVATIVE
         else:

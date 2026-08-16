@@ -107,7 +107,12 @@ class PDClusterConfig:
         )
 
     def prefill_config(self, index: int) -> PDWorkerConfig:
-        """Config for the index-th prefill worker (single state slot, no decode)."""
+        """Config for the index-th prefill worker.
+
+        The prefill worker also serves collocated short requests (W4), so it
+        needs the same state/decoding capacity as a decode worker in addition
+        to its PD prefill role.
+        """
         return PDWorkerConfig(
             self.model_dir,
             prefill_device=self.prefill_devices[index],
@@ -116,8 +121,8 @@ class PDClusterConfig:
             block_size=self.block_size,
             use_flash_attention=self.use_flash_attention,
             prefill_chunk_size=self.prefill_chunk_size,
-            max_state_slots=1,
-            max_decode_batch_size=1,
+            max_state_slots=self.max_state_slots_per_worker,
+            max_decode_batch_size=self.max_decode_batch_size_per_worker,
             prefix_cache_blocks=self.prefix_cache_blocks,
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
             kv_headroom_blocks=self.kv_headroom_blocks,
@@ -159,6 +164,11 @@ class MultiWorkerGenerationBackend:
     """Persistent 1P+ND backend with immutable per-request worker binding."""
 
     supports_async_prefill = True
+
+    @property
+    def prefill_parallelism(self) -> int:
+        """Concurrent prefill slots the serving loop may drive in parallel."""
+        return len(self.config.prefill_devices)
 
     def __init__(
         self,
@@ -249,6 +259,10 @@ class MultiWorkerGenerationBackend:
         self._prefill_recovery_successes = [0] * prefill_count
         self._prefill_recovery_failures = [0] * prefill_count
         self._prefill_round_robin = 0
+        self._prefill_serve_round_robin = 0
+        # request_id -> prefill worker index for collocated requests served on a
+        # prefill worker (W4); decode-worker-bound requests stay in the registry.
+        self._prefill_bound: dict[int, int] = {}
         self._replay_mismatches = 0
 
         for process in self._decode_processes:
@@ -293,6 +307,32 @@ class MultiWorkerGenerationBackend:
             return AdmissionDecision.accept()
         except KeyError:
             pass
+        # W4: short requests that will be routed collocated can be served on an
+        # idle prefill worker (using its otherwise-idle decode-phase compute)
+        # instead of a decode worker. Long requests always stay on the PD path.
+        force_pd = int(getattr(getattr(self.router, "config", None), "force_pd_tokens", 0) or 0)
+        if (
+            force_pd
+            and len(request.token_ids) < force_pd
+            and self._prefill_available()
+        ):
+            index = self._pick_serve_prefill_worker()
+            if index is not None:
+                try:
+                    result = self._prefill_serving_rpc(
+                        index,
+                        self._request_command("reserve", request),
+                        "admission",
+                        request.request_id,
+                    )
+                except (TimeoutError, WorkerUnavailableError):
+                    result = {}
+                if result.get("admitted"):
+                    self._prefill_bound[request.request_id] = index
+                    request.route = "collocated"
+                    request.route_reason = "prefill_worker_collocated"
+                    request.worker_id = index
+                    return AdmissionDecision.accept()
         required_blocks = self._required_blocks(request)
         prefix_matches = {
             worker.worker_id: self._prefix_match(request, worker.worker_id)
@@ -362,9 +402,21 @@ class MultiWorkerGenerationBackend:
         admitted = self.admit(request)
         if not admitted.admitted:
             raise MemoryError(admitted.reason or "request cannot be admitted")
+        started = monotonic()
+        if request.request_id in self._prefill_bound:
+            index = self._prefill_bound[request.request_id]
+            result = self._prefill_serving_rpc(
+                index,
+                self._request_command("collocated_prepare", request),
+                "collocated_prepare",
+                request.request_id,
+            )
+            with self._state_lock:
+                self._collocated_count += 1
+            sample = result.get("sample")
+            return sample if isinstance(sample, TokenSample) else int(result["token_id"])
         worker_id = self.registry.worker_for(request.request_id)
         decision = self.route_for(request.request_id)
-        started = monotonic()
         if decision.route is Route.COLLOCATED:
             token_id = self._collocated_prefill(worker_id, request)
             self._observe_route_cost(request, decision, started)
@@ -421,8 +473,13 @@ class MultiWorkerGenerationBackend:
         if not requests:
             return ()
         groups: dict[int, list[tuple[int, ServingRequest]]] = {}
+        prefill_groups: dict[int, list[tuple[int, ServingRequest]]] = {}
         failures: dict[int, BaseException] = {}
         for position, request in enumerate(requests):
+            prefill_index = self._prefill_bound.get(request.request_id)
+            if prefill_index is not None:
+                prefill_groups.setdefault(prefill_index, []).append((position, request))
+                continue
             try:
                 worker_id = self.registry.worker_for(request.request_id)
             except KeyError:
@@ -451,12 +508,33 @@ class MultiWorkerGenerationBackend:
                 return indexed_requests, tuple(samples)
             return indexed_requests, tuple(int(token) for token in result["token_ids"])
 
+        def execute_prefill(index, indexed_requests):
+            request_ids = tuple(item.request_id for _, item in indexed_requests)
+            result = self._prefill_serving_rpc(
+                index,
+                {"op": "decode", "request_ids": request_ids},
+                "decode",
+            )
+            if tuple(result["request_ids"]) != request_ids:
+                raise RuntimeError("prefill worker returned a different request batch")
+            samples = result.get("samples")
+            if samples is not None:
+                return indexed_requests, tuple(samples)
+            return indexed_requests, tuple(int(token) for token in result["token_ids"])
+
+        all_groups = [
+            ("decode", worker_id, tuple(indexed))
+            for worker_id, indexed in groups.items()
+        ] + [
+            ("prefill", index, tuple(indexed))
+            for index, indexed in prefill_groups.items()
+        ]
         successes: dict[int, int | TokenSample] = {}
-        with ThreadPoolExecutor(max_workers=max(1, len(groups))) as executor:
-            futures = {
-                executor.submit(execute, worker_id, tuple(indexed)): tuple(indexed)
-                for worker_id, indexed in groups.items()
-            }
+        with ThreadPoolExecutor(max_workers=max(1, len(all_groups))) as executor:
+            futures = {}
+            for kind, worker_key, indexed in all_groups:
+                fn = execute if kind == "decode" else execute_prefill
+                futures[executor.submit(fn, worker_key, indexed)] = indexed
             for future, scheduled in futures.items():
                 try:
                     indexed, token_ids = future.result()
@@ -477,6 +555,20 @@ class MultiWorkerGenerationBackend:
         return tuple(output)
 
     def release(self, request_id: int) -> None:
+        prefill_index = self._prefill_bound.pop(request_id, None)
+        if prefill_index is not None:
+            try:
+                self._prefill_serving_rpc(
+                    prefill_index,
+                    {"op": "release", "request_id": request_id},
+                    "release",
+                    request_id,
+                )
+            finally:
+                with self._state_lock:
+                    self._route_decisions.pop(request_id, None)
+                    self._lost_requests.discard(request_id)
+            return
         worker_id = self.registry.release(request_id)
         if worker_id is None:
             with self._state_lock:
@@ -498,6 +590,12 @@ class MultiWorkerGenerationBackend:
 
     def abandon(self, request_id: int) -> None:
         """Forget host-side ownership after device-local state is known lost."""
+        if request_id in self._prefill_bound:
+            self._prefill_bound.pop(request_id, None)
+            with self._state_lock:
+                self._route_decisions.pop(request_id, None)
+                self._lost_requests.discard(request_id)
+            return
         worker_id = self.registry.release(request_id)
         with self._state_lock:
             if worker_id is not None:
@@ -720,6 +818,23 @@ class MultiWorkerGenerationBackend:
                     return index
             return self._prefill_round_robin % count
 
+    def _pick_serve_prefill_worker(self) -> int | None:
+        """Pick an idle prefill worker for a collocated short request (W4).
+
+        A prefill worker whose command loop is busy running a long prefill must
+        be skipped, otherwise the short request blocks behind the multi-second
+        prefill on the shared ``_prefill_locks`` and its decode stalls. Returns
+        ``None`` when every prefill worker is busy.
+        """
+        with self._state_lock:
+            count = len(self._prefill_processes)
+            for offset in range(count):
+                index = (self._prefill_serve_round_robin + offset) % count
+                if self._prefill_healthy[index] and not self._prefill_locks[index].locked():
+                    self._prefill_serve_round_robin = (index + 1) % count
+                    return index
+            return None
+
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
         index = self._pick_prefill_worker()
         failure = None
@@ -741,6 +856,31 @@ class MultiWorkerGenerationBackend:
             self._schedule_prefill_recovery(index)
             raise failure
         self._check(result, "prefill", request_id)
+        return result
+
+    def _prefill_serving_rpc(
+        self, index: int, command: dict, expected_op: str, request_id: int | None = None
+    ) -> dict:
+        """RPC for a prefill worker's collocated-serving operations (W4)."""
+        failure = None
+        with self._prefill_locks[index]:
+            try:
+                if not self._prefill_processes[index].is_alive():
+                    raise WorkerUnavailableError(
+                        f"prefill worker {index} is not running"
+                    )
+                self._prefill_commands[index].put(command)
+                result = self._get_prefill_response(index, self.operation_timeout)
+            except (TimeoutError, WorkerUnavailableError) as exc:
+                failure = exc
+        if failure is not None:
+            with self._state_lock:
+                if self._prefill_healthy[index]:
+                    self._pd_failures += 1
+                self._prefill_healthy[index] = False
+            self._schedule_prefill_recovery(index)
+            raise failure
+        self._check(result, expected_op, request_id)
         return result
 
     def _prefill_available(self) -> bool:

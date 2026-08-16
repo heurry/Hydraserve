@@ -345,7 +345,10 @@ class ContinuousGenerationLoop:
     ) -> None:
         pending: OrderedDict[int, tuple[ServingRequest, Future]] = OrderedDict()
         recovering: set[int] = set()
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hydraserve-prefill") as executor:
+        prefill_workers = max(1, int(getattr(self.backend, "prefill_parallelism", 1)))
+        with ThreadPoolExecutor(
+            max_workers=prefill_workers, thread_name_prefix="hydraserve-prefill"
+        ) as executor:
             while not self._stop.is_set():
                 did_work = self._submit_async_prefill(active, pending, executor)
                 did_work = (

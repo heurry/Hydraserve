@@ -214,8 +214,13 @@ class PrefixCache:
                     node.children[token_block] = child
                     node = child
                     continue
-                if child.block_id is not None and child.block_id != blocks[index]:
-                    raise ValueError("the same token prefix is already mapped to another KV block")
+                # A node may already be mapped to a different physical block when
+                # two burst requests were both admitted before either published:
+                # each prefill computed the shared prefix into its own fresh
+                # blocks, so the second sighting remaps the same token prefix.
+                # Keep the first mapping; the caller treats this block as
+                # not-inserted and releases it back to the request (it remains a
+                # valid, request-private copy of the same KV).
                 existing_path.append(child)
                 node = child
             shared_blocks = len(existing_path)
@@ -311,7 +316,7 @@ class PrefixCache:
                 if child.block_id is None:
                     inserted_indices.append(index)
                     self._cached_blocks += 1
-                child.block_id = blocks[index]
+                    child.block_id = blocks[index]
                 child.last_access = next(self._clock)
                 child.frequency = max(child.frequency, frequency)
                 child.prefix_tokens = (index + 1) * self.block_size

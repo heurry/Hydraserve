@@ -392,6 +392,7 @@ def main() -> int:
                     str(args.model),
                     tuple(args.decode_devices),
                     prefill_device=args.device,
+                    prefill_devices=tuple(args.prefill_devices) if args.prefill_devices else (),
                     cache_tokens_per_worker=args.cache_tokens,
                     block_size=args.block_size,
                     max_state_slots_per_worker=args.concurrency,
@@ -401,6 +402,8 @@ def main() -> int:
                     prefix_cache_blocks=args.prefix_cache_blocks,
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                     kv_headroom_blocks=args.kv_headroom_blocks,
+                    kv_quant=args.kv_quant,
+                    worker_log_dir=args.worker_log_dir,
                 ),
                 router=router,
             )

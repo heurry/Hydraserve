@@ -21,8 +21,18 @@ def test_prefix_cache_branches_at_block_boundary() -> None:
     cache.insert((1, 2, 8, 9), (10, 12))
     assert cache.match((1, 2, 3, 4)).block_ids == (10, 11)
     assert cache.match((1, 2, 8, 9)).block_ids == (10, 12)
-    with pytest.raises(ValueError, match="another KV block"):
-        cache.insert((1, 2), (99,))
+
+
+def test_same_prefix_remap_keeps_first_mapping() -> None:
+    """A later request publishing the same prefix into fresh blocks must not
+    raise nor overwrite the existing mapping; its blocks are not inserted."""
+    cache = PrefixCache(block_size=2)
+    cache.insert((1, 2, 3, 4), (10, 11))
+    remapped = cache.insert((1, 2), (99,))
+    assert remapped.inserted_block_ids == ()
+    # The tree still maps the shared prefix to the original blocks.
+    assert cache.match((1, 2, 3, 4)).block_ids == (10, 11)
+    assert cache.stats().cached_blocks == 2
 
 
 def test_referenced_prefix_is_not_evicted() -> None:

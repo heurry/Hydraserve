@@ -109,9 +109,20 @@ def _prefill_worker(
     try:
         import torch
 
-        from hydraserve.cache import KVBlockManager, PagedKVCache, plan_paged_kv_blocks
+        from hydraserve.cache import (
+            CacheNamespace,
+            CostAwarePrefixPolicy,
+            GpuLinearStatePool,
+            KVBlockManager,
+            PagedKVCache,
+            PrefixCache,
+            plan_paged_kv_blocks,
+        )
         from hydraserve.engine.pd_worker import PrefillWorker
+        from hydraserve.engine.scheduler import RequestState
+        from hydraserve.engine.sampling import sample_logits
         from hydraserve.model.runtime import QwenTextRuntime
+        from hydraserve.router import Route
         from hydraserve.transfer import SharedMemoryTransferBackend, TransferPipeline
 
         device = torch.device(config.prefill_device)
@@ -133,16 +144,38 @@ def _prefill_worker(
             block_size=config.block_size,
             dtype=torch.bfloat16,
             device=device,
-            state_slots=1,
-            state_workspace_slots=0,
-            state_memory_fraction=1.0,
             kv_quant=config.kv_quant,
         )
-        prefill_cache = PagedKVCache(
+        blocks = memory_plan.planned_blocks
+        if config.kv_headroom_blocks >= blocks:
+            raise MemoryError("KV headroom consumes the memory-planned cache")
+        revision = str(Path(config.model_dir).resolve())
+        prefix_cache = (
+            PrefixCache(
+                config.block_size,
+                max_blocks=config.prefix_cache_blocks,
+                policy=CostAwarePrefixPolicy(
+                    minimum_frequency=config.prefix_cache_min_frequency
+                ),
+            )
+            if config.prefix_cache_blocks
+            else None
+        )
+        cache = PagedKVCache(
             runtime.config,
-            KVBlockManager(memory_plan.planned_blocks, block_size=config.block_size),
+            KVBlockManager(
+                blocks,
+                block_size=config.block_size,
+                headroom_blocks=config.kv_headroom_blocks,
+            ),
             device=device,
             dtype=torch.bfloat16,
+            prefix_cache=prefix_cache,
+            cache_namespace=CacheNamespace(
+                model=runtime.config.name,
+                tokenizer_revision=revision,
+                model_revision=revision,
+            ),
             memory_plan=memory_plan,
             kv_quant=config.kv_quant,
         )
@@ -162,49 +195,305 @@ def _prefill_worker(
                     TransferPipeline(
                         backend, src_gpu=0, dst_gpu=worker_index + 1
                     ),
-                    prefill_cache,
+                    cache,
                 )
             )
+
+        # W4: the prefill worker also serves collocated short requests, so it
+        # keeps a recurrent-state pool and per-request bookkeeping like the
+        # decode worker.
+        requests = {}
+        states = {}
+        state_pool = GpuLinearStatePool(
+            config.max_state_slots,
+            runtime.config,
+            device=device,
+            workspace_capacity=min(
+                config.max_state_slots, config.max_decode_batch_size
+            ),
+        )
+        state_capacity = state_pool.capacity_snapshot().total_slots
+        reservations = set()
+
+        def capacity_payload():
+            capacity = cache.block_manager.capacity()
+            live = len(set(states) | reservations)
+            return {
+                "kv_total_blocks": capacity.total_blocks,
+                "kv_free_blocks": capacity.free_blocks,
+                "state_total_slots": state_capacity,
+                "state_free_slots": max(0, state_capacity - live),
+                "kv_cache_stats": {**cache.stats(), **state_pool.stats()},
+            }
+
         responses.put({"op": "ready", "model_name": runtime.config.name})
         while True:
             command = commands.get()
-            if command["op"] == "shutdown":
+            operation = command["op"]
+            if operation == "shutdown":
+                for request_id in tuple(set(states) | reservations):
+                    cache.free(request_id)
                 responses.put({"op": "shutdown"})
                 return
-            request_id = command["request_id"]
             try:
-                worker_index = int(command.get("worker_index", 0))
-                if not 0 <= worker_index < len(workers):
-                    raise ValueError(f"unknown decode worker {worker_index}")
-                request = _request(
-                    request_id,
-                    command["token_ids"],
-                    command["max_new_tokens"],
-                    transferred=False,
-                    sampling_params=command.get("sampling_params"),
-                )
-                try:
-                    result = workers[worker_index].process(
-                        request,
-                        n_minus_one=True,
-                        chunk_size=config.prefill_chunk_size,
+                if operation == "prefill":
+                    request_id = command["request_id"]
+                    worker_index = int(command.get("worker_index", 0))
+                    if not 0 <= worker_index < len(workers):
+                        raise ValueError(f"unknown decode worker {worker_index}")
+                    request = _request(
+                        request_id,
+                        command["token_ids"],
+                        command["max_new_tokens"],
+                        transferred=False,
+                        sampling_params=command.get("sampling_params"),
                     )
-                finally:
-                    prefill_cache.free(request_id)
-                responses.put(
-                    {
-                        "op": "prefill",
-                        "request_id": request_id,
-                        "worker_index": worker_index,
-                        "token_id": result.first_token_id,
-                        "sample": result.sample,
-                    }
-                )
+                    try:
+                        result = workers[worker_index].process(
+                            request,
+                            n_minus_one=True,
+                            chunk_size=config.prefill_chunk_size,
+                        )
+                    finally:
+                        cache.free(request_id)
+                    responses.put(
+                        {
+                            "op": "prefill",
+                            "request_id": request_id,
+                            "worker_index": worker_index,
+                            "token_id": result.first_token_id,
+                            "sample": result.sample,
+                        }
+                    )
+                elif operation == "reserve":
+                    request_id = command["request_id"]
+                    total_tokens = len(command["token_ids"]) + max(
+                        0, command["max_new_tokens"] - 1
+                    )
+                    required = cache.block_manager.blocks_required(total_tokens)
+                    live_requests = set(states) | reservations
+                    if required > cache.block_manager.num_blocks:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": False,
+                                "retryable": False,
+                                "reason": (
+                                    f"request needs {required} KV blocks, worker capacity "
+                                    f"is {cache.block_manager.num_blocks}"
+                                ),
+                                **capacity_payload(),
+                            }
+                        )
+                    elif request_id in live_requests:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": True,
+                                **capacity_payload(),
+                            }
+                        )
+                    elif len(live_requests) >= state_capacity:
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": False,
+                                "retryable": True,
+                                "reason": "recurrent-state slots are exhausted",
+                                **capacity_payload(),
+                            }
+                        )
+                    else:
+                        try:
+                            cache.allocate(
+                                request_id,
+                                len(command["token_ids"]),
+                                reserve_tokens=total_tokens,
+                                token_ids=command["token_ids"],
+                            )
+                        except MemoryError:
+                            responses.put(
+                                {
+                                    "op": "admission",
+                                    "request_id": request_id,
+                                    "admitted": False,
+                                    "retryable": True,
+                                    "reason": "prefill worker KV capacity is exhausted",
+                                    **capacity_payload(),
+                                }
+                            )
+                            continue
+                        reservations.add(request_id)
+                        responses.put(
+                            {
+                                "op": "admission",
+                                "request_id": request_id,
+                                "admitted": True,
+                                **capacity_payload(),
+                            }
+                        )
+                elif operation == "collocated_prepare":
+                    request_id = command["request_id"]
+                    if request_id not in reservations:
+                        raise RuntimeError("collocated prefill requires a KV reservation")
+                    request = _request(
+                        request_id,
+                        command["token_ids"],
+                        command["max_new_tokens"],
+                        transferred=False,
+                        route=Route.COLLOCATED,
+                        sampling_params=command.get("sampling_params"),
+                    )
+                    request.transition(RequestState.PREFILL_RUNNING)
+                    input_ids = torch.tensor(
+                        [request.token_ids], device=runtime.input_device, dtype=torch.long
+                    )
+                    with torch.inference_mode():
+                        logits, state = runtime.prefill(
+                            input_ids,
+                            chunk_size=config.prefill_chunk_size,
+                            paged_cache=cache,
+                            request_id=request_id,
+                        )
+                    cache.publish_prefix(request_id, request.token_ids)
+                    sample = sample_logits(
+                        logits[:, -1],
+                        (request.token_ids,),
+                        (request.sampling_params,),
+                        steps=(0,),
+                    )[0]
+                    token_id = sample.token_id
+                    request.generated_token_ids.append(token_id)
+                    requests[request_id] = request
+                    states[request_id] = state_pool.install(request_id, state)
+                    responses.put(
+                        {
+                            "op": "collocated_prepare",
+                            "request_id": request_id,
+                            "token_id": token_id,
+                            "sample": sample,
+                        }
+                    )
+                elif operation == "decode":
+                    request_ids = tuple(command["request_ids"])
+                    cache.block_manager.grow_many(request_ids, additional_tokens=1)
+                    input_ids = torch.tensor(
+                        [requests[request_id].generated_token_ids[-1] for request_id in request_ids],
+                        device=runtime.input_device,
+                        dtype=torch.long,
+                    ).unsqueeze(1)
+                    batch_states = [states[request_id] for request_id in request_ids]
+                    with torch.inference_mode():
+                        logits, _ = runtime.decode_batch(
+                            input_ids, batch_states, cache, request_ids
+                        )
+                    samples = sample_logits(
+                        logits[:, -1],
+                        (
+                            requests[request_id].token_ids
+                            + tuple(requests[request_id].generated_token_ids)
+                            for request_id in request_ids
+                        ),
+                        (requests[request_id].sampling_params for request_id in request_ids),
+                        steps=(
+                            len(requests[request_id].generated_token_ids)
+                            for request_id in request_ids
+                        ),
+                    )
+                    token_ids = tuple(sample.token_id for sample in samples)
+                    for request_id, token_id in zip(request_ids, token_ids, strict=True):
+                        requests[request_id].generated_token_ids.append(token_id)
+                    responses.put(
+                        {
+                            "op": "decode",
+                            "request_ids": request_ids,
+                            "token_ids": token_ids,
+                            "samples": samples,
+                        }
+                    )
+                elif operation == "release":
+                    request_id = command["request_id"]
+                    reservations.discard(request_id)
+                    states.pop(request_id, None)
+                    state_pool.free(request_id)
+                    requests.pop(request_id, None)
+                    cache.free(request_id)
+                    responses.put(
+                        {"op": "release", "request_id": request_id, **capacity_payload()}
+                    )
+                elif operation == "recover":
+                    request_id = command["request_id"]
+                    if request_id not in reservations:
+                        raise RuntimeError("recovery requires a KV/state reservation")
+                    replay_token_ids = tuple(command["replay_token_ids"])
+                    generated_token_ids = tuple(command["generated_token_ids"])
+                    expected_replay = tuple(command["token_ids"]) + generated_token_ids[:-1]
+                    if replay_token_ids != expected_replay:
+                        raise RuntimeError("recovery replay does not match request history")
+                    total_tokens = len(command["token_ids"]) + max(
+                        0, command["max_new_tokens"] - 1
+                    )
+                    state_pool.free(request_id)
+                    states.pop(request_id, None)
+                    requests.pop(request_id, None)
+                    cache.free(request_id)
+                    cache.allocate(
+                        request_id,
+                        len(replay_token_ids),
+                        reserve_tokens=total_tokens,
+                        token_ids=replay_token_ids,
+                    )
+                    replay = torch.tensor(
+                        [replay_token_ids], device=runtime.input_device, dtype=torch.long
+                    )
+                    with torch.inference_mode():
+                        _, state = runtime.prefill(
+                            replay,
+                            chunk_size=config.prefill_chunk_size,
+                            paged_cache=cache,
+                            request_id=request_id,
+                        )
+                    request = _request(
+                        request_id,
+                        command["token_ids"],
+                        command["max_new_tokens"],
+                        transferred=False,
+                        route=Route.COLLOCATED,
+                        sampling_params=command.get("sampling_params"),
+                    )
+                    request.generated_token_ids.extend(generated_token_ids)
+                    requests[request_id] = request
+                    states[request_id] = state_pool.install(request_id, state)
+                    responses.put(
+                        {"op": "recover", "request_id": request_id, **capacity_payload()}
+                    )
+                elif operation == "prefix_probe":
+                    match = cache.probe_prefix(command["token_ids"])
+                    responses.put(
+                        {
+                            "op": "prefix_probe",
+                            "request_id": command["request_id"],
+                            "matched_tokens": match.matched_tokens,
+                            **capacity_payload(),
+                        }
+                    )
+                else:
+                    raise ValueError(f"unknown prefill-worker operation {operation!r}")
             except Exception as exc:
+                if operation in {"collocated_prepare", "recover"}:
+                    reservations.discard(command.get("request_id"))
+                    state_pool.free(command.get("request_id"))
+                    states.pop(command.get("request_id"), None)
+                    requests.pop(command.get("request_id"), None)
+                    cache.free(command.get("request_id"))
                 responses.put(
                     {
                         "op": "error",
-                        "request_id": request_id,
+                        "request_id": command.get("request_id"),
+                        "request_ids": command.get("request_ids"),
                         "message": repr(exc),
                     }
                 )
