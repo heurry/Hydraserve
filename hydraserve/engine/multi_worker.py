@@ -243,6 +243,7 @@ class MultiWorkerGenerationBackend:
         self._lost_requests: set[int] = set()
         self._state_lock = RLock()
         self._prefill_healthy = [True] * prefill_count
+        self._prefill_pending = [0] * prefill_count
         self._closed = False
         self._collocated_count = 0
         self._pd_count = 0
@@ -368,11 +369,17 @@ class MultiWorkerGenerationBackend:
             request.worker_id = candidate.worker_id
             with self._state_lock:
                 if prefill_available:
+                    with self._state_lock:
+                        busy = sum(
+                            1 for pending in self._prefill_pending if pending > 0
+                        )
+                    prefill_load = busy / len(self._prefill_pending)
                     decision = self.router.decide(
                         len(request.token_ids),
                         candidate.decode_load,
                         True,
                         request.route_prefill_queue_ahead_ms,
+                        prefill_load=prefill_load,
                     )
                 else:
                     decision = RouteDecision(
@@ -390,6 +397,7 @@ class MultiWorkerGenerationBackend:
                 request.route_estimated_savings_ms = decision.estimated_savings_ms
                 request.route_cost_confidence = decision.cost_model_confidence
                 request.route_decode_load = decision.decode_load
+                request.route_prefill_load = decision.prefill_load
                 request.route_prefill_queue_ahead_ms = (
                     decision.prefill_queue_ahead_ms
                 )
@@ -828,12 +836,20 @@ class MultiWorkerGenerationBackend:
         """
         with self._state_lock:
             count = len(self._prefill_processes)
-            for offset in range(count):
-                index = (self._prefill_serve_round_robin + offset) % count
-                if self._prefill_healthy[index] and not self._prefill_locks[index].locked():
-                    self._prefill_serve_round_robin = (index + 1) % count
-                    return index
-            return None
+            idle = [
+                index
+                for index in range(count)
+                if self._prefill_healthy[index]
+                and not self._prefill_locks[index].locked()
+            ]
+            if not idle:
+                return None
+            # Prefer the least-loaded idle worker (fewest in-flight commands);
+            # the command queue is shared with PD prefills, so a worker with
+            # queued work would stall the short request behind it.
+            index = min(idle, key=lambda candidate: self._prefill_pending[candidate])
+            self._prefill_serve_round_robin = (index + 1) % count
+            return index
 
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
         index = self._pick_prefill_worker()
@@ -844,10 +860,15 @@ class MultiWorkerGenerationBackend:
                     raise WorkerUnavailableError(
                         f"prefill worker {index} is not running"
                     )
+                with self._state_lock:
+                    self._prefill_pending[index] += 1
                 self._prefill_commands[index].put(command)
                 result = self._get_prefill_response(index, self.operation_timeout)
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc
+            finally:
+                with self._state_lock:
+                    self._prefill_pending[index] -= 1
         if failure is not None:
             with self._state_lock:
                 if self._prefill_healthy[index]:
@@ -869,10 +890,15 @@ class MultiWorkerGenerationBackend:
                     raise WorkerUnavailableError(
                         f"prefill worker {index} is not running"
                     )
+                with self._state_lock:
+                    self._prefill_pending[index] += 1
                 self._prefill_commands[index].put(command)
                 result = self._get_prefill_response(index, self.operation_timeout)
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc
+            finally:
+                with self._state_lock:
+                    self._prefill_pending[index] -= 1
         if failure is not None:
             with self._state_lock:
                 if self._prefill_healthy[index]:

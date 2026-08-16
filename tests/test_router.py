@@ -167,3 +167,27 @@ def test_common_prefill_queue_cost_does_not_change_route_savings_or_calibration(
     assert router.stats().pd_correction == pytest.approx(1)
     router.reset_online_state()
     assert router.stats().pd_observations == 0
+
+
+def test_prefill_load_inflates_pd_cost_and_flips_route() -> None:
+    config = CostRouterConfig(
+        collocated=LatencyCurve(fixed_ms=10.0, linear_ms_per_token=1.0),
+        pd_disaggregated=LatencyCurve(fixed_ms=5.0, linear_ms_per_token=0.5),
+        minimum_pd_prompt_tokens=256,
+        minimum_savings_ms=5.0,
+        minimum_savings_ratio=0.05,
+    )
+    router = CostAwareRouter(config)
+    clear = router.decide(1000, 0.0)
+    assert clear.route is Route.PD_DISAGGREGATED
+    busy = router.decide(1000, 0.0, prefill_load=1.0)
+    assert busy.route is Route.COLLOCATED
+    # Busy-pool inflation scales the PD cost multiplicatively.
+    assert busy.pd_cost_ms == pytest.approx(clear.pd_cost_ms * 2.0)
+    assert busy.prefill_load == 1.0
+
+
+def test_prefill_load_rejects_out_of_range() -> None:
+    router = CostAwareRouter()
+    with pytest.raises(ValueError):
+        router.decide(1024, 0.0, prefill_load=1.5)

@@ -52,6 +52,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._lost_requests = set()
         self._state_lock = RLock()
         self._prefill_healthy = [True]
+        self._prefill_pending = [0]
         self._collocated_count = 0
         self._pd_count = 0
         self._pd_failures = 0

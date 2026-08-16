@@ -18,6 +18,7 @@ class RouteReason(str, Enum):
     LONG_PROMPT_PD = "long_prompt_pd"
     FORCED_LONG_PROMPT = "forced_long_prompt"
     DECODE_SATURATED = "decode_saturated"
+    PREFILL_SATURATED = "prefill_saturated"
     NO_DECODE_SLOT = "no_decode_slot"
     PREFILL_UNAVAILABLE = "prefill_unavailable"
     COST_MODEL_COLLOCATED = "cost_model_collocated"
@@ -40,6 +41,7 @@ class RouteDecision:
     estimated_savings_ms: float | None = None
     cost_model_confidence: float | None = None
     prefill_queue_ahead_ms: float = 0.0
+    prefill_load: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,12 +68,14 @@ class AdaptiveRouter:
         decode_load: float,
         decode_has_slot: bool = True,
         prefill_queue_ahead_ms: float = 0.0,
+        prefill_load: float = 0.0,
     ) -> Route:
         return self.decide(
             prompt_tokens,
             decode_load,
             decode_has_slot,
             prefill_queue_ahead_ms,
+            prefill_load,
         ).route
 
     def decide(
@@ -80,6 +84,7 @@ class AdaptiveRouter:
         decode_load: float,
         decode_has_slot: bool = True,
         prefill_queue_ahead_ms: float = 0.0,
+        prefill_load: float = 0.0,
     ) -> RouteDecision:
         if prompt_tokens <= 0:
             raise ValueError("prompt_tokens must be positive")
@@ -87,6 +92,8 @@ class AdaptiveRouter:
             raise ValueError("decode_load must be in [0, 1]")
         if prefill_queue_ahead_ms < 0:
             raise ValueError("prefill queue cost cannot be negative")
+        if not 0 <= prefill_load <= 1:
+            raise ValueError("prefill_load must be in [0, 1]")
         if prompt_tokens >= self.config.force_pd_tokens:
             route, reason = Route.PD_DISAGGREGATED, RouteReason.FORCED_LONG_PROMPT
         elif prompt_tokens < self.config.short_prompt_tokens:
@@ -96,10 +103,16 @@ class AdaptiveRouter:
         elif (
             prompt_tokens >= self.config.long_prompt_tokens
             and decode_load < self.config.decode_load_limit
+            and prefill_load < self.config.decode_load_limit
         ):
             route, reason = Route.PD_DISAGGREGATED, RouteReason.LONG_PROMPT_PD
         elif prompt_tokens >= self.config.long_prompt_tokens:
-            route, reason = Route.COLLOCATED, RouteReason.DECODE_SATURATED
+            route, reason = (
+                Route.COLLOCATED,
+                RouteReason.PREFILL_SATURATED
+                if prefill_load >= self.config.decode_load_limit
+                else RouteReason.DECODE_SATURATED,
+            )
         else:
             route, reason = Route.COLLOCATED, RouteReason.MEDIUM_PROMPT
         return RouteDecision(
@@ -109,6 +122,7 @@ class AdaptiveRouter:
             decode_load=decode_load,
             decode_has_slot=decode_has_slot,
             prefill_queue_ahead_ms=prefill_queue_ahead_ms,
+            prefill_load=prefill_load,
         )
 
 
@@ -156,12 +170,15 @@ class CostRouterConfig:
     drift_min_observations: int = 5
     fail_closed_on_drift: bool = True
     force_pd_tokens: int = 0
+    prefill_load_scale: float = 1.0
 
     def __post_init__(self) -> None:
         if self.minimum_pd_prompt_tokens <= 0:
             raise ValueError("minimum PD prompt length must be positive")
         if self.force_pd_tokens < 0:
             raise ValueError("force-PD prompt threshold cannot be negative")
+        if self.prefill_load_scale < 0:
+            raise ValueError("prefill load scale cannot be negative")
         if self.minimum_savings_ms < 0:
             raise ValueError("minimum route savings cannot be negative")
         if not 0 <= self.minimum_savings_ratio < 1:
@@ -260,12 +277,14 @@ class CostAwareRouter:
         decode_load: float,
         decode_has_slot: bool = True,
         prefill_queue_ahead_ms: float = 0.0,
+        prefill_load: float = 0.0,
     ) -> Route:
         return self.decide(
             prompt_tokens,
             decode_load,
             decode_has_slot,
             prefill_queue_ahead_ms,
+            prefill_load,
         ).route
 
     def decide(
@@ -274,6 +293,7 @@ class CostAwareRouter:
         decode_load: float,
         decode_has_slot: bool = True,
         prefill_queue_ahead_ms: float = 0.0,
+        prefill_load: float = 0.0,
     ) -> RouteDecision:
         if prompt_tokens <= 0:
             raise ValueError("prompt_tokens must be positive")
@@ -281,12 +301,18 @@ class CostAwareRouter:
             raise ValueError("decode_load must be in [0, 1]")
         if prefill_queue_ahead_ms < 0:
             raise ValueError("prefill queue cost cannot be negative")
+        if not 0 <= prefill_load <= 1:
+            raise ValueError("prefill_load must be in [0, 1]")
         collocated_service = self._predict(
             Route.COLLOCATED, prompt_tokens, decode_load
         )
         pd_service = self._predict(Route.PD_DISAGGREGATED, prompt_tokens, decode_load)
+        # A busy prefill pool inflates the PD path's effective cost: the
+        # request would wait behind in-flight long prefills.
         risk_adjusted_pd_service = (
-            pd_service * self.config.pd_uncertainty_multiplier
+            pd_service
+            * self.config.pd_uncertainty_multiplier
+            * (1.0 + self.config.prefill_load_scale * prefill_load)
         )
         savings = collocated_service - risk_adjusted_pd_service
         required_savings = max(
@@ -344,6 +370,7 @@ class CostAwareRouter:
             savings,
             self._confidence(prompt_tokens),
             prefill_queue_ahead_ms,
+            prefill_load,
         )
 
     def observe(

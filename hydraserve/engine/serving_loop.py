@@ -120,6 +120,7 @@ class ServingRequest:
     route_estimated_savings_ms: float | None = None
     route_cost_confidence: float | None = None
     route_decode_load: float | None = None
+    route_prefill_load: float = 0.0
     route_prefill_queue_ahead_ms: float = 0.0
     route_observed_prefill_service_ms: float | None = None
     prefill_started_at: float | None = None
