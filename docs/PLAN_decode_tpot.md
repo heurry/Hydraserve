@@ -104,3 +104,15 @@ prefill 无关——所以 plan 原定的 W4/W5/W6(prefill 侧杠杆,为 128K �
 - 结论:B3 的真实解是 **chunkwise 仿射扫描**(S' = (aI − βkkᵀ)S + βkvᵀ 的关联
   扫描,chunk 内并行,参考 fla 的 chunked delta rule),研究级 kernel,建议独立
   立项,不在本轮继续。
+
+## 7. 上线后待办:长上下文 router profile 拟合(#3)
+
+**现象**:默认 profile(partial_transfer_default)的二次曲线由短 prompt(≤9K)数据
+拟合,外推到 64K/128K 严重失准;云端混合负载实测 17 个请求触发 drift 保护
+fail-closed 到 collocated。
+
+**任务**:用已有 32K/64K/128K 三个长度实测点(context_sweep + 单请求诊断数据)
+跑 `python -m hydraserve fit-router-profile`,产出的 profile 作为 `--router-profile`
+上线;prefill-load 感知路由上线后,拟合样本需同时覆盖低/高 prefill-load 工况。
+验收:64K 混合负载下 route_reason 不再出现 cost_model_drift,且长请求路由与
+成本模型预测一致。

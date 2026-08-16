@@ -214,6 +214,9 @@ def _prefill_worker(
         )
         state_capacity = state_pool.capacity_snapshot().total_slots
         reservations = set()
+        from threading import Lock as _ThreadLock
+
+        state_lock = _ThreadLock()
 
         def capacity_payload():
             capacity = cache.block_manager.capacity()
@@ -262,7 +265,9 @@ def _prefill_worker(
                     short_budget = 64
             operation = command["op"]
             if operation == "shutdown":
-                for request_id in tuple(set(states) | reservations):
+                with state_lock:
+                    live_ids = tuple(set(states) | reservations)
+                for request_id in live_ids:
                     cache.free(request_id)
                 responses.put({"op": "shutdown"})
                 return
@@ -302,7 +307,8 @@ def _prefill_worker(
                         0, command["max_new_tokens"] - 1
                     )
                     required = cache.block_manager.blocks_required(total_tokens)
-                    live_requests = set(states) | reservations
+                    with state_lock:
+                        live_requests = set(states) | reservations
                     if required > cache.block_manager.num_blocks:
                         responses.put(
                             {
@@ -357,7 +363,8 @@ def _prefill_worker(
                                 }
                             )
                             continue
-                        reservations.add(request_id)
+                        with state_lock:
+                            reservations.add(request_id)
                         responses.put(
                             {
                                 "op": "admission",
@@ -398,8 +405,9 @@ def _prefill_worker(
                     )[0]
                     token_id = sample.token_id
                     request.generated_token_ids.append(token_id)
-                    requests[request_id] = request
-                    states[request_id] = state_pool.install(request_id, state)
+                    with state_lock:
+                        requests[request_id] = request
+                        states[request_id] = state_pool.install(request_id, state)
                     responses.put(
                         {
                             "op": "collocated_prepare",
@@ -447,10 +455,11 @@ def _prefill_worker(
                     )
                 elif operation == "release":
                     request_id = command["request_id"]
-                    reservations.discard(request_id)
-                    states.pop(request_id, None)
-                    state_pool.free(request_id)
-                    requests.pop(request_id, None)
+                    with state_lock:
+                        reservations.discard(request_id)
+                        states.pop(request_id, None)
+                        state_pool.free(request_id)
+                        requests.pop(request_id, None)
                     cache.free(request_id)
                     responses.put(
                         {"op": "release", "request_id": request_id, **capacity_payload()}
@@ -467,9 +476,10 @@ def _prefill_worker(
                     total_tokens = len(command["token_ids"]) + max(
                         0, command["max_new_tokens"] - 1
                     )
-                    state_pool.free(request_id)
-                    states.pop(request_id, None)
-                    requests.pop(request_id, None)
+                    with state_lock:
+                        state_pool.free(request_id)
+                        states.pop(request_id, None)
+                        requests.pop(request_id, None)
                     cache.free(request_id)
                     cache.allocate(
                         request_id,
@@ -496,8 +506,9 @@ def _prefill_worker(
                         sampling_params=command.get("sampling_params"),
                     )
                     request.generated_token_ids.extend(generated_token_ids)
-                    requests[request_id] = request
-                    states[request_id] = state_pool.install(request_id, state)
+                    with state_lock:
+                        requests[request_id] = request
+                        states[request_id] = state_pool.install(request_id, state)
                     responses.put(
                         {"op": "recover", "request_id": request_id, **capacity_payload()}
                     )
@@ -641,9 +652,16 @@ def _decode_worker(
         )
         state_capacity = state_pool.capacity_snapshot().total_slots
         reservations = set()
+        # Guards the request/state dicts shared with background prepare
+        # threads (transfer+install runs concurrently with the decode loop).
+        from threading import Lock as _ThreadLock
+
+        state_lock = _ThreadLock()
+
         def capacity_payload():
-            capacity = cache.block_manager.capacity()
-            live = len(set(states) | reservations)
+            with state_lock:
+                capacity = cache.block_manager.capacity()
+                live = len(set(states) | reservations)
             return {
                 "kv_total_blocks": capacity.total_blocks,
                 "kv_free_blocks": capacity.free_blocks,
@@ -659,7 +677,9 @@ def _decode_worker(
             command = commands.get()
             operation = command["op"]
             if operation == "shutdown":
-                for request_id in tuple(set(states) | reservations):
+                with state_lock:
+                    live_ids = tuple(set(states) | reservations)
+                for request_id in live_ids:
                     cache.free(request_id)
                 responses.put({"op": "shutdown"})
                 return
@@ -670,7 +690,8 @@ def _decode_worker(
                         0, command["max_new_tokens"] - 1
                     )
                     required = cache.block_manager.blocks_required(total_tokens)
-                    live_requests = set(states) | reservations
+                    with state_lock:
+                        live_requests = set(states) | reservations
                     if required > cache.block_manager.num_blocks:
                         responses.put(
                             {
@@ -725,7 +746,8 @@ def _decode_worker(
                                 }
                             )
                             continue
-                        reservations.add(request_id)
+                        with state_lock:
+                            reservations.add(request_id)
                         responses.put(
                             {
                                 "op": "admission",
@@ -743,24 +765,46 @@ def _decode_worker(
                         transferred=True,
                         sampling_params=command.get("sampling_params"),
                     )
-                    prepared = worker.receive_and_prepare(
-                        request,
-                        timeout=command.get("timeout"),
-                        preallocated=request_id in reservations,
-                        chunk_size=config.prefill_chunk_size,
-                    )
-                    requests[request_id] = request
-                    states[request_id] = state_pool.install(
-                        request_id, prepared.state
-                    )
-                    responses.put(
-                        {
-                            "op": "prepare",
-                            "request_id": request_id,
-                            "token_id": prepared.first_token_id,
-                            "replay_consistent": prepared.replay_consistent,
-                        }
-                    )
+
+                    # Overlap the transfer/install (SHM receive, KV install,
+                    # N-1 replay) with the decode loop: other requests keep
+                    # decoding while this one's state lands. GPU ops serialize
+                    # on the default stream, so decode steps interleave
+                    # between install kernels instead of blocking behind the
+                    # whole receive window.
+                    def prepare_in_background():
+                        try:
+                            prepared = worker.receive_and_prepare(
+                                request,
+                                timeout=command.get("timeout"),
+                                preallocated=request_id in reservations,
+                                chunk_size=config.prefill_chunk_size,
+                            )
+                            with state_lock:
+                                requests[request_id] = request
+                                states[request_id] = state_pool.install(
+                                    request_id, prepared.state
+                                )
+                            responses.put(
+                                {
+                                    "op": "prepare",
+                                    "request_id": request_id,
+                                    "token_id": prepared.first_token_id,
+                                    "replay_consistent": prepared.replay_consistent,
+                                }
+                            )
+                        except Exception as exc:
+                            responses.put(
+                                {
+                                    "op": "error",
+                                    "request_id": request_id,
+                                    "message": repr(exc),
+                                }
+                            )
+
+                    from threading import Thread as _Thread
+
+                    _Thread(target=prepare_in_background, daemon=True).start()
                 elif operation == "collocated_prepare":
                     request_id = command["request_id"]
                     if request_id not in reservations:
@@ -793,8 +837,9 @@ def _decode_worker(
                     )[0]
                     token_id = sample.token_id
                     request.generated_token_ids.append(token_id)
-                    requests[request_id] = request
-                    states[request_id] = state_pool.install(request_id, state)
+                    with state_lock:
+                        requests[request_id] = request
+                        states[request_id] = state_pool.install(request_id, state)
                     responses.put(
                         {
                             "op": "collocated_prepare",
@@ -817,9 +862,10 @@ def _decode_worker(
                     total_tokens = len(command["token_ids"]) + max(
                         0, command["max_new_tokens"] - 1
                     )
-                    state_pool.free(request_id)
-                    states.pop(request_id, None)
-                    requests.pop(request_id, None)
+                    with state_lock:
+                        state_pool.free(request_id)
+                        states.pop(request_id, None)
+                        requests.pop(request_id, None)
                     cache.free(request_id)
                     cache.allocate(
                         request_id,
@@ -846,8 +892,9 @@ def _decode_worker(
                         sampling_params=command.get("sampling_params"),
                     )
                     request.generated_token_ids.extend(generated_token_ids)
-                    requests[request_id] = request
-                    states[request_id] = state_pool.install(request_id, state)
+                    with state_lock:
+                        requests[request_id] = request
+                        states[request_id] = state_pool.install(request_id, state)
                     responses.put(
                         {"op": "recover", "request_id": request_id, **capacity_payload()}
                     )
@@ -890,10 +937,11 @@ def _decode_worker(
                     )
                 elif operation == "release":
                     request_id = command["request_id"]
-                    reservations.discard(request_id)
-                    states.pop(request_id, None)
-                    state_pool.free(request_id)
-                    requests.pop(request_id, None)
+                    with state_lock:
+                        reservations.discard(request_id)
+                        states.pop(request_id, None)
+                        state_pool.free(request_id)
+                        requests.pop(request_id, None)
                     cache.free(request_id)
                     responses.put(
                         {"op": "release", "request_id": request_id, **capacity_payload()}
