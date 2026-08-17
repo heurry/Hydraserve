@@ -144,6 +144,10 @@ def _prefill_worker(
             block_size=config.block_size,
             dtype=torch.bfloat16,
             device=device,
+            state_slots=config.max_state_slots,
+            state_workspace_slots=min(
+                config.max_state_slots, config.max_decode_batch_size
+            ),
             kv_quant=config.kv_quant,
         )
         blocks = memory_plan.planned_blocks
@@ -599,6 +603,10 @@ def _decode_worker(
             block_size=config.block_size,
             dtype=torch.bfloat16,
             device=device,
+            state_slots=config.max_state_slots,
+            state_workspace_slots=min(
+                config.max_state_slots, config.max_decode_batch_size
+            ),
             kv_quant=config.kv_quant,
         )
         blocks = memory_plan.planned_blocks

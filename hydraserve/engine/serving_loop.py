@@ -1324,9 +1324,14 @@ class RuntimeGenerationBackend:
         def restore(request_ids: tuple[int, ...]) -> None:
             for request_id in request_ids:
                 manager.truncate(request_id, base_lengths[request_id])
-                self.states[request_id] = self._checkpoint_state(
-                    checkpoints[request_id]
-                )
+                state = self.states.get(request_id)
+                # Pooled recurrent states are committed atomically at the end of
+                # the transaction, so a failed decode leaves them untouched; the
+                # state-pool identity check requires the object be preserved.
+                if state is not None and getattr(state, "_state_pool_ref", None) is None:
+                    self.states[request_id] = self._checkpoint_state(
+                        checkpoints[request_id]
+                    )
 
         def attempt(request_ids: tuple[int, ...]) -> tuple[TokenSample, ...]:
             manager.grow_many(request_ids, additional_tokens=1)

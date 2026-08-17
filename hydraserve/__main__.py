@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 from pathlib import Path
 
 from hydraserve.config import discover_model_configs, load_model_config
@@ -61,10 +62,23 @@ def main() -> int:
     serve_parser.add_argument("--decode-devices", nargs="+")
     serve_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
     serve_parser.add_argument("--worker-log-dir", default="", help="capture per-worker stderr into this directory")
+    serve_parser.add_argument(
+        "--pd-schedule",
+        choices=("round-robin", "kv-aware", "load-aware"),
+        default="round-robin",
+        help="decode-worker selection policy for multi-card PD",
+    )
     serve_mode = serve_parser.add_mutually_exclusive_group()
     serve_mode.add_argument("--pd", action="store_true")
     serve_mode.add_argument("--adaptive", action="store_true")
     serve_parser.add_argument("--router-profile", type=Path)
+    serve_parser.add_argument(
+        "--force-pd-tokens",
+        type=int,
+        default=0,
+        help="force PD disaggregated routing when prompt token count reaches "
+        "this threshold (0 disables)",
+    )
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
@@ -88,6 +102,13 @@ def main() -> int:
     benchmark_parser.add_argument("--limit", type=int, default=100)
     benchmark_parser.add_argument("--max-new-tokens", type=int, default=32)
     benchmark_parser.add_argument("--max-prompt-tokens", type=int, default=8192)
+    benchmark_parser.add_argument("--num-long", type=int, default=0)
+    benchmark_parser.add_argument("--long-tokens", type=int, default=0)
+    benchmark_parser.add_argument("--num-short", type=int, default=0)
+    benchmark_parser.add_argument("--short-tokens", type=int, default=0)
+    benchmark_parser.add_argument("--num-balanced", type=int, default=0)
+    benchmark_parser.add_argument("--balanced-min-tokens", type=int, default=0)
+    benchmark_parser.add_argument("--balanced-max-tokens", type=int, default=0)
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
     benchmark_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     benchmark_parser.add_argument("--warmup", type=int, default=0)
@@ -101,10 +122,23 @@ def main() -> int:
     benchmark_parser.add_argument("--decode-devices", nargs="+")
     benchmark_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
     benchmark_parser.add_argument("--worker-log-dir", default="", help="capture per-worker stderr into this directory")
+    benchmark_parser.add_argument(
+        "--pd-schedule",
+        choices=("round-robin", "kv-aware", "load-aware"),
+        default="round-robin",
+        help="decode-worker selection policy for multi-card PD",
+    )
     benchmark_mode = benchmark_parser.add_mutually_exclusive_group()
     benchmark_mode.add_argument("--pd", action="store_true")
     benchmark_mode.add_argument("--adaptive", action="store_true")
     benchmark_parser.add_argument("--router-profile", type=Path)
+    benchmark_parser.add_argument(
+        "--force-pd-tokens",
+        type=int,
+        default=0,
+        help="force PD disaggregated routing when prompt token count reaches "
+        "this threshold (0 disables)",
+    )
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
@@ -114,6 +148,12 @@ def main() -> int:
     benchmark_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
     benchmark_parser.add_argument("--no-flash-attention", action="store_true")
     benchmark_parser.add_argument("--output", type=Path)
+    benchmark_parser.add_argument(
+        "--dp-proxy",
+        metavar="URL",
+        help="drive a remote endpoint (e.g. a load-aware DP proxy) over HTTP "
+        "instead of an in-process backend",
+    )
     args = parser.parse_args()
 
     if args.command == "fit-router-profile":
@@ -163,7 +203,7 @@ def main() -> int:
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
-        from hydraserve.router import CostAwareRouter
+        from hydraserve.router import CostAwareRouter, CostRouterConfig
 
         if min(
             args.cache_tokens,
@@ -189,12 +229,23 @@ def main() -> int:
             parser.error("--decode-devices requires --adaptive")
         if args.router_profile and not args.adaptive:
             parser.error("--router-profile requires --adaptive")
+        if args.force_pd_tokens and not args.adaptive:
+            parser.error("--force-pd-tokens requires --adaptive")
         try:
             router = (
                 CostAwareRouter.from_json(args.router_profile)
                 if args.router_profile
                 else None
             )
+            if args.force_pd_tokens > 0:
+                config = (
+                    router.config
+                    if router is not None
+                    else CostRouterConfig.partial_transfer_default()
+                )
+                router = CostAwareRouter(
+                    replace(config, force_pd_tokens=args.force_pd_tokens)
+                )
         except (OSError, ValueError) as exc:
             parser.error(f"cannot load router profile: {exc}")
         if args.adaptive and args.decode_devices:
@@ -215,6 +266,7 @@ def main() -> int:
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
                     worker_log_dir=args.worker_log_dir,
+                    pd_schedule=args.pd_schedule,
                 ),
                 router=router,
             )
@@ -273,6 +325,8 @@ def main() -> int:
                 block_size=args.block_size,
                 dtype=torch.bfloat16,
                 device=args.device,
+                state_slots=max_active_requests,
+                state_workspace_slots=min(max_active_requests, args.max_batch_size),
                 kv_quant=args.kv_quant,
             )
             blocks = memory_plan.planned_blocks
@@ -348,7 +402,13 @@ def main() -> int:
     if args.command == "benchmark":
         import json
 
-        from hydraserve.benchmark import iter_dataset, run_benchmark
+        from hydraserve.benchmark import (
+            SyntheticSpec,
+            iter_dataset,
+            iter_synthetic,
+            run_benchmark,
+            run_http_benchmark,
+        )
         from hydraserve.engine import (
             AdaptiveGenerationBackend,
             ContinuousGenerationLoop,
@@ -358,7 +418,7 @@ def main() -> int:
             PDWorkerConfig,
         )
         from hydraserve.model import QwenTokenizer
-        from hydraserve.router import CostAwareRouter
+        from hydraserve.router import CostAwareRouter, CostRouterConfig
 
         if min(
             args.cache_tokens,
@@ -374,16 +434,86 @@ def main() -> int:
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
         tokenizer = QwenTokenizer(args.model)
+
+        def build_samples():
+            if args.dataset.lower() == "synthetic":
+                spec = SyntheticSpec(
+                    num_long=args.num_long,
+                    long_tokens=args.long_tokens,
+                    num_short=args.num_short,
+                    short_tokens=args.short_tokens,
+                    num_balanced=args.num_balanced,
+                    balanced_min_tokens=args.balanced_min_tokens,
+                    balanced_max_tokens=args.balanced_max_tokens,
+                    seed=args.seed,
+                )
+                spec.validate()
+                samples = list(iter_synthetic(tokenizer, spec))
+                if args.warmup > 0:
+                    warmup_tokens = args.short_tokens or 512
+                    warmup_spec = SyntheticSpec(
+                        num_short=args.warmup,
+                        short_tokens=warmup_tokens,
+                        seed=args.seed + 1,
+                    )
+                    samples = list(iter_synthetic(tokenizer, warmup_spec)) + samples
+                # Avoid the default 8192 truncating long synthetic prompts.
+                max_prompt_tokens = max(args.max_prompt_tokens, spec.max_prompt_tokens())
+            else:
+                samples = list(
+                    iter_dataset(
+                        args.datasets,
+                        args.dataset,
+                        subset=args.subset,
+                        limit=args.limit + args.warmup,
+                    )
+                )
+                max_prompt_tokens = args.max_prompt_tokens
+            return samples, max_prompt_tokens
+
+        if args.dp_proxy:
+            samples, _ = build_samples()
+            summary = run_http_benchmark(
+                args.dp_proxy,
+                tokenizer,
+                samples,
+                max_new_tokens=args.max_new_tokens,
+                concurrency=args.concurrency,
+                warmup_requests=args.warmup,
+                request_rate=args.request_rate,
+                arrival_pattern=args.arrival_pattern,
+                seed=args.seed,
+            )
+            output = json.dumps(summary.to_dict(), ensure_ascii=False, indent=2)
+            if args.output:
+                args.output.parent.mkdir(parents=True, exist_ok=True)
+                args.output.write_text(output + "\n", encoding="utf-8")
+                print(args.output)
+            else:
+                print(output)
+            return int(summary.failed > 0)
+
         if args.decode_devices and not args.adaptive:
             parser.error("--decode-devices requires --adaptive")
         if args.router_profile and not args.adaptive:
             parser.error("--router-profile requires --adaptive")
+        if args.force_pd_tokens and not args.adaptive:
+            parser.error("--force-pd-tokens requires --adaptive")
         try:
             router = (
                 CostAwareRouter.from_json(args.router_profile)
                 if args.router_profile
                 else None
             )
+            if args.force_pd_tokens > 0:
+                config = (
+                    router.config
+                    if router is not None
+                    else CostRouterConfig.partial_transfer_default()
+                )
+                router = CostAwareRouter(
+                    replace(config, force_pd_tokens=args.force_pd_tokens)
+                )
         except (OSError, ValueError) as exc:
             parser.error(f"cannot load router profile: {exc}")
         if args.adaptive and args.decode_devices:
@@ -404,6 +534,7 @@ def main() -> int:
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
                     worker_log_dir=args.worker_log_dir,
+                    pd_schedule=args.pd_schedule,
                 ),
                 router=router,
             )
@@ -460,6 +591,8 @@ def main() -> int:
                 block_size=args.block_size,
                 dtype=torch.bfloat16,
                 device=args.device,
+                state_slots=args.concurrency,
+                state_workspace_slots=args.concurrency,
                 kv_quant=args.kv_quant,
             )
             blocks = memory_plan.planned_blocks
@@ -507,19 +640,14 @@ def main() -> int:
             max_preemptions_per_request=args.max_preemptions_per_request,
         )
         try:
-            samples = iter_dataset(
-                args.datasets,
-                args.dataset,
-                subset=args.subset,
-                limit=args.limit + args.warmup,
-            )
+            samples, max_prompt_tokens = build_samples()
             summary = run_benchmark(
                 loop,
                 tokenizer,
                 samples,
                 max_new_tokens=args.max_new_tokens,
                 concurrency=args.concurrency,
-                max_prompt_tokens=args.max_prompt_tokens,
+                max_prompt_tokens=max_prompt_tokens,
                 warmup_requests=args.warmup,
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,

@@ -1,0 +1,207 @@
+# HydraServe 压测方案 v2（最终版）
+
+> 配套实现记录见 [`BENCHMARK_V2_CHANGES.md`](./BENCHMARK_V2_CHANGES.md)（三项前置改动的代码落点与复现步骤）。
+> 本文档是**测试方案本身**：环境、负载、矩阵、判据、实施顺序。
+> 代码仓库：`github.com/heurry/Hydraserve`（基线 commit `a8f747a`）。
+
+---
+
+## 一、测试环境
+
+4×RTX 3090 24GB，无 P2P，SHM 4.58 GB/s，CUDA 12.8，triton 3.7.1，FlashAttention 2.8.3。
+模型 Qwen3.5-4B BF16 + INT8 KV，FlashDecoding kernel 默认开。
+前缀缓存关闭（`--prefix-cache-blocks 0`），排除前缀缓存干扰变量，纯粹测 prefill-decode 干扰和 PD 隔离效果。
+
+## 二、前置改动（3 项，已实现，见 BENCHMARK_V2_CHANGES.md）
+
+1. **synthetic dataset adapter** — `hydraserve/benchmark/datasets.py`。混合模式 `--num-long/--long-tokens/--num-short/--short-tokens`；均匀模式 `--num-balanced/--balanced-min-tokens/--balanced-max-tokens`。从 tokenizer base vocab 随机采样（排除特殊 token），decode 成文本，按 seed 打乱、每请求 distinct。
+2. **DP load-aware proxy** — `scripts/dp_proxy.py`（stdlib）。查各后端 `/health` 的 `scheduler.active_requests`，转发给最少者。4×DP：4 个 serve（端口 8000-8003）+ 1 个 proxy（端口 9000）。
+3. **PD KV-aware 路由** — `--pd-schedule {round-robin, kv-aware, load-aware}`。kv-aware 选已占 KV block 最少的 D worker（block 粒度近似 KV token 总量，读自 registry 容量快照，不阻塞 decode）。
+
+## 三、负载设计
+
+**负载 A — prefill-bound**
+
+| 参数 | 值 |
+|---|---|
+| 长请求 | 8 个，prompt 32K token |
+| 短请求 | 32 个，prompt 2K token |
+| 输出 | 128 token/请求 |
+| 总 prefill | 320K token |
+| 总 decode | 5120 token |
+| prefill 占比 | 98% |
+
+32K prefill 单卡 ~12s，期间同卡 decode 被干扰 2.5-6.4 倍。PD 模式下 prefill 在 P 卡，D 卡 decode 不受干扰。
+KV 预算（INT8，32KB/token）：32K=1GB，2K=64MB。2P+2D 每 D 卡 4 长+16 短=4GB+1GB+8.5GB 权重=13.5GB；1P+3D 每 D 卡 ~2.7 长+10.7 短=2.7GB+0.7GB+8.5GB=11.9GB，均够。
+
+**负载 B — balanced**
+
+| 参数 | 值 |
+|---|---|
+| 请求数 | 40 个 |
+| prompt 长度 | 4K-8K 均匀随机 |
+| 输出 | 256 token/请求 |
+| 总 prefill | ~240K token |
+| 总 decode | 10240 token |
+| prefill 占比 | ~96% |
+
+单请求 prefill 只 1-2s，干扰窗口短。测"干扰不大时 PD 是否还值得"。
+
+## 四、统一配置参数
+
+所有 7 组统一（除非特别注明）：
+
+```
+--kv-quant int8
+--prefix-cache-blocks 0
+--prefill-chunk-size 32768
+--concurrency 16
+--arrival-pattern burst
+--seed 42
+--warmup 5
+--cache-tokens 131072
+--block-size 16
+```
+
+负载 A 额外：`--max-new-tokens 128`；负载 B 额外：`--max-new-tokens 256`。
+> 注：`--max-batch-size 64` 仅 serve 子命令有；benchmark 子命令用 `--concurrency`。synthetic 分支会自动把 `--max-prompt-tokens` 抬到最长 synthetic prompt，无需手动指定。
+
+## 五、测试矩阵
+
+| 组号 | 负载 | 拓扑 | 路由 | FlashDecoding | 目的 |
+|---|---|---|---|---|---|
+| 1 | A | 4×DP | load-aware proxy | on | DP baseline（prefill-bound） |
+| 2 | A | 2P+2D | kv-aware | on | PD 主力（prefill-bound） |
+| 3 | A | 1P+3D | kv-aware | on | PD 极致隔离（prefill-bound） |
+| 4 | A | 4×DP | load-aware proxy | off | FlashDecoding A/B |
+| 5 | A | 2P+2D | kv-aware | off | FlashDecoding A/B |
+| 6 | B | 4×DP | load-aware proxy | on | DP baseline（balanced） |
+| 7 | B | 2P+2D | kv-aware | on | PD（balanced） |
+
+分析完后再决定是否补测 round-robin baseline 和 decode-bound 负载。
+
+## 六、具体命令
+
+> ⚠️ **多卡 PD 一律用 `--adaptive`，不要用 `--pd`**（代码有硬校验 `--decode-devices requires --adaptive`，`--pd` 仅限 1P1D）。详见 BENCHMARK_V2_CHANGES.md「已知差异 1」。
+
+**组 1：4×DP load-aware，负载 A，FlashDecoding on**
+```bash
+for i in 0 1 2 3; do
+  CUDA_VISIBLE_DEVICES=$i python -m hydraserve serve /root/autodl-tmp/models/Qwen3.5-4B \
+    --port $((8000+i)) --kv-quant int8 --prefix-cache-blocks 0 \
+    --prefill-chunk-size 32768 --cache-tokens 131072 --max-batch-size 64 &
+done
+sleep 30
+python scripts/dp_proxy.py --port 9000 --backends 8000,8001,8002,8003 &
+
+python -m hydraserve benchmark /root/autodl-tmp/models/Qwen3.5-4B /root/autodl-tmp/data \
+  --dataset synthetic --num-long 8 --long-tokens 32768 --num-short 32 --short-tokens 2048 \
+  --max-new-tokens 128 --concurrency 16 --arrival-pattern burst --seed 42 --warmup 5 \
+  --kv-quant int8 --prefix-cache-blocks 0 --prefill-chunk-size 32768 --cache-tokens 131072 \
+  --dp-proxy http://127.0.0.1:9000 \
+  --output results/LoadA_4dp_loadaware_fd_on.json
+```
+> 说明：`--dp-proxy` 已在 benchmark 子命令实现——设了它就走 HTTP 客户端直打 proxy 地址（`/v1/completions`，`stream=true`），跳过进程内 backend。注意 proxy 模式下 `route_counts`/`per_worker` 为空（HTTP 响应不回传 route/worker 信息）。见「风险 1」。
+
+**组 2：2P+2D kv-aware，负载 A，FlashDecoding on**
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m hydraserve benchmark \
+  /root/autodl-tmp/models/Qwen3.5-4B /root/autodl-tmp/data \
+  --dataset synthetic --num-long 8 --long-tokens 32768 --num-short 32 --short-tokens 2048 \
+  --max-new-tokens 128 --concurrency 16 --arrival-pattern burst --seed 42 --warmup 5 \
+  --kv-quant int8 --prefix-cache-blocks 0 --prefill-chunk-size 32768 --cache-tokens 131072 \
+  --adaptive --prefill-devices 0 1 --decode-devices 2 3 \
+  --pd-schedule kv-aware --worker-log-dir ./worker_logs \
+  --output results/LoadA_2p2d_kvaware_fd_on.json
+```
+
+**组 3：1P+3D kv-aware，负载 A，FlashDecoding on**
+```bash
+# 同组 2，改设备分配：
+#   --adaptive --prefill-devices 0 --decode-devices 1 2 3
+#   --output results/LoadA_1p3d_kvaware_fd_on.json
+```
+
+**组 4 / 组 5：FlashDecoding off（A/B）**
+同组 1 / 组 2，但关闭 FlashDecoding（设 `HYDRASERVE_PAGED_ATTENTION=reference`）。
+> decode 的 FlashDecoding/reference 切换由环境变量 `HYDRASERVE_PAGED_ATTENTION=reference` 控制（`hydraserve/model/runtime.py` decode 路径），默认 split-K FlashDecoding，设 reference 即回退顺序 kernel。
+
+**组 6：4×DP load-aware，负载 B**
+同组 1，负载参数改为：
+```
+--num-balanced 40 --balanced-min-tokens 4096 --balanced-max-tokens 8192 --max-new-tokens 256
+```
+
+**组 7：2P+2D kv-aware，负载 B**
+```bash
+# 同组 2，负载参数改为：
+#   --num-balanced 40 --balanced-min-tokens 4096 --balanced-max-tokens 8192 --max-new-tokens 256
+#   --output results/LoadB_2p2d_kvaware_fd_on.json
+```
+
+## 七、指标记录
+
+每组记录到 JSON：吞吐 `output_token_throughput`(tok/s)、TPOT P50/P95/P99、TTFT P50/P95/P99、`route_counts`(collocated/pd_disaggregated)、per-worker 分布（请求数/prompt tokens/output tokens/max TPOT）、`wall_time_s`。
+> runner 已内置吞吐/TPOT/TTFT/route_counts/wall_time，并新增 `per_worker` 聚合字段（按 `worker_id` 聚合请求数/prompt tokens/output tokens/max TPOT/max TTFT）。
+
+## 八、关键判据
+
+- **组 1 vs 组 2**（核心）：成功条件 = 组 2 TPOT P99 < 组 1 TPOT P99 且吞吐差距 <40%。预期组 1 ~50 tok/s、TPOT P99 ~350ms；组 2 ~31 tok/s、TPOT P99 ~150ms → 用 38% 吞吐换 57% TPOT 改善，帕累托改进成立。
+- **组 2 vs 组 3**：确认 prefill 并行度影响。预期组 3 ~15 tok/s、TPOT P99 ~80ms。两者都是帕累托点（2P+2D 平衡、1P+3D 极致 SLO）。
+- **组 1 vs 4、组 2 vs 5**：FlashDecoding A/B，预期 TPOT P99 降 20-25%。
+- **组 6 vs 组 7**：balanced 负载，预期 PD 略输或持平。
+
+## 九、帕累托图（负载 A）
+
+```
+TPOT P99 (ms)
+400 |  · 4×DP load-aware (组1)
+300 |
+200 |        · 2P+2D kv-aware (组2)
+100 |               · 1P+3D kv-aware (组3)
+    |________________________
+     10    20    30    40    50   吞吐 (tok/s)
+```
+组 2 落在组 1-组 3 连线下方 → 帕累托改进成立；落在连线上 → 2P+2D 非帕累托最优。
+
+## 十、实施顺序
+
+1. **本地（1 天）**：三项前置改动 + 单测（**已完成**，见 BENCHMARK_V2_CHANGES.md）。
+2. **云端（2-3h）**：跑组 1-3（负载 A 三拓扑），每组 5-10min，中间 `kill` 清理 GPU、`nvidia-smi` 确认显存释放。
+3. **云端（1-2h）**：跑组 4-5（FlashDecoding A/B）——先补 decode reference 开关。
+4. **云端（1-2h）**：跑组 6-7（负载 B）。
+5. **本地（1h）**：收集 7 组 JSON、画帕累托图、分析。
+6. 按结果决定是否补测 round-robin baseline 和 decode-bound 负载。
+
+## 十一、面试叙述框架
+
+1. 干扰数据：4×DP load-aware 在 prefill-bound 下 TPOT P99 ~350ms，根因是 32K prefill 干扰同卡 decode（实测 2.5-6.4× 减速）。
+2. 隔离效果：2P+2D kv-aware 同负载 TPOT P99 ~150ms，D 卡 decode 不受 prefill 干扰。
+3. 帕累托点：2P+2D 用 38% 吞吐换 57% TPOT 改善，落在 4×DP 和 1P+3D 都到不了的位置。
+4. kernel 优化：FlashDecoding 使 TPOT 额外降 23%，与拓扑优化独立叠加。
+5. 边界：balanced 负载下 PD 不再占优 → PD 价值在 prefill-bound 场景（诚实边界增强可信度）。
+
+## 十二、风险和备选
+
+1. **proxy 转发延迟** ~4ms/请求，对 150-350ms 量级影响 <2%；要消除就把 proxy 逻辑嵌入 benchmark runner。
+2. **synthetic prompt 是随机 token，输出乱码**。不影响性能测试；若被问输出正确性，用 WikiText-103 真实文本跑一组 smoke 验证通顺，性能测试用 synthetic 以精确控制 token 数。
+3. **1P+3D 的 32K wall time 可能过长**（8×12s=96s prefill 串行）。超 10min 就减长请求数到 4 或缩到 16K。
+4. **kv-aware 的 KV 查询不能阻塞 decode**——已用 registry 容量快照（非阻塞）实现。
+5. **FlashDecoding decode 开关**（影响组 4/5）：设环境变量 `HYDRASERVE_PAGED_ATTENTION=reference` 即回退顺序 decode attention；默认 split-K FlashDecoding（`hydraserve/model/runtime.py`）。注意别和 prefill 的 `HYDRASERVE_PAGED_PREFILL=reference` 混淆。
+
+---
+
+## 附：实现状态与相对原方案的修正（2026-08-13）
+
+| 项 | 状态 |
+|---|---|
+| synthetic dataset（改动 1） | ✅ 已实现 + mock 验证 |
+| dp_proxy（改动 2） | ✅ 已实现（`--help` 可用） |
+| kv-aware 路由（改动 3） | ✅ 已实现 + 排序算法 mock 验证 |
+| 多卡 PD 命令 | ⚠️ 原方案用 `--pd`，须改 `--adaptive`（代码硬校验） |
+| `--pd-schedule` 默认 | ⚠️ 默认改为字面 round-robin；旧复合打分保留为 `load-aware` |
+| `--max-prompt-tokens` | ✅ synthetic 分支自动抬到最长 prompt，不会截断 32K |
+| benchmark `--dp-proxy` / 多卡 DP runner | ✅ 已实现（HTTP 客户端直打 proxy，跳过进程内 backend） |
+| decode FlashDecoding reference 开关 | ✅ 已存在（`HYDRASERVE_PAGED_ATTENTION=reference`，默认 split-K） |
+| per-worker 聚合指标 | ✅ 已实现（`per_worker` 字段：请求数/prompt tokens/output tokens/max TPOT/max TTFT） |
+

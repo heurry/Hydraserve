@@ -37,6 +37,12 @@ from hydraserve.router import (
 )
 
 
+def _normalize_device(device: str) -> str:
+    """Accept a bare CUDA index (``"2"``) as well as a full ``"cuda:2"`` string."""
+    value = device.strip()
+    return f"cuda:{value}" if value.isdigit() else value
+
+
 @dataclass(frozen=True, slots=True)
 class PDClusterConfig:
     model_dir: str
@@ -55,14 +61,27 @@ class PDClusterConfig:
     max_decode_batch_size_per_worker: int = 64
     kv_quant: str | None = None
     worker_log_dir: str = ""
+    pd_schedule: str = "round-robin"
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
             raise ValueError("cluster requires a model and decode workers")
+        object.__setattr__(
+            self,
+            "decode_devices",
+            tuple(_normalize_device(device) for device in self.decode_devices),
+        )
+        object.__setattr__(self, "prefill_device", _normalize_device(self.prefill_device))
+        if self.prefill_devices:
+            object.__setattr__(
+                self,
+                "prefill_devices",
+                tuple(_normalize_device(device) for device in self.prefill_devices),
+            )
+        else:
+            object.__setattr__(self, "prefill_devices", (self.prefill_device,))
         if len(set(self.decode_devices)) != len(self.decode_devices):
             raise ValueError("decode devices must be unique")
-        if not self.prefill_devices:
-            object.__setattr__(self, "prefill_devices", (self.prefill_device,))
         if len(set(self.prefill_devices)) != len(self.prefill_devices):
             raise ValueError("prefill devices must be unique")
         if set(self.prefill_devices) & set(self.decode_devices):
@@ -85,6 +104,10 @@ class PDClusterConfig:
             raise ValueError("KV headroom must be below physical cache blocks")
         if self.topologies and len(self.topologies) != len(self.decode_devices):
             raise ValueError("topologies must match decode devices")
+        if self.pd_schedule not in {"round-robin", "kv-aware", "load-aware"}:
+            raise ValueError(
+                "pd_schedule must be one of round-robin, kv-aware, load-aware"
+            )
 
     def worker_config(self, worker_index: int) -> PDWorkerConfig:
         return PDWorkerConfig(
@@ -261,6 +284,7 @@ class MultiWorkerGenerationBackend:
         self._prefill_recovery_failures = [0] * prefill_count
         self._prefill_round_robin = 0
         self._prefill_serve_round_robin = 0
+        self._decode_round_robin = 0
         # request_id -> prefill worker index for collocated requests served on a
         # prefill worker (W4); decode-worker-bound requests stay in the registry.
         self._prefill_bound: dict[int, int] = {}
@@ -352,6 +376,7 @@ class MultiWorkerGenerationBackend:
                 )
             return AdmissionDecision.defer("all decode workers are temporarily full")
 
+        candidates = self._order_candidates(candidates)
         last_retryable = None
         prefill_available = self._prefill_available()
         for candidate in candidates:
@@ -405,6 +430,33 @@ class MultiWorkerGenerationBackend:
         return AdmissionDecision.defer(
             last_retryable or "all decode workers rejected the reservation"
         )
+
+    def _order_candidates(self, candidates):
+        """Reorder decode-worker candidates per ``--pd-schedule``.
+
+        ``load-aware`` keeps the registry's composite score order (the pre-change
+        default). ``kv-aware`` prefers the worker with the fewest occupied KV
+        blocks. ``round-robin`` rotates so a different worker leads each admission.
+        """
+        schedule = self.config.pd_schedule
+        if schedule in ("load-aware", ""):
+            return list(candidates)
+        if schedule == "kv-aware":
+            used = {
+                snapshot.worker_id: snapshot.capacity.kv_total_blocks
+                - snapshot.capacity.kv_free_blocks
+                for snapshot in self.registry.snapshots()
+            }
+            return sorted(
+                candidates,
+                key=lambda c: (used.get(c.worker_id, 0), c.decode_load, c.worker_id),
+            )
+        with self._state_lock:
+            offset = self._decode_round_robin % max(1, len(candidates))
+            self._decode_round_robin += 1
+        if offset == 0:
+            return list(candidates)
+        return list(candidates[offset:]) + list(candidates[:offset])
 
     def prefill(self, request: ServingRequest) -> int | TokenSample:
         admitted = self.admit(request)

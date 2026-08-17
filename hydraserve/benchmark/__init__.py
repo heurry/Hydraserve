@@ -4,16 +4,26 @@ from hydraserve.benchmark.datasets import (
     BenchmarkSample,
     DatasetCatalog,
     DatasetFormatError,
+    SyntheticSpec,
     iter_dataset,
+    iter_synthetic,
 )
-from hydraserve.benchmark.runner import BenchmarkSummary, RequestMetrics, run_benchmark
+from hydraserve.benchmark.runner import (
+    BenchmarkSummary,
+    RequestMetrics,
+    run_benchmark,
+    run_http_benchmark,
+)
 
 __all__ = [
     "BenchmarkSample",
     "DatasetCatalog",
     "DatasetFormatError",
+    "SyntheticSpec",
     "iter_dataset",
+    "iter_synthetic",
     "BenchmarkSummary",
     "RequestMetrics",
     "run_benchmark",
+    "run_http_benchmark",
 ]

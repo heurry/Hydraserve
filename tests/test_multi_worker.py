@@ -32,6 +32,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
             max_state_slots_per_worker=4,
             prefix_cache_blocks=0,
             kv_headroom_blocks=0,
+            pd_schedule="load-aware",
         )
         self.router = AdaptiveRouter(
             RouterConfig(short_prompt_tokens=4, long_prompt_tokens=8, force_pd_tokens=16)
@@ -68,6 +69,7 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self._prefill_recovery_failures = [0]
         self._prefill_round_robin = 0
         self._prefill_serve_round_robin = 0
+        self._decode_round_robin = 0
         self._prefill_bound = {}
         self._recovery_stop = Event()
         self._recovering_workers = set()

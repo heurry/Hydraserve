@@ -7,3 +7,5 @@ htmlcov/
 .venv/
 dist/
 build/
+worker_logs/
+.claude/

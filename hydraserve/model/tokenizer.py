@@ -28,6 +28,15 @@ class QwenTokenizer:
             self._tokenizer.token_to_id(eos_token) if isinstance(eos_token, str) else None
         )
 
+    @property
+    def base_vocab_size(self) -> int:
+        """Vocabulary size excluding added/special tokens.
+
+        Sampling IDs from ``[0, base_vocab_size)`` avoids special tokens, so a
+        synthetic prompt of random IDs re-encodes to ordinary text.
+        """
+        return int(self._tokenizer.get_vocab_size(with_added_tokens=False))
+
     def encode(self, text: str) -> tuple[int, ...]:
         if not isinstance(text, str) or not text:
             raise ValueError("prompt must be a non-empty string")

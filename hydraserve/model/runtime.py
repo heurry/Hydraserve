@@ -318,7 +318,11 @@ class QwenTextRuntime:
             else state_pool.batch(request_ids, states)
         )
         with context as pooled_batch:
-            if pooled_batch is not None and self._use_cuda_graphs():
+            if (
+                pooled_batch is not None
+                and self._use_cuda_graphs()
+                and getattr(paged_cache, "kv_quant", None) != "int8"
+            ):
                 return self._decode_batch_graph(
                     input_ids, states, paged_cache, request_ids, pooled_batch
                 )
@@ -499,6 +503,7 @@ class QwenTextRuntime:
         entry["positions"].copy_(positions)
         entry["table"].copy_(table)
         entry["lengths"].copy_(lengths)
+        entry["slot_ids"].copy_(pooled_batch.slot_ids)
         entry["graph"].replay()
         for state in states:
             state.sequence_length += 1
@@ -530,6 +535,7 @@ class QwenTextRuntime:
                 (batch, width), device=self.device, dtype=torch.int32
             ),
             "lengths": torch.empty((batch,), device=self.device, dtype=torch.int32),
+            "slot_ids": torch.empty((batch,), device=self.device, dtype=torch.long),
             "logits": torch.empty(
                 (batch, 1, self.config.vocab_size),
                 device=self.device,
@@ -598,6 +604,12 @@ class QwenTextRuntime:
             table, lengths = paged_cache.batch_metadata(request_ids)
         static["table"].copy_(table)
         static["lengths"].copy_(lengths)
+        # The pooled-state commit scatters into per-request slots; those slot
+        # ids vary per batch, so they must live in a static buffer the replay
+        # rewrites (the fresh tensor would otherwise be captured by address and
+        # read as stale memory on later replays).
+        static["slot_ids"].copy_(pooled_batch.slot_ids)
+        pooled_batch.slot_ids = static["slot_ids"]
         try:
             graph = torch.cuda.CUDAGraph()
             stream = torch.cuda.Stream()
@@ -626,7 +638,13 @@ class QwenTextRuntime:
                 )
         except Exception:
             # Any host sync or dynamic shape inside the capture region makes
-            # this batch shape permanently eager.
+            # this batch shape permanently eager. Release the failed graph's
+            # private memory pool so a capture failure does not pin several GB.
+            try:
+                graph.reset()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
             restore()
             return None
         restore()

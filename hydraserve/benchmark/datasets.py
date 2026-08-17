@@ -11,6 +11,7 @@ import gzip
 import io
 import json
 from pathlib import Path
+from random import Random
 from typing import Any, BinaryIO, Iterator, TextIO
 import zipfile
 
@@ -329,3 +330,105 @@ def iter_dataset(
         if limit is not None and index >= limit:
             return
         yield sample
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticSpec:
+    """Recipe for a synthetic, length-controlled benchmark workload."""
+
+    num_long: int = 0
+    long_tokens: int = 0
+    num_short: int = 0
+    short_tokens: int = 0
+    num_balanced: int = 0
+    balanced_min_tokens: int = 0
+    balanced_max_tokens: int = 0
+    seed: int = 0
+
+    def total_requests(self) -> int:
+        return self.num_long + self.num_short + self.num_balanced
+
+    def max_prompt_tokens(self) -> int:
+        return max(self.long_tokens, self.short_tokens, self.balanced_max_tokens)
+
+    def validate(self) -> None:
+        if self.total_requests() <= 0:
+            raise ValueError("synthetic spec requires at least one request")
+        if min(self.num_long, self.num_short, self.num_balanced) < 0:
+            raise ValueError("synthetic request counts cannot be negative")
+        if self.num_long and self.long_tokens <= 0:
+            raise ValueError("synthetic long requests require long_tokens > 0")
+        if self.num_short and self.short_tokens <= 0:
+            raise ValueError("synthetic short requests require short_tokens > 0")
+        if self.num_balanced and not (
+            0 < self.balanced_min_tokens <= self.balanced_max_tokens
+        ):
+            raise ValueError(
+                "synthetic balanced requests require 0 < balanced_min_tokens "
+                "<= balanced_max_tokens"
+            )
+
+
+def _base_vocab_size(tokenizer) -> int:
+    """Return the tokenizer vocabulary size excluding added/special tokens."""
+    base = getattr(tokenizer, "base_vocab_size", None)
+    if base is not None:
+        return int(base)
+    inner = getattr(tokenizer, "_tokenizer", None)
+    if inner is not None:
+        return int(inner.get_vocab_size(with_added_tokens=False))
+    raise TypeError("tokenizer does not expose a base vocabulary size")
+
+
+def _random_prompt(tokenizer, target_tokens: int, rng: Random) -> str:
+    """Sample a distinct prompt whose re-encoded length approaches ``target_tokens``.
+
+    Random base-vocab IDs can decode to text that re-encodes to a different
+    length (byte-fallback merges/splits). We resample with a proportional count
+    correction, bounded to avoid pathological loops.
+    """
+    vocab_size = _base_vocab_size(tokenizer)
+    count = max(1, target_tokens)
+    text = ""
+    for _ in range(4):
+        token_ids = [rng.randrange(vocab_size) for _ in range(count)]
+        text = tokenizer.decode(token_ids)
+        encoded = len(tokenizer.encode(text))
+        if encoded == target_tokens:
+            return text
+        if encoded <= 0:
+            continue
+        count = max(1, int(round(count * target_tokens / encoded)))
+    return text
+
+
+def iter_synthetic(tokenizer, spec: SyntheticSpec) -> Iterator[BenchmarkSample]:
+    """Yield shuffled synthetic requests with reproducible, distinct prompts.
+
+    Entries are ``long-*``/``short-*``/``balanced-*``, shuffled with
+    ``Random(spec.seed)``; each prompt is generated from ``Random(f"{seed}:{id}")``
+    so requests are distinct and reproducible.
+    """
+    spec.validate()
+    entries: list[tuple[str, int]] = []
+    for index in range(spec.num_long):
+        entries.append((f"long-{index}", spec.long_tokens))
+    for index in range(spec.num_short):
+        entries.append((f"short-{index}", spec.short_tokens))
+    rng = Random(spec.seed)
+    balanced_tokens = [
+        rng.randint(spec.balanced_min_tokens, spec.balanced_max_tokens)
+        for _ in range(spec.num_balanced)
+    ]
+    for index, tokens in enumerate(balanced_tokens):
+        entries.append((f"balanced-{index}", tokens))
+    rng.shuffle(entries)
+    for sample_id, target_tokens in entries:
+        prompt_rng = Random(f"{spec.seed}:{sample_id}")
+        prompt = _random_prompt(tokenizer, target_tokens, prompt_rng)
+        yield BenchmarkSample(
+            "synthetic",
+            sample_id,
+            prompt,
+            metadata={"target_tokens": target_tokens},
+        )

@@ -1,0 +1,202 @@
+# HydraServe 压测方案 v2 — 三项前置改动实现记录
+
+> 本文档记录「HydraServe 压测方案 v2（最终版）」中**三项前置改动**的代码实现，
+> 供另一位 agent 照此复现 / 核对 / 在 GPU 机器上验证。
+> 配套测试方案见 [`BENCHMARK_PLAN_V2.md`](./BENCHMARK_PLAN_V2.md)。
+>
+> 代码落点仓库：`github.com/heurry/Hydraserve`，基线 commit `a8f747a`（Overlap PD transfer/install with the decode loop）。
+> 改动性质：新增功能，向后兼容（除一处默认行为变化，见「已知差异 2」）。
+
+---
+
+## 0. 改动总览
+
+| # | 改动 | 涉及文件 | 类型 |
+|---|------|---------|------|
+| 1 | synthetic dataset adapter | `hydraserve/model/tokenizer.py`、`hydraserve/benchmark/datasets.py`、`hydraserve/benchmark/__init__.py`、`hydraserve/__main__.py` | 新增 + CLI |
+| 2 | DP load-aware proxy | `scripts/dp_proxy.py` | 新文件 |
+| 3 | PD KV-aware 路由 | `hydraserve/engine/multi_worker.py`、`hydraserve/__main__.py` | 新增 + CLI |
+
+所有改动均已通过 `python -m py_compile` 语法检查；改动 1 与改动 3 的核心算法已用
+mock 做过逻辑验证（本机无 GPU，无法跑真实前向，真实验证需在 4×3090 机器上）。
+
+---
+
+## 1. 改动 1：synthetic dataset adapter
+
+### 1.1 目标
+用模型 tokenizer 随机采样 token ID 到指定长度、decode 成文本，作为可控 prefill
+长度的压测负载。支持两种模式：
+- **混合（prefill-bound）**：`--num-long 8 --long-tokens 32768` + `--num-short 32 --short-tokens 2048`，按 seed 打乱。
+- **均匀（balanced）**：`--num-balanced 40 --balanced-min-tokens 4096 --balanced-max-tokens 8192`。
+
+每个请求内容 distinct（以 `seed:sample_id` 做随机种子），可复现。
+
+### 1.2 文件与改动
+
+**`hydraserve/model/tokenizer.py`** — 给 `QwenTokenizer` 新增属性：
+```python
+@property
+def base_vocab_size(self) -> int:
+    """词表大小（不含 added/special token）。在 [0, base_vocab_size) 采样可避开特殊 token。"""
+    return int(self._tokenizer.get_vocab_size(with_added_tokens=False))
+```
+
+**`hydraserve/benchmark/datasets.py`** — 顶部新增 `from random import Random`；文件末尾新增：
+- `SyntheticSpec`（frozen dataclass）：字段 `num_long/long_tokens/num_short/short_tokens/num_balanced/balanced_min_tokens/balanced_max_tokens/seed`；方法 `total_requests()`、`max_prompt_tokens()`、`validate()`。
+- `_base_vocab_size(tokenizer)`：优先 `tokenizer.base_vocab_size`，回退 `tokenizer._tokenizer.get_vocab_size(with_added_tokens=False)`。
+- `_random_prompt(tokenizer, target_tokens, rng)`：采样 base-vocab token ID → decode；用**有界重试**（最多 4 次，按比例 rescale 采样数）纠正 decode→re-encode 的长度漂移，使 re-encode 长度逼近 target。
+- `iter_synthetic(tokenizer, spec) -> Iterator[BenchmarkSample]`：生成 `long-*`/`short-*`/`balanced-*` 条目，用 `Random(spec.seed)` 打乱；每条用 `Random(f"{seed}:{sample_id}")` 生成 distinct prompt；`BenchmarkSample.dataset="synthetic"`，`metadata={"target_tokens": ...}`。
+
+**`hydraserve/benchmark/__init__.py`** — 导出 `SyntheticSpec`、`iter_synthetic`（加入 import 与 `__all__`）。
+
+**`hydraserve/__main__.py`** —
+1. benchmark_parser 新增 7 个 flag：`--num-long --long-tokens --num-short --short-tokens --num-balanced --balanced-min-tokens --balanced-max-tokens`（均 `type=int, default=0`）。
+2. benchmark 命令的 import 增加 `SyntheticSpec, iter_synthetic`。
+3. benchmark handler 的 samples 构建处（原 `samples = iter_dataset(...)`）改为分支：
+   - `args.dataset.lower() == "synthetic"`：构建 `SyntheticSpec` → `validate()` → `list(iter_synthetic(...))`；若 `args.warmup>0`，用 `SyntheticSpec(num_short=warmup, short_tokens=warmup_tokens, seed=seed+1)` 生成 warmup 样本并**前置**（runner 从头部取 warmup）；`max_prompt_tokens = max(args.max_prompt_tokens, spec.max_prompt_tokens())`（**避免默认 8192 截断 32K synthetic prompt**）。
+   - 否则走原 `iter_dataset(...)`，`max_prompt_tokens = args.max_prompt_tokens`。
+   - `run_benchmark(..., max_prompt_tokens=max_prompt_tokens, ...)`。
+
+### 1.3 验证（本机已做）
+用假 tokenizer 跑 `iter_synthetic`：2 long + 3 short → 5 样本、已打乱、re-encode 长度==target；balanced 模式 4 样本长度落在 [min,max]；空 spec 正确抛 `ValueError`。
+
+---
+
+## 2. 改动 2：DP load-aware proxy
+
+### 2.1 目标
+4×DP 测试时，压测流量经一个 proxy 转发到「当前 active_requests 最少」的后端 serve 进程。纯 stdlib（`http.server` + `urllib`），无额外依赖。
+
+### 2.2 文件
+**`scripts/dp_proxy.py`**（新文件，已 `chmod +x`）：
+- `LoadAwareProxyHandler(BaseHTTPRequestHandler)`：
+  - `_active_requests(backend)`：`GET {backend}/health`，解析 `scheduler.active_requests`；失败返回 `inf`（跳过不健康后端）。
+  - `_pick_backend()`：遍历 `backends`，选 `active_requests` 最小者（严格 `<`，平局取先出现者，保证确定性）。
+  - `_forward()`：读请求体 → `urllib.request.Request` 转发到所选后端的同路径 → 逐块回写响应（支持流式）。透传 `Content-Type/Accept/Authorization/X-Request-Id`。
+  - `do_POST = do_GET = _forward`。
+- `_normalize_backend(raw)`：接受 `8000` / `127.0.0.1:8000` / `http://host:8000`。
+- `main()`：`--port`（默认 9000）、`--host`、`--backends`（必填，逗号分隔）、`--health-timeout`、`--forward-timeout`。用 `ThreadingHTTPServer`。
+
+### 2.3 用法
+```bash
+# 4 个 serve 进程（各绑一卡，端口 8000-8003），见压测方案组 1
+python scripts/dp_proxy.py --port 9000 --backends 8000,8001,8002,8003
+# 压测工具连 http://127.0.0.1:9000
+```
+
+### 2.4 验证（本机已做）
+`python scripts/dp_proxy.py --help` 正常；`py_compile` 通过。（转发行为需起真实 serve 后端联调。）
+
+---
+
+## 3. 改动 3：PD KV-aware 路由
+
+### 3.1 目标
+给 decode-worker（D worker）选择加 `--pd-schedule`：
+- `round-robin`（默认）：轮流分配。
+- `kv-aware`：选当前「已占用 KV block 最少」的 D worker（KV token 总量的 block 粒度近似）。
+- `load-aware`：**新增**，保留改动前的复合打分（load+topology+affinity），即旧默认行为。
+
+KV 占用从 worker registry 既有的容量快照读取，不阻塞 decode 循环。
+
+### 3.2 重要现状澄清
+方案 v2 假设「D worker 当前是 round-robin」——**实际不是**。改动前 D worker 选择走
+`DecodeWorkerRegistry.candidates()` 的复合打分（`load_weight*decode_load + topology_weight*topo − affinity_weight*affinity`，见 `hydraserve/router/worker_registry.py`），本来就是 load-aware。因此：
+- 本改动把默认改为**字面 round-robin**（见「已知差异 2」）。
+- 额外提供 `load-aware` 选项以保留旧行为，避免回归。
+
+### 3.3 文件与改动
+
+**`hydraserve/engine/multi_worker.py`**：
+1. `PDClusterConfig` 新增字段 `pd_schedule: str = "round-robin"`；`__post_init__` 校验取值 ∈ `{round-robin, kv-aware, load-aware}`。
+2. `MultiWorkerGenerationBackend.__init__` 新增 `self._decode_round_robin = 0`（与 `_prefill_round_robin` 同处）。
+3. 准入逻辑（`candidates = self.registry.candidates(...)` 判空之后、遍历之前）插入：
+   ```python
+   candidates = self._order_candidates(candidates)
+   ```
+4. 新增方法 `_order_candidates(candidates)`：
+   - `load-aware` 或空：原样返回。
+   - `kv-aware`：从 `self.registry.snapshots()` 计算每 worker `used_blocks = kv_total_blocks − kv_free_blocks`，按 `(used_blocks, decode_load, worker_id)` 升序排（最少 KV 优先）。
+   - `round-robin`：在 `self._state_lock` 下取自增 `self._decode_round_robin` 作 offset，轮转 candidates。
+
+**`hydraserve/__main__.py`**：
+1. serve_parser 与 benchmark_parser 各新增：
+   ```python
+   add_argument("--pd-schedule", choices=("round-robin","kv-aware","load-aware"), default="round-robin", ...)
+   ```
+2. 两处 `PDClusterConfig(...)` 构造（serve handler 与 benchmark handler 的 `MultiWorkerGenerationBackend` 分支）各加 `pd_schedule=args.pd_schedule`。
+
+### 3.4 验证（本机已做）
+用 mock registry/candidates 复刻 `_order_candidates`：
+- kv-aware：used blocks {0:100,1:10,2:50} → 排序 `[1,2,0]`（最少优先）✓
+- load-aware：保持原序 ✓
+- round-robin：连续三次调用 `[0,1,2]→[1,2,0]→[2,0,1]` ✓
+`py_compile` 通过。
+
+---
+
+## 4. 已知差异 / 方案修正（另一位 agent 必读）
+
+1. **多卡 PD 必须用 `--adaptive`，不能用 `--pd`。**
+   `hydraserve/__main__.py` 有硬校验 `--decode-devices requires --adaptive`，且 `--pd`/`--adaptive` 互斥。方案 v2 组 2/3/7 的命令写的是 `--pd --prefill-devices … --decode-devices …`，**会直接报错**。请把这些组的 `--pd` 改成 `--adaptive`。
+   副作用：`--adaptive` 走 cost-aware router，可能把部分短请求路由到 collocated；用输出 JSON 的 `route_counts` 核对 collocated/pd 比例。若要纯 PD，需要另行提供「多卡强制 PD」后端（本次未实现，超出三项前置改动范围）。
+
+2. **默认调度行为变化。** 改动前 D worker 默认是复合 load-aware 打分；改动后 `--pd-schedule` 默认 `round-robin`。想保留旧行为请显式加 `--pd-schedule load-aware`。
+
+3. **`--max-prompt-tokens` 默认 8192 会截断长 synthetic prompt。** synthetic 分支已自动把上限抬到最长 synthetic prompt（`spec.max_prompt_tokens()`），无需手动覆盖；但非 synthetic 路径仍需自行保证该值足够大。
+
+4. **kv-aware 的 KV 度量是 block 粒度近似**（`kv_total_blocks − kv_free_blocks`），不是精确 token 数；与方案「KV token 总量」语义一致（paged KV 按 block 计）。未新增 `kv_tokens` 字段，复用既有容量快照，零侵入 decode 循环。
+
+5. **FlashDecoding decode 开关已存在（影响组 4/5，非本次三项改动）。** decode 路径由 `HYDRASERVE_PAGED_ATTENTION=reference` 切换（`hydraserve/model/runtime.py`，默认 split-K FlashDecoding）；`HYDRASERVE_PAGED_PREFILL=reference` 是 **prefill** 路径，二者别混淆。组 4/5 的 A/B 直接设前者即可。
+
+---
+
+## 5. 在 GPU 机器上的复现 / 验证步骤
+
+```bash
+# 0) 语法自查（任意机器）
+python -m py_compile \
+  hydraserve/model/tokenizer.py \
+  hydraserve/benchmark/datasets.py \
+  hydraserve/benchmark/__init__.py \
+  hydraserve/engine/multi_worker.py \
+  hydraserve/__main__.py \
+  scripts/dp_proxy.py
+
+# 1) CLI 冒烟：确认新 flag 被接受
+python -m hydraserve benchmark --help | grep -E 'num-long|num-balanced|pd-schedule'
+python -m hydraserve serve --help | grep pd-schedule
+python scripts/dp_proxy.py --help
+
+# 2) synthetic 数据链路冒烟（需要先能加载 tokenizer 的小模型目录）
+python -m hydraserve benchmark MODEL_DIR DATA_DIR \
+  --dataset synthetic --num-short 4 --short-tokens 512 \
+  --max-new-tokens 8 --concurrency 2 --warmup 1 --seed 42 \
+  --output /tmp/synthetic_smoke.json
+# 检查 /tmp/synthetic_smoke.json 的 requests==4、prompt_tokens≈512
+
+# 3) kv-aware 路由冒烟（2P+2D；注意用 --adaptive 而非 --pd）
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m hydraserve benchmark MODEL_DIR DATA_DIR \
+  --dataset synthetic --num-short 8 --short-tokens 1024 --max-new-tokens 16 \
+  --concurrency 4 --warmup 1 --seed 42 \
+  --adaptive --prefill-devices 0 1 --decode-devices 2 3 \
+  --pd-schedule kv-aware --worker-log-dir ./worker_logs \
+  --output /tmp/kvaware_smoke.json
+
+# 4) dp_proxy 联调：起 4 个 serve + proxy，curl /health 与一次 completions
+```
+
+---
+
+## 6. 变更文件清单（便于 code review / cherry-pick）
+
+```
+M  hydraserve/model/tokenizer.py          # +base_vocab_size
+M  hydraserve/benchmark/datasets.py        # +SyntheticSpec/iter_synthetic/_random_prompt
+M  hydraserve/benchmark/__init__.py        # 导出 synthetic
+M  hydraserve/engine/multi_worker.py       # +pd_schedule 字段/_decode_round_robin/_order_candidates
+M  hydraserve/__main__.py                  # +synthetic flags、+--pd-schedule、分支、穿透
+A  scripts/dp_proxy.py                     # 新文件：load-aware DP proxy
+```
+
