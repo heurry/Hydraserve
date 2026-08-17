@@ -45,3 +45,14 @@ TPOT P99(ms)
 7. **状态池内存规划偏差**：`plan_paged_kv_blocks` 默认 `state_slots=1`，低估状态池占用。修复：传入实际 `max_state_slots`/`workspace` 容量（`engine/pd_service.py`、`__main__.py`）。
 
 另有三项前置改动与三个补充项（synthetic dataset、dp_proxy、kv-aware 路由、per-worker 聚合、`--dp-proxy` HTTP 模式、decode FlashDecoding 开关确认），详见 `BENCHMARK_V2_CHANGES.txt`。
+
+## 四、负载均衡验证与数据可信度
+
+**KV-aware 路由确实生效**（in-process 组有 per-worker 数据可证）：
+- 组 2（2P+2D）：8 个 32K 长请求精确 **4/4** 分配到 2 个 D 卡（prompt_tokens 169895 vs 157616，反推 4 长+19 短 / 4 长+13 短）。
+- 组 3（1P+3D）：长请求 **3/3/2**，短请求 9/11/12。
+- 组 7（负载 B）：prompt_tokens 117028 vs 116343，差 0.6%。
+
+**4×DP 的 load-aware proxy 按请求数均衡**（`scripts/dp_proxy.py` 的 in-flight 计数），长请求随机分布（约 2/3/1/2）。这是"请求数级 load-aware"的固有特性（长请求 prefill 慢、占 in-flight 久）。实测三种均衡策略对比（组 1 负载 A）：请求数均衡 TPOT P99 309ms、in-flight 权重 369ms、累计 KV 占用 397ms——**请求数均衡反而最优**（累计均衡虽让长请求 2/2/2/2，但短请求严重不均、decode 排队拉高尾延迟）。故保留请求数均衡，并在 proxy 增加 `/stats` 端点（served / prompt_chars / pending）用于审计。
+
+**组 6 的 467ms 并非路由失效**：负载 B 是 40 个 4-8K 请求、无 32K 长请求，467ms 是长尾（中位数 105ms，个别请求 ~656ms），来自 4-8K prefill 与 256-token decode 持续重叠的偶发干扰，与长请求分配无关。

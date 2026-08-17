@@ -35,13 +35,17 @@ class LoadAwareProxyHandler(BaseHTTPRequestHandler):
     forward_timeout: float = 600.0
     _pending_lock = threading.Lock()
     _pending: dict[str, int] = {}
+    _served: dict[str, int] = {}
+    _served_chars: dict[str, int] = {}
 
-    def _pick_backend(self) -> str:
+    def _pick_backend(self, weight: int = 1) -> str:
         """Pick the backend with the fewest in-flight requests.
 
         Local in-flight counts avoid the burst thundering-herd: N concurrent
         requests all reading ``/health`` before any forward would all see zero
-        load and pile onto the first backend.
+        load and pile onto the first backend. (The ``weight`` arg is accepted
+        but unused: count-based balancing measured a lower tail TPOT than
+        KV-occupancy balancing, which starved short requests.)
         """
         with self._pending_lock:
             best = self.backends[0]
@@ -51,17 +55,52 @@ class LoadAwareProxyHandler(BaseHTTPRequestHandler):
                 if pending < best_pending:
                     best, best_pending = backend, pending
             self._pending[best] = best_pending + 1
+            self._served[best] = self._served.get(best, 0) + 1
             return best
 
     def _release_backend(self, backend: str) -> None:
         with self._pending_lock:
             self._pending[backend] = max(0, self._pending.get(backend, 0) - 1)
 
+    def _stats(self) -> None:
+        with self._pending_lock:
+            stats = {
+                backend: {
+                    "served": self._served.get(backend, 0),
+                    "prompt_chars": self._served_chars.get(backend, 0),
+                    "pending": self._pending.get(backend, 0),
+                }
+                for backend in self.backends
+            }
+        body = json.dumps(stats).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:
+        if self.path == "/stats":
+            self._stats()
+        else:
+            self._forward()
+
     def _forward(self) -> None:
-        backend = self._pick_backend()
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else None
+        prompt_chars = 0
+        if body:
+            try:
+                prompt_chars = len(json.loads(body.decode("utf-8")).get("prompt", ""))
+            except Exception:
+                prompt_chars = 0
+        weight = prompt_chars if prompt_chars > 0 else 1
+        backend = self._pick_backend(weight)
         try:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(length) if length else None
+            with self._pending_lock:
+                self._served_chars[backend] = (
+                    self._served_chars.get(backend, 0) + prompt_chars
+                )
             upstream = request.Request(
                 f"{backend}{self.path}", data=body, method=self.command
             )
@@ -93,7 +132,6 @@ class LoadAwareProxyHandler(BaseHTTPRequestHandler):
         finally:
             self._release_backend(backend)
 
-    do_GET = _forward
     do_POST = _forward
 
     def log_message(self, format, *args):  # noqa: A002 - keep proxy log terse
