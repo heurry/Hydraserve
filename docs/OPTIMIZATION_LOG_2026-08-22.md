@@ -1275,3 +1275,28 @@ CLI：`--pd-transfer-quant int8`。它与 `--kv-quant int8` 含义不同：前�
 边界：当前机器无 GPU peer access，CUDA P2P/NCCL/NIXL 仍不能做目标拓扑验收；生产 SHM 主路径
 采用 all-layer bulk chunk，而不是把 bulk chunk 拆成逐层小消息。`LayerTransferPipeline` 继续作为
 高带宽 transport 接口保留。
+
+## 22. V3 四卡压测前置修复（未执行测试）
+
+拉取 `dbc570b` 后审计新增的 P0 harness 和 engine-only 4×DP backend，发现直接开跑会污染结论：
+
+1. trace 虽记录 `ignore_eos`，但 generation loop 仍按全局 EOS 提前结束；
+2. 4×DP worker 选择只观察瞬时 RPC pending，reserve 完成后归零，burst 会反复选择 GPU 0；
+3. coordinator 按 worker 串行调用 decode，四张卡没有在同一步并行执行；
+4. 多 worker decode 的 local group/global position 混用，交错 request 顺序可能映射错误；
+5. trace CLI 无法表达 W1 的 long=16、short=128 以及定时注入，warmup 还会吃掉正式 trace；
+6. 原 trace-wide hash 只拼接 prompt 文本，没有覆盖输出长度、到达时刻和 EOS 策略。
+
+本轮完成的前置实现：
+
+- `ServingRequest` 增加逐请求 `ignore_eos`，进程内 runner 和 HTTP API 都传递该字段；
+- 4×DP 从 worker 选择到 request release 持久计数 active assignment，等负载 round-robin；
+- coordinator 使用持久线程池同时派发各 worker decode，并修正 request/result 映射；
+- trace-out 支持分类输出长度、long 固定注入时刻和 short Poisson 到达率；重放按绝对到达时刻排序；
+- trace 固化实际 re-encode token 数、token-ID/record/全文件 SHA256，并写同名 `.meta.json`；
+- CLI 为 trace 生成独立 synthetic warmup，正式结果不再丢掉前 N 条请求；
+- benchmark metadata 增加 trace hash、模型文件 manifest、逐卡属性、`nvidia-smi` 状态和 topology；
+- `BENCHMARK_PLAN_V3.md` 已改为 engine-only D0/P0 主路径，并补充 W1 命令和十项四卡门禁。
+
+按用户要求，本节修改没有执行单元测试、GPU 测试或性能压测。新增测试用例只作为下一次验证入口；
+当前状态是“代码和实验前置已准备，尚未验证”，禁止据此产生或更新性能数字。

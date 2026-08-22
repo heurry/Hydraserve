@@ -111,6 +111,7 @@ class ServingRequest:
     request_id: int
     token_ids: tuple[int, ...]
     max_new_tokens: int
+    ignore_eos: bool = False
     generated_token_ids: list[int] = field(default_factory=list)
     cancelled: Event = field(default_factory=Event)
     route: str | None = None
@@ -266,6 +267,7 @@ class ContinuousGenerationLoop:
         token_ids: list[int] | tuple[int, ...],
         max_new_tokens: int,
         *,
+        ignore_eos: bool = False,
         priority: int = 0,
         sampling_params: SamplingParams | None = None,
         timeout_ms: float | None = None,
@@ -287,6 +289,7 @@ class ContinuousGenerationLoop:
             next(self._ids),
             tuple(token_ids),
             max_new_tokens,
+            ignore_eos=ignore_eos,
             priority=priority,
             sampling_params=sampling,
             deadline_at=(
@@ -959,7 +962,11 @@ class ContinuousGenerationLoop:
         return request.deadline_at is not None and monotonic() >= request.deadline_at
 
     def _finish_reason(self, request: ServingRequest, token_id: int) -> str | None:
-        if self.eos_token_id is not None and token_id == self.eos_token_id:
+        if (
+            not request.ignore_eos
+            and self.eos_token_id is not None
+            and token_id == self.eos_token_id
+        ):
             return "stop"
         generated = request.generated_token_ids
         if any(

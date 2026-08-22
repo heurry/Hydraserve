@@ -63,6 +63,10 @@ PD 拓扑收益，二者必须独立 A/B。
 
 以下能力没有完成前，不产出新的对外性能数字。
 
+当前代码已完成 trace adapter、逐请求 `ignore_eos`、分 class/SLO 指标、进程内 4×DP backend、
+持久请求负载均衡及跨 worker 并行 decode 的前置实现；**本次按要求未执行测试，仍须通过 3.5 的
+四卡门禁，不能把“已实现”写成“已验证”。**
+
 ### P0.1 Trace workload
 
 为 benchmark 增加 JSONL trace adapter，每条请求包含：
@@ -91,6 +95,7 @@ PD 拓扑收益，二者必须独立 A/B。
 - tokenizer revision；
 - 每条实际 re-encode token 数；
 - prompt token ID 的 SHA256；
+- 每条完整 JSON record 的 SHA256；
 - 全 trace SHA256。
 
 4×DP、PD 和 vLLM 必须读取同一个冻结 trace；不允许各自重新随机生成。
@@ -118,6 +123,30 @@ JSON 除总体指标外，增加 `by_class.short/long/...`：
 
 每个结果写入：git commit、dirty 状态、完整 CLI/env、CUDA/PyTorch/Triton/FlashAttention 版本、
 GPU 型号/时钟/温度/topology、P2P 状态、模型与 trace hash。每轮保留 worker stderr 和 proxy stats。
+
+### P0.5 本次前置修改后的四卡门禁
+
+正式矩阵前必须依次通过，任何一项失败都先修复，不允许继续批量跑数：
+
+1. `ignore_eos=true` 的请求即使首 token 为 EOS，也必须生成完整目标长度，结果中
+   `finish_reason=length`、`completion_tokens=target_new_tokens`；
+2. 用 8 条同长度 burst 请求检查 4×DP，`per_worker` 必须为每卡 2 条，worker log 中四个进程均有
+   reserve/prefill/decode；这是持久 active-request 均衡的最小正确性门禁；
+3. 用至少两卡同时 decode，结合 worker 时间戳或 Nsight Systems 确认不同 GPU 的 decode 区间重叠；
+   不能只看总吞吐推断并行；
+4. 构造交错 request 顺序（例如 worker 0/1/0/1），确认返回 token 与 request ID 一一对应，且无
+   `PartialDecodeError`、错位或漏 token；
+5. trace 生成后立即保存同名 `.meta.json`，重放前校验 `token_ids_sha256`、`record_sha256` 和
+   `trace_sha256`；JSONL 一旦生成禁止手改，任何改动都必须重新生成；
+6. `--trace` 重放统一使用 `--arrival-pattern burst` 且不再传 `--request-rate`，因为到达时刻已经
+   固化在 `arrival_offset_ms`；否则会叠加第二套到达延迟；
+7. `--warmup N` 只使用独立的 synthetic warmup，不消耗正式 trace；结果的 `requests` 必须仍等于
+   trace 行数（W1 为 72）；
+8. 检查每卡显存余量、KV free blocks、state slots、ring slots 和进程存活。W1 从
+   `--cache-tokens 131072` 起步，不使用默认 65536；若 memory planner 下调，记录实际值；
+9. 同一 seed 的 D0/P0/P1 必须读取同一个 trace 文件，结果 metadata 中 trace SHA256 必须完全一致；
+10. 当前机器没有可用 NVIDIA 驱动且本次未执行测试，因此以下命令只是四卡机的开跑模板，不是
+    已验证结果。第一次四卡 gate 通过后再批量跑 5 seeds。
 
 ---
 
@@ -149,6 +178,54 @@ repetitions              = 5
 `prefill_chunk_size` 和 `max_step_tokens` 先在 calibration seed=41 上扫描
 `{4096,8192,16384,32768}`，按短请求 SLO 与总吞吐的帕累托点选定一次，随后冻结，不能在正式
 对比中按拓扑分别调参。
+
+### 4.3 W1 trace 与首轮开跑模板
+
+先冻结 seed=42 的 W1。`SHORT_RATE` 替换为 W0 calibration 得到的目标 offered load；长请求到达
+单位是毫秒。生成动作只加载 tokenizer，不启动 GPU runtime。
+
+```bash
+python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
+  --trace-out traces/w1_seed42.jsonl \
+  --num-long 8 --long-tokens 32768 --long-new-tokens 16 \
+  --long-arrival-offsets-ms 5000,20000,35000,50000,65000,80000,95000,110000 \
+  --num-short 64 --short-tokens 2048 --short-new-tokens 128 \
+  --short-trace-request-rate SHORT_RATE --seed 42
+```
+
+生成后记录打印出的 `trace_sha256`，确认 JSONL 中 `prompt_tokens` 是实际重编码长度；
+`requested_prompt_tokens` 只是目标值。跨引擎公平性以实际 `prompt_tokens` 和
+`token_ids_sha256` 为准，不以请求目标值冒充实际长度。
+
+D0 首轮使用进程内 engine-only 4×DP，避免 HTTP/proxy 成为 baseline 的固定开销：
+
+```bash
+python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
+  --trace traces/w1_seed42.jsonl --dp-devices 0 1 2 3 \
+  --concurrency 72 --warmup 8 --arrival-pattern burst \
+  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
+  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens FROZEN_STEP \
+  --worker-log-dir results/v3/w1_d0_seed42_workers \
+  --output results/v3/w1_d0_seed42.json --seed 42
+```
+
+P0 首轮使用同一进程内 benchmark coordinator 和 2P+2D worker，不经过 HTTP：
+
+```bash
+python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
+  --trace traces/w1_seed42.jsonl --adaptive --force-pd-tokens 1 \
+  --prefill-devices 0 1 --decode-devices 2 3 --pd-schedule kv-aware \
+  --concurrency 72 --warmup 8 --arrival-pattern burst \
+  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
+  --pd-transfer-backend shm-ring --pd-transfer-target-mb 8 \
+  --pd-transfer-inflight 2 --shm-ring-slots 3 --shm-ring-slot-mb 64 \
+  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens FROZEN_STEP \
+  --worker-log-dir results/v3/w1_p0_seed42_workers \
+  --output results/v3/w1_p0_seed42.json --seed 42
+```
+
+`MODEL`、`DATASETS`、`SHORT_RATE`、`FROZEN_CHUNK`、`FROZEN_STEP` 必须显式替换，禁止原样运行。
+P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数不变。
 
 ---
 
@@ -227,13 +304,17 @@ W1，不允许用共享前缀降低主拓扑实验的实际工作量。
 ### D0：4×DP baseline
 
 - 四个独立 collocated worker，各占一张 GPU；
-- 统一 HTTP load-aware proxy，使用已经验证优于 KV/char 权重的本地 in-flight 请求数均衡；
-- 每轮保存 `/stats`，审计每卡请求数、prompt tokens 和长请求分布；
-- 另跑一次严格 2-long-per-GPU 的静态平衡控制组，确认 proxy 分配不是结论来源；
+- 正式主 baseline 使用 `--dp-devices 0 1 2 3` 的 engine-only coordinator，不经过 HTTP；
+- coordinator 以“已分配且尚未 release 的请求数”为持久负载，等负载时 round-robin；不能使用仅在
+  RPC 调用期间非零的 pending 数，否则 burst 会集中到 GPU 0；
+- 每轮审计 `per_worker`、worker log、prompt tokens 和长请求分布；
+- decode 必须由 coordinator 同时派发到各 worker，不允许逐 worker 同步等待；
+- 另跑一次严格 2-long-per-GPU 的平衡控制组，确认动态分配不是结论来源；
 - 所有 worker 使用与 PD worker 相同的 KV 精度、chunk、Graph 和 kernel 开关。
 
-当前 ZeroMQ broker 尚未形成可直接替代 OpenAI HTTP serve/benchmark 的完整端到端客户端/worker
-链路；在联调验收前不用于正式 baseline，避免把未闭环路径写入结果。
+HTTP proxy 只保留为线上服务路径或与只提供 HTTP API 的外部引擎对接，不作为 HydraServe
+D0/P0/P1 主对比的数据面。若 vLLM/SGLang 只能通过 HTTP 压测，必须额外报告 transport-only
+空载开销，并明确该组不是严格 engine-only 延迟对比。
 
 ### P0：2P+2D lossless（主 PD）
 

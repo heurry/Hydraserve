@@ -271,6 +271,7 @@ def run_benchmark(
     concurrency: int = 1,
     max_prompt_tokens: int | None = None,
     warmup_requests: int = 0,
+    warmup_samples: Iterable[BenchmarkSample] | None = None,
     request_rate: float | None = None,
     arrival_pattern: str = "burst",
     seed: int = 0,
@@ -288,8 +289,15 @@ def run_benchmark(
     if arrival_pattern != "burst" and request_rate is None:
         raise ValueError("fixed/poisson arrivals require request_rate")
     all_samples = tuple(samples)
-    warmups = all_samples[:warmup_requests]
-    indexed = tuple(enumerate(all_samples[warmup_requests:]))
+    # A frozen trace is the measured workload: CLI callers provide separate
+    # prompts so warmup never consumes official records. Keep the historical
+    # prefix-consuming behavior only when no independent pool is supplied.
+    warmup_pool = tuple(warmup_samples) if warmup_samples is not None else all_samples
+    warmups = warmup_pool[:warmup_requests]
+    if len(warmups) != warmup_requests:
+        raise ValueError("not enough independent warmup samples")
+    measured_samples = all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    indexed = tuple(enumerate(measured_samples))
 
     def encode(sample: BenchmarkSample):
         token_ids = tokenizer.encode(sample.prompt)
@@ -298,7 +306,11 @@ def run_benchmark(
         return token_ids
 
     for sample in warmups:
-        handle = generation_loop.submit(encode(sample), max_new_tokens)
+        handle = generation_loop.submit(
+            encode(sample),
+            sample.max_new_tokens or max_new_tokens,
+            ignore_eos=sample.ignore_eos,
+        )
         terminal = None
         for terminal in handle:
             pass
@@ -325,7 +337,9 @@ def run_benchmark(
         error = None
         handle = None
         try:
-            handle = generation_loop.submit(token_ids, per_sample_max)
+            handle = generation_loop.submit(
+                token_ids, per_sample_max, ignore_eos=sample.ignore_eos
+            )
             for event in handle:
                 now = perf_counter()
                 if event.token_id is not None:
@@ -419,7 +433,11 @@ def run_benchmark(
     ordered_results: list[RequestMetrics | None] = [None] * len(indexed)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
-        for item, offset in zip(indexed, offsets, strict=True):
+        scheduled = sorted(
+            zip(indexed, offsets, strict=True),
+            key=lambda pair: pair[1] + pair[0][1].arrival_offset_ms / 1000.0,
+        )
+        for item, offset in scheduled:
             index, sample = item
             trace_offset = sample.arrival_offset_ms / 1000.0
             delay = wall_started + offset + trace_offset - perf_counter()
@@ -468,6 +486,7 @@ def _iter_completion_sse(
     prompt: str,
     max_new_tokens: int,
     *,
+    ignore_eos: bool = False,
     timeout: float = 600.0,
 ) -> Iterable[tuple[str, str | None]]:
     """Stream one completion from a HydraServe endpoint as SSE ``(kind, value)``.
@@ -476,7 +495,12 @@ def _iter_completion_sse(
     reason or error message. The response body is the server's ``text/event-stream``.
     """
     body = json.dumps(
-        {"prompt": prompt, "max_tokens": max_new_tokens, "stream": True}
+        {
+            "prompt": prompt,
+            "max_tokens": max_new_tokens,
+            "stream": True,
+            "ignore_eos": ignore_eos,
+        }
     ).encode("utf-8")
     req = request.Request(
         f"{endpoint.rstrip('/')}/v1/completions", data=body, method="POST"
@@ -515,6 +539,7 @@ def run_http_benchmark(
     concurrency: int = 1,
     max_prompt_tokens: int | None = None,
     warmup_requests: int = 0,
+    warmup_samples: Iterable[BenchmarkSample] | None = None,
     request_rate: float | None = None,
     arrival_pattern: str = "burst",
     seed: int = 0,
@@ -550,14 +575,19 @@ def run_http_benchmark(
         return tokenizer.decode(ids[-max_prompt_tokens:])
 
     all_samples = tuple(samples)
-    warmups = all_samples[:warmup_requests]
-    indexed = tuple(enumerate(all_samples[warmup_requests:]))
+    warmup_pool = tuple(warmup_samples) if warmup_samples is not None else all_samples
+    warmups = warmup_pool[:warmup_requests]
+    if len(warmups) != warmup_requests:
+        raise ValueError("not enough independent warmup samples")
+    measured_samples = all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    indexed = tuple(enumerate(measured_samples))
 
     for sample in warmups:
         for kind, value in _iter_completion_sse(
             endpoint,
             truncate_prompt(sample),
             sample.max_new_tokens or max_new_tokens,
+            ignore_eos=sample.ignore_eos,
             timeout=timeout_s,
         ):
             if kind == "error":
@@ -575,7 +605,11 @@ def run_http_benchmark(
         error = None
         try:
             for kind, value in _iter_completion_sse(
-                endpoint, prompt, per_sample_max, timeout=timeout_s
+                endpoint,
+                prompt,
+                per_sample_max,
+                ignore_eos=sample.ignore_eos,
+                timeout=timeout_s,
             ):
                 now = perf_counter()
                 if kind == "token":
@@ -629,7 +663,11 @@ def run_http_benchmark(
     ordered_results: list[RequestMetrics | None] = [None] * len(indexed)
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
-        for item, offset in zip(indexed, offsets, strict=True):
+        scheduled = sorted(
+            zip(indexed, offsets, strict=True),
+            key=lambda pair: pair[1] + pair[0][1].arrival_offset_ms / 1000.0,
+        )
+        for item, offset in scheduled:
             index, sample = item
             trace_offset = sample.arrival_offset_ms / 1000.0
             delay = wall_started + offset + trace_offset - perf_counter()

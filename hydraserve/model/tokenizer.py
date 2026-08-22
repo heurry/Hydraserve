@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -20,6 +21,7 @@ class QwenTokenizer:
         config_path = root / "tokenizer_config.json"
         if not tokenizer_path.is_file():
             raise FileNotFoundError(tokenizer_path)
+        self.revision = hashlib.sha256(tokenizer_path.read_bytes()).hexdigest()
         self._tokenizer = Tokenizer.from_file(str(tokenizer_path))
         config = json.loads(config_path.read_text(encoding="utf-8")) if config_path.is_file() else {}
         self.model_max_length = int(config.get("model_max_length", 0)) or None

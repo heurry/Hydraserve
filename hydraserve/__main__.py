@@ -12,6 +12,7 @@ from hydraserve.config import discover_model_configs, load_model_config
 def _collect_benchmark_metadata(args) -> dict:
     """Reproducibility metadata (P0.4, V3 plan): commit, CLI, versions, GPU."""
     import hashlib
+    import json
 
     meta: dict = {
         "git_commit": None,
@@ -43,8 +44,22 @@ def _collect_benchmark_metadata(args) -> dict:
 
         meta["torch"] = torch.__version__
         meta["cuda"] = torch.version.cuda
-        meta["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
-        meta["gpu_count"] = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        available = torch.cuda.is_available()
+        meta["gpu"] = torch.cuda.get_device_name(0) if available else None
+        meta["gpu_count"] = torch.cuda.device_count() if available else 0
+        meta["gpus"] = (
+            [
+                {
+                    "index": index,
+                    "name": torch.cuda.get_device_name(index),
+                    "capability": list(torch.cuda.get_device_capability(index)),
+                    "total_memory_bytes": torch.cuda.get_device_properties(index).total_memory,
+                }
+                for index in range(torch.cuda.device_count())
+            ]
+            if available
+            else []
+        )
     except Exception:
         pass
     try:
@@ -59,10 +74,50 @@ def _collect_benchmark_metadata(args) -> dict:
         meta["flash_attn"] = flash_attn.__version__
     except Exception:
         pass
-    meta["model_dir"] = str(Path(args.model).resolve())
-    meta["model_path_sha256"] = hashlib.sha256(
-        str(Path(args.model).resolve()).encode()
+    model_dir = Path(args.model).resolve()
+    meta["model_dir"] = str(model_dir)
+    model_manifest = []
+    for pattern in ("*.json", "*.safetensors", "*.bin", "*.model"):
+        for path in sorted(model_dir.glob(pattern)):
+            if path.is_file():
+                model_manifest.append(
+                    {"name": path.name, "size_bytes": path.stat().st_size}
+                )
+    meta["model_manifest_sha256"] = hashlib.sha256(
+        json.dumps(model_manifest, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
+    meta["model_manifest"] = model_manifest
+    trace_path = getattr(args, "trace", None)
+    if trace_path:
+        trace_path = Path(trace_path).resolve()
+        meta["trace_path"] = str(trace_path)
+        meta["trace_sha256"] = hashlib.sha256(trace_path.read_bytes()).hexdigest()
+        trace_meta = trace_path.with_suffix(trace_path.suffix + ".meta.json")
+        if trace_meta.is_file():
+            try:
+                meta["trace_metadata"] = json.loads(
+                    trace_meta.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                meta["trace_metadata"] = {"error": "unreadable"}
+    try:
+        meta["nvidia_smi_query"] = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=index,name,uuid,pci.bus_id,driver_version,pstate,"
+                "temperature.gpu,clocks.sm,memory.total,memory.used",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip().splitlines()
+        meta["nvidia_topology"] = subprocess.check_output(
+            ["nvidia-smi", "topo", "-m"],
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        ).decode().strip()
+    except Exception:
+        pass
     return meta
 
 
@@ -181,6 +236,17 @@ def main() -> int:
     benchmark_parser.add_argument("--subset")
     benchmark_parser.add_argument("--limit", type=int, default=100)
     benchmark_parser.add_argument("--max-new-tokens", type=int, default=32)
+    benchmark_parser.add_argument(
+        "--long-new-tokens", type=int, help="per-long-request output target for --trace-out"
+    )
+    benchmark_parser.add_argument(
+        "--short-new-tokens", type=int, help="per-short-request output target for --trace-out"
+    )
+    benchmark_parser.add_argument(
+        "--balanced-new-tokens",
+        type=int,
+        help="per-balanced-request output target for --trace-out",
+    )
     benchmark_parser.add_argument("--max-prompt-tokens", type=int, default=8192)
     benchmark_parser.add_argument("--num-long", type=int, default=0)
     benchmark_parser.add_argument("--long-tokens", type=int, default=0)
@@ -189,6 +255,15 @@ def main() -> int:
     benchmark_parser.add_argument("--num-balanced", type=int, default=0)
     benchmark_parser.add_argument("--balanced-min-tokens", type=int, default=0)
     benchmark_parser.add_argument("--balanced-max-tokens", type=int, default=0)
+    benchmark_parser.add_argument(
+        "--long-arrival-offsets-ms",
+        help="comma-separated absolute arrival offsets for long trace requests",
+    )
+    benchmark_parser.add_argument(
+        "--short-trace-request-rate",
+        type=float,
+        help="Poisson request/s used to freeze short-request arrival offsets",
+    )
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
     benchmark_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     benchmark_parser.add_argument("--warmup", type=int, default=0)
@@ -579,34 +654,113 @@ def main() -> int:
                 seed=args.seed,
             )
             spec.validate()
-            entries: list[TraceSpec] = []
-            for index in range(spec.num_long):
-                entries.append(
-                    TraceSpec(f"long-{index}", "long", spec.long_tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
+            output_targets = tuple(
+                value
+                for value in (
+                    args.long_new_tokens,
+                    args.short_new_tokens,
+                    args.balanced_new_tokens,
+                    args.max_new_tokens,
                 )
-            for index in range(spec.num_short):
-                entries.append(
-                    TraceSpec(f"short-{index}", "short", spec.short_tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
-                )
+                if value is not None
+            )
+            if min(output_targets) <= 0:
+                parser.error("trace output-token targets must be positive")
+            long_offsets = [0.0] * spec.num_long
+            if args.long_arrival_offsets_ms:
+                try:
+                    long_offsets = [
+                        float(value.strip())
+                        for value in args.long_arrival_offsets_ms.split(",")
+                    ]
+                except ValueError:
+                    parser.error("--long-arrival-offsets-ms must contain numbers")
+                if len(long_offsets) != spec.num_long or min(long_offsets) < 0:
+                    parser.error(
+                        "--long-arrival-offsets-ms needs one non-negative value per long request"
+                    )
+            if (
+                args.short_trace_request_rate is not None
+                and args.short_trace_request_rate <= 0
+            ):
+                parser.error("--short-trace-request-rate must be positive")
             from random import Random as _Random
 
             rng = _Random(args.seed)
+            short_offsets: list[float] = []
+            short_elapsed_ms = 0.0
+            for index in range(spec.num_short):
+                if index and args.short_trace_request_rate is not None:
+                    short_elapsed_ms += (
+                        rng.expovariate(args.short_trace_request_rate) * 1000.0
+                    )
+                short_offsets.append(short_elapsed_ms)
+            entries: list[TraceSpec] = []
+            for index in range(spec.num_long):
+                entries.append(
+                    TraceSpec(
+                        f"long-{index}",
+                        "long",
+                        spec.long_tokens,
+                        args.long_new_tokens or args.max_new_tokens,
+                        arrival_offset_ms=long_offsets[index],
+                        ignore_eos=True,
+                        seed=args.seed,
+                    )
+                )
+            for index in range(spec.num_short):
+                entries.append(
+                    TraceSpec(
+                        f"short-{index}",
+                        "short",
+                        spec.short_tokens,
+                        args.short_new_tokens or args.max_new_tokens,
+                        arrival_offset_ms=short_offsets[index],
+                        ignore_eos=True,
+                        seed=args.seed,
+                    )
+                )
             for index in range(spec.num_balanced):
                 tokens = rng.randint(spec.balanced_min_tokens, spec.balanced_max_tokens)
                 entries.append(
-                    TraceSpec(f"balanced-{index}", "balanced", tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
+                    TraceSpec(
+                        f"balanced-{index}",
+                        "balanced",
+                        tokens,
+                        args.balanced_new_tokens or args.max_new_tokens,
+                        ignore_eos=True,
+                        seed=args.seed,
+                    )
                 )
             meta = write_trace(tokenizer, entries, args.trace_out, seed=args.seed)
             print(json.dumps(meta, ensure_ascii=False, indent=2))
             return 0
 
         def build_samples():
+            warmup_samples = []
             if args.trace:
                 samples = list(iter_trace(tokenizer, args.trace, seed=args.seed))
                 max_prompt_tokens = max(
                     args.max_prompt_tokens,
                     max(sample.metadata["target_tokens"] for sample in samples),
                 )
+                if args.warmup:
+                    warmup_spec = SyntheticSpec(
+                        num_short=args.warmup,
+                        short_tokens=min(args.short_tokens or 512, max_prompt_tokens),
+                        seed=args.seed + 1,
+                    )
+                    warmup_samples = [
+                        replace(
+                            sample,
+                            sample_id=f"warmup-{index}",
+                            max_new_tokens=min(args.max_new_tokens, 8),
+                            ignore_eos=True,
+                        )
+                        for index, sample in enumerate(
+                            iter_synthetic(tokenizer, warmup_spec)
+                        )
+                    ]
             elif args.dataset.lower() == "synthetic":
                 spec = SyntheticSpec(
                     num_long=args.num_long,
@@ -627,11 +781,11 @@ def main() -> int:
                         short_tokens=warmup_tokens,
                         seed=args.seed + 1,
                     )
-                    samples = list(iter_synthetic(tokenizer, warmup_spec)) + samples
+                    warmup_samples = list(iter_synthetic(tokenizer, warmup_spec))
                 # Avoid the default 8192 truncating long synthetic prompts.
                 max_prompt_tokens = max(args.max_prompt_tokens, spec.max_prompt_tokens())
             else:
-                samples = list(
+                loaded = list(
                     iter_dataset(
                         args.datasets,
                         args.dataset,
@@ -639,14 +793,19 @@ def main() -> int:
                         limit=args.limit + args.warmup,
                     )
                 )
+                warmup_samples = loaded[: args.warmup]
+                samples = loaded[args.warmup :]
                 max_prompt_tokens = args.max_prompt_tokens
-            return samples, max_prompt_tokens
+            return samples, warmup_samples, max_prompt_tokens
 
         if args.dp_devices and (args.dp_proxy or args.pd or args.adaptive):
-            parser.error("--dp-devices is engine-only 4xDP; combine with neither --dp-proxy nor --pd/--adaptive")
+            parser.error(
+                "--dp-devices is engine-only 4xDP; combine with neither "
+                "--dp-proxy nor --pd/--adaptive"
+            )
 
         if args.dp_proxy:
-            samples, max_prompt_tokens = build_samples()
+            samples, warmup_samples, max_prompt_tokens = build_samples()
             summary = run_http_benchmark(
                 args.dp_proxy,
                 tokenizer,
@@ -655,6 +814,7 @@ def main() -> int:
                 concurrency=args.concurrency,
                 max_prompt_tokens=max_prompt_tokens,
                 warmup_requests=args.warmup,
+                warmup_samples=warmup_samples,
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,
@@ -850,7 +1010,7 @@ def main() -> int:
             dp_graph_sync=args.dp_graph_sync,
         )
         try:
-            samples, max_prompt_tokens = build_samples()
+            samples, warmup_samples, max_prompt_tokens = build_samples()
             summary = run_benchmark(
                 loop,
                 tokenizer,
@@ -859,6 +1019,7 @@ def main() -> int:
                 concurrency=args.concurrency,
                 max_prompt_tokens=max_prompt_tokens,
                 warmup_requests=args.warmup,
+                warmup_samples=warmup_samples,
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,

@@ -128,3 +128,22 @@ def test_run_benchmark_uses_per_sample_max_new_tokens() -> None:
     long = [r for r in summary.results if r.klass == "long"][0]
     assert long.target_new_tokens == 5
     assert long.completion_tokens == 5
+
+
+def test_request_level_ignore_eos_preserves_fixed_output_work() -> None:
+    class EosBackend(Backend):
+        def prefill(self, request):
+            self.live.add(request.request_id)
+            return 7
+
+        def decode(self, requests):
+            return tuple(7 for _ in requests)
+
+    loop = ContinuousGenerationLoop(EosBackend(), max_batch_size=2, eos_token_id=7)
+    stopped = list(loop.submit((1,), 3))
+    fixed = list(loop.submit((1,), 3, ignore_eos=True))
+    loop.close()
+    assert sum(event.token_id is not None for event in stopped) == 1
+    assert stopped[-1].finish_reason == "stop"
+    assert sum(event.token_id is not None for event in fixed) == 3
+    assert fixed[-1].finish_reason == "length"

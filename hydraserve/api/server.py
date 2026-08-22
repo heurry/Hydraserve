@@ -202,6 +202,9 @@ class _Handler(BaseHTTPRequestHandler):
             stream = payload.get("stream", False)
             if not isinstance(stream, bool):
                 raise ValueError("stream must be a boolean")
+            ignore_eos = payload.get("ignore_eos", False)
+            if not isinstance(ignore_eos, bool):
+                raise ValueError("ignore_eos must be a boolean")
             stream_options = payload.get("stream_options")
             include_usage = False
             if stream_options is not None:
@@ -216,6 +219,7 @@ class _Handler(BaseHTTPRequestHandler):
             handle = self.hydra.generation_loop.submit(
                 prompt_ids,
                 max_tokens,
+                ignore_eos=ignore_eos,
                 priority=priority,
                 sampling_params=sampling,
                 timeout_ms=timeout_ms,
@@ -360,7 +364,10 @@ class _Handler(BaseHTTPRequestHandler):
             (len(sequence) for sequence in handle.request.sampling_params.stop_token_sequences),
             default=0,
         )
-        if self.hydra.generation_loop.eos_token_id is not None:
+        if (
+            not handle.request.ignore_eos
+            and self.hydra.generation_loop.eos_token_id is not None
+        ):
             max_hold = max(1, max_hold)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -476,7 +483,7 @@ class _Handler(BaseHTTPRequestHandler):
             if len(token_ids) >= len(sequence) and token_ids[-len(sequence) :] == sequence
         ]
         eos = self.hydra.generation_loop.eos_token_id
-        if eos is not None and token_ids[-1] == eos:
+        if not handle.request.ignore_eos and eos is not None and token_ids[-1] == eos:
             matches.append(1)
         trim = max(matches, default=0)
         return visible[:-trim] if trim else visible

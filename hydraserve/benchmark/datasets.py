@@ -12,7 +12,7 @@ import io
 import json
 from pathlib import Path
 from random import Random
-from typing import Any, BinaryIO, Iterator, TextIO
+from typing import Any, BinaryIO, Iterable, Iterator, TextIO
 import zipfile
 
 
@@ -508,24 +508,60 @@ def iter_trace(
     ``Random(f"{seed}:{id}")`` unless the trace records an explicit ``prompt``.
     The re-encoded token count is recorded in ``metadata`` for reproducibility.
     """
+    import hashlib
+
     trace_path = Path(path)
+    trace_hasher = hashlib.sha256()
     with trace_path.open("r", encoding="utf-8") as stream:
         for index, line in enumerate(stream):
             if not line.strip():
                 continue
+            trace_hasher.update(line.encode("utf-8"))
             try:
                 record = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise DatasetFormatError(f"invalid trace JSON at {trace_path}:{index}") from exc
             if not isinstance(record, dict):
                 raise DatasetFormatError(f"expected trace objects at {trace_path}:{index}")
+            expected_record_hash = record.get("record_sha256")
+            if expected_record_hash is not None:
+                hash_payload = dict(record)
+                del hash_payload["record_sha256"]
+                actual_record_hash = hashlib.sha256(
+                    json.dumps(
+                        hash_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                ).hexdigest()
+                if actual_record_hash != expected_record_hash:
+                    raise DatasetFormatError(
+                        f"trace record hash mismatch at {trace_path}:{index}"
+                    )
             spec = _parse_trace_record(record, index)
             prompt = spec.prompt
             if prompt is None:
                 prompt = _random_prompt(
                     tokenizer, spec.prompt_tokens, Random(f"{seed}:{spec.id}")
                 )
-            reencoded = len(tokenizer.encode(prompt))
+            token_ids = tokenizer.encode(prompt)
+            reencoded = len(token_ids)
+            prompt_hash = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            if record.get("prompt_sha256") not in {None, prompt_hash}:
+                raise DatasetFormatError(
+                    f"prompt hash mismatch at {trace_path}:{index}"
+                )
+            token_ids_hash = hashlib.sha256(
+                json.dumps(list(token_ids), separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
+            if record.get("token_ids_sha256") not in {None, token_ids_hash}:
+                raise DatasetFormatError(
+                    f"token ID hash mismatch at {trace_path}:{index}; "
+                    "the tokenizer/checkpoint does not match the frozen trace"
+                )
+            expected_tokens = record.get("reencode_tokens")
+            if expected_tokens is not None and expected_tokens != reencoded:
+                raise DatasetFormatError(
+                    f"re-encoded token count mismatch at {trace_path}:{index}"
+                )
             yield BenchmarkSample(
                 "trace",
                 spec.id,
@@ -535,13 +571,25 @@ def iter_trace(
                 arrival_offset_ms=spec.arrival_offset_ms,
                 ignore_eos=spec.ignore_eos,
                 metadata={
-                    "target_tokens": spec.prompt_tokens,
+                    "target_tokens": reencoded,
+                    "requested_prompt_tokens": record.get(
+                        "requested_prompt_tokens", spec.prompt_tokens
+                    ),
                     "reencode_tokens": reencoded,
+                    "token_ids_sha256": token_ids_hash,
                     "arrival_offset_ms": spec.arrival_offset_ms,
                     "ignore_eos": spec.ignore_eos,
                     "trace_seed": seed,
                 },
             )
+    meta_path = trace_path.with_suffix(trace_path.suffix + ".meta.json")
+    if meta_path.is_file():
+        try:
+            metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DatasetFormatError(f"invalid trace metadata: {meta_path}") from exc
+        if metadata.get("trace_sha256") != trace_hasher.hexdigest():
+            raise DatasetFormatError(f"trace-wide hash mismatch: {trace_path}")
 
 
 def write_trace(
@@ -572,10 +620,17 @@ def write_trace(
                     tokenizer, spec.prompt_tokens, Random(f"{seed}:{spec.id}")
                 )
             token_ids = tokenizer.encode(prompt)
+            token_ids_hash = hashlib.sha256(
+                json.dumps(list(token_ids), separators=(",", ":")).encode("utf-8")
+            ).hexdigest()
             payload = {
                 "id": spec.id,
                 "class": spec.klass,
-                "prompt_tokens": spec.prompt_tokens,
+                # prompt_tokens is the workload actually replayed. Preserve the
+                # requested target separately because decode/re-encode is not
+                # bijective for every tokenizer.
+                "prompt_tokens": len(token_ids),
+                "requested_prompt_tokens": spec.prompt_tokens,
                 "reencode_tokens": len(token_ids),
                 "max_new_tokens": spec.max_new_tokens,
                 "arrival_offset_ms": spec.arrival_offset_ms,
@@ -583,14 +638,32 @@ def write_trace(
                 "seed": spec.seed,
                 "prompt": prompt,
                 "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+                "token_ids_sha256": token_ids_hash,
             }
-            stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            hasher.update(payload["prompt"].encode("utf-8"))
+            payload["record_sha256"] = hashlib.sha256(
+                json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            ).hexdigest()
+            line = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ) + "\n"
+            stream.write(line)
+            hasher.update(line.encode("utf-8"))
             written += 1
-    return {
+    metadata = {
         "path": str(trace_path),
         "entries": written,
         "trace_sha256": hasher.hexdigest(),
-        "tokenizer_revision": str(getattr(tokenizer, "model_max_length", "")),
+        "tokenizer_revision": str(
+            getattr(tokenizer, "revision", getattr(tokenizer, "model_max_length", ""))
+        ),
         "generation_seed": seed,
     }
+    meta_path = trace_path.with_suffix(trace_path.suffix + ".meta.json")
+    meta_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    metadata["metadata_path"] = str(meta_path)
+    return metadata

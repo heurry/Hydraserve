@@ -13,6 +13,7 @@ decode workers, no PD transfer, and no cost-aware router.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 import multiprocessing as mp
 from pathlib import Path
@@ -156,12 +157,19 @@ class MultiGPUCollocatedBackend:
             for index in range(worker_count)
         ]
         self._pending = [0] * worker_count
+        # Reservations are counted from worker selection until release. RPC
+        # depth alone drops back to zero after prefill and makes burst traffic
+        # repeatedly choose worker 0.
+        self._assigned = [0] * worker_count
         self._healthy = [True] * worker_count
         self._bound: dict[int, int] = {}
         self._capacity: list[BackendCapacity | None] = [None] * worker_count
         self._state_lock = RLock()
         self._closed = False
         self._round_robin = 0
+        self._decode_executor = ThreadPoolExecutor(
+            max_workers=worker_count, thread_name_prefix="hydraserve-dp-decode"
+        )
 
         for process in self._processes:
             process.start()
@@ -201,15 +209,28 @@ class MultiGPUCollocatedBackend:
         )
 
     def _pick_worker(self) -> int:
-        """Least-loaded healthy worker (fewest in-flight commands), round-robin ties."""
+        """Reserve the least-loaded healthy worker, round-robin on ties."""
         with self._state_lock:
             count = len(self._processes)
             candidates = [i for i in range(count) if self._healthy[i]]
             if not candidates:
-                return self._round_robin % count
-            index = min(candidates, key=lambda i: self._pending[i])
+                candidates = list(range(count))
+            start = self._round_robin % count
+            index = min(
+                candidates,
+                key=lambda i: (
+                    self._assigned[i],
+                    self._pending[i],
+                    (i - start) % count,
+                ),
+            )
+            self._assigned[index] += 1
             self._round_robin = (index + 1) % count
             return index
+
+    def _unassign_worker(self, index: int) -> None:
+        with self._state_lock:
+            self._assigned[index] = max(0, self._assigned[index] - 1)
 
     def _rpc(self, index: int, command: dict, expected_op: str, request_id=None) -> dict:
         failure = None
@@ -293,8 +314,10 @@ class MultiGPUCollocatedBackend:
                 request.request_id,
             )
         except Exception as exc:
+            self._unassign_worker(index)
             return AdmissionDecision.defer(f"collocated reserve failed: {exc}")
         if not result.get("admitted"):
+            self._unassign_worker(index)
             reason = result.get("reason", "worker rejected the reservation")
             return AdmissionDecision.defer(reason)
         with self._state_lock:
@@ -345,17 +368,22 @@ class MultiGPUCollocatedBackend:
                 return tuple(samples)
             return tuple(int(token) for token in result["token_ids"])
 
-        # Execute each worker group independently so one failure does not
-        # block the others; partial decode reports the losers like the loop
-        # expects.
+        # Dispatch every device concurrently. A sequential coordinator loop
+        # serializes N independent GPUs and invalidates the 4xDP baseline.
         successes: dict[int, TokenSample] = {}
-        for index, indexed_requests in groups.items():
+        futures = {
+            self._decode_executor.submit(execute, index, indexed_requests): indexed_requests
+            for index, indexed_requests in groups.items()
+        }
+        for future in as_completed(futures):
+            indexed_requests = futures[future]
             try:
                 for (position, _), sample in zip(
-                    indexed_requests, execute(index, indexed_requests), strict=True
+                    indexed_requests, future.result(), strict=True
                 ):
                     output[position] = sample
-                    successes[indexed_requests[position][1].request_id] = sample
+                    request = requests[position]
+                    successes[request.request_id] = sample
             except Exception as exc:
                 for _, request in indexed_requests:
                     failures[request.request_id] = exc
@@ -368,6 +396,7 @@ class MultiGPUCollocatedBackend:
             index = self._bound.pop(request_id, None)
         if index is None:
             return
+        self._unassign_worker(index)
         try:
             self._rpc(
                 index,
@@ -403,6 +432,7 @@ class MultiGPUCollocatedBackend:
             if self._closed:
                 return
             self._closed = True
+        self._decode_executor.shutdown(wait=not force, cancel_futures=force)
         for index in range(len(self._processes)):
             try:
                 self._commands[index].put({"op": "shutdown"})
