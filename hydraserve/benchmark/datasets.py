@@ -27,6 +27,12 @@ class BenchmarkSample:
     prompt: str
     reference: str | list[str] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # P0 trace fields (V3 plan): per-request class / output target / arrival /
+    # EOS policy. ``klass`` avoids shadowing the ``class`` keyword.
+    klass: str = "default"
+    max_new_tokens: int | None = None
+    arrival_offset_ms: float = 0.0
+    ignore_eos: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,3 +438,159 @@ def iter_synthetic(tokenizer, spec: SyntheticSpec) -> Iterator[BenchmarkSample]:
             prompt,
             metadata={"target_tokens": target_tokens},
         )
+
+
+@dataclass(frozen=True, slots=True)
+class TraceSpec:
+    """One JSONL benchmark trace line (P0.1, V3 plan).
+
+    A frozen trace freezes the exact per-request workload so 4xDP / PD / vLLM
+    all execute the same prompts and the same output-token counts.
+    """
+
+    id: str
+    klass: str
+    prompt_tokens: int
+    max_new_tokens: int
+    arrival_offset_ms: float = 0.0
+    ignore_eos: bool = False
+    seed: int = 0
+    prompt: str | None = None  # when set, used verbatim instead of sampling
+
+    def validate(self) -> None:
+        if not self.id or not self.klass:
+            raise ValueError("trace entries require id and class")
+        if self.prompt_tokens <= 0 or self.max_new_tokens <= 0:
+            raise ValueError("trace entries require positive token counts")
+        if self.arrival_offset_ms < 0:
+            raise ValueError("trace arrival offset cannot be negative")
+
+
+def _parse_trace_record(record: dict[str, Any], index: int) -> TraceSpec:
+    def required(key: str, source: str) -> Any:
+        if key not in record:
+            raise DatasetFormatError(f"missing {key!r} in {source}")
+        return record[key]
+
+    def integer(key: str, default: int) -> int:
+        value = record.get(key, default)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise DatasetFormatError(f"trace field {key!r} must be an integer")
+        return value
+
+    klass = str(required("class", f"trace[{index}]")).lower()
+    prompt = record.get("prompt")
+    if prompt is not None and not isinstance(prompt, str):
+        raise DatasetFormatError(f"trace[{index}] prompt must be a string")
+    spec = TraceSpec(
+        id=str(required("id", f"trace[{index}]")),
+        klass=klass,
+        prompt_tokens=integer("prompt_tokens", 0),
+        max_new_tokens=integer("max_new_tokens", 0),
+        arrival_offset_ms=float(record.get("arrival_offset_ms", 0.0)),
+        ignore_eos=bool(record.get("ignore_eos", False)),
+        seed=integer("seed", 0),
+        prompt=prompt,
+    )
+    spec.validate()
+    return spec
+
+
+def iter_trace(
+    tokenizer,
+    path: str | Path,
+    *,
+    seed: int = 0,
+) -> Iterator[BenchmarkSample]:
+    """Yield benchmark samples from a frozen JSONL trace (P0.1).
+
+    Each line is a ``TraceSpec``; prompts are regenerated deterministically from
+    ``Random(f"{seed}:{id}")`` unless the trace records an explicit ``prompt``.
+    The re-encoded token count is recorded in ``metadata`` for reproducibility.
+    """
+    trace_path = Path(path)
+    with trace_path.open("r", encoding="utf-8") as stream:
+        for index, line in enumerate(stream):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise DatasetFormatError(f"invalid trace JSON at {trace_path}:{index}") from exc
+            if not isinstance(record, dict):
+                raise DatasetFormatError(f"expected trace objects at {trace_path}:{index}")
+            spec = _parse_trace_record(record, index)
+            prompt = spec.prompt
+            if prompt is None:
+                prompt = _random_prompt(
+                    tokenizer, spec.prompt_tokens, Random(f"{seed}:{spec.id}")
+                )
+            reencoded = len(tokenizer.encode(prompt))
+            yield BenchmarkSample(
+                "trace",
+                spec.id,
+                prompt,
+                klass=spec.klass,
+                max_new_tokens=spec.max_new_tokens,
+                arrival_offset_ms=spec.arrival_offset_ms,
+                ignore_eos=spec.ignore_eos,
+                metadata={
+                    "target_tokens": spec.prompt_tokens,
+                    "reencode_tokens": reencoded,
+                    "arrival_offset_ms": spec.arrival_offset_ms,
+                    "ignore_eos": spec.ignore_eos,
+                    "trace_seed": seed,
+                },
+            )
+
+
+def write_trace(
+    tokenizer,
+    entries: Iterable[TraceSpec],
+    path: str | Path,
+    *,
+    seed: int = 0,
+) -> dict[str, Any]:
+    """Generate a frozen JSONL trace with resolved prompts and hashes (P0.2).
+
+    Writes every entry with an explicit ``prompt`` (regenerated deterministically)
+    and the actual re-encoded token count, plus per-prompt SHA256 and a trace-wide
+    SHA256 so the exact input can be audited across engines.
+    """
+    import hashlib
+
+    trace_path = Path(path)
+    trace_path.parent.mkdir(parents=True, exist_ok=True)
+    hasher = hashlib.sha256()
+    written = 0
+    with trace_path.open("w", encoding="utf-8") as stream:
+        for entry in entries:
+            spec = entry if isinstance(entry, TraceSpec) else _parse_trace_record(entry, written)
+            prompt = spec.prompt
+            if prompt is None:
+                prompt = _random_prompt(
+                    tokenizer, spec.prompt_tokens, Random(f"{seed}:{spec.id}")
+                )
+            token_ids = tokenizer.encode(prompt)
+            payload = {
+                "id": spec.id,
+                "class": spec.klass,
+                "prompt_tokens": spec.prompt_tokens,
+                "reencode_tokens": len(token_ids),
+                "max_new_tokens": spec.max_new_tokens,
+                "arrival_offset_ms": spec.arrival_offset_ms,
+                "ignore_eos": spec.ignore_eos,
+                "seed": spec.seed,
+                "prompt": prompt,
+                "prompt_sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            }
+            stream.write(json.dumps(payload, ensure_ascii=False) + "\n")
+            hasher.update(payload["prompt"].encode("utf-8"))
+            written += 1
+    return {
+        "path": str(trace_path),
+        "entries": written,
+        "trace_sha256": hasher.hexdigest(),
+        "tokenizer_revision": str(getattr(tokenizer, "model_max_length", "")),
+        "generation_seed": seed,
+    }

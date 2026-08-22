@@ -2,9 +2,68 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import os
 from pathlib import Path
+import subprocess
 
 from hydraserve.config import discover_model_configs, load_model_config
+
+
+def _collect_benchmark_metadata(args) -> dict:
+    """Reproducibility metadata (P0.4, V3 plan): commit, CLI, versions, GPU."""
+    import hashlib
+
+    meta: dict = {
+        "git_commit": None,
+        "git_dirty": None,
+        "cli": {k: str(v) for k, v in sorted(vars(args).items())},
+        "env": {
+            k: os.environ[k]
+            for k in (
+                "CUDA_VISIBLE_DEVICES",
+                "HYDRASERVE_PAGED_ATTENTION",
+                "HYDRASERVE_PAGED_PREFILL",
+            )
+            if k in os.environ
+        },
+    }
+    try:
+        cwd = Path(__file__).resolve().parent
+        meta["git_commit"] = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=cwd, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain"], cwd=cwd, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        meta["git_dirty"] = bool(dirty)
+    except Exception:
+        pass
+    try:
+        import torch
+
+        meta["torch"] = torch.__version__
+        meta["cuda"] = torch.version.cuda
+        meta["gpu"] = torch.cuda.get_device_name(0) if torch.cuda.is_available() else None
+        meta["gpu_count"] = torch.cuda.device_count() if torch.cuda.is_available() else 0
+    except Exception:
+        pass
+    try:
+        import triton
+
+        meta["triton"] = triton.__version__
+    except Exception:
+        pass
+    try:
+        import flash_attn
+
+        meta["flash_attn"] = flash_attn.__version__
+    except Exception:
+        pass
+    meta["model_dir"] = str(Path(args.model).resolve())
+    meta["model_path_sha256"] = hashlib.sha256(
+        str(Path(args.model).resolve()).encode()
+    ).hexdigest()
+    return meta
 
 
 def _describe(path: Path, result) -> str:
@@ -109,6 +168,16 @@ def main() -> int:
     benchmark_parser.add_argument("model", type=Path)
     benchmark_parser.add_argument("datasets", type=Path)
     benchmark_parser.add_argument("--dataset", required=True)
+    benchmark_parser.add_argument(
+        "--trace",
+        type=Path,
+        help="replay a frozen JSONL trace (P0.1); overrides --dataset for sample generation",
+    )
+    benchmark_parser.add_argument(
+        "--trace-out",
+        type=Path,
+        help="write a frozen JSONL trace from the synthetic spec (all ignore_eos=true) and exit",
+    )
     benchmark_parser.add_argument("--subset")
     benchmark_parser.add_argument("--limit", type=int, default=100)
     benchmark_parser.add_argument("--max-new-tokens", type=int, default=32)
@@ -132,6 +201,11 @@ def main() -> int:
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
     benchmark_parser.add_argument("--decode-devices", nargs="+")
     benchmark_parser.add_argument("--prefill-devices", nargs="+", help="multiple prefill workers (nP+mD)")
+    benchmark_parser.add_argument(
+        "--dp-devices",
+        nargs="+",
+        help="multiple collocated data-parallel workers (engine-only 4xDP, no HTTP)",
+    )
     benchmark_parser.add_argument("--worker-log-dir", default="", help="capture per-worker stderr into this directory")
     benchmark_parser.add_argument(
         "--pd-schedule",
@@ -449,15 +523,20 @@ def main() -> int:
 
         from hydraserve.benchmark import (
             SyntheticSpec,
+            TraceSpec,
             iter_dataset,
             iter_synthetic,
+            iter_trace,
             run_benchmark,
             run_http_benchmark,
+            write_trace,
         )
         from hydraserve.engine import (
             AdaptiveGenerationBackend,
+            CollocatedClusterConfig,
             ContinuousGenerationLoop,
             DisaggregatedGenerationBackend,
+            MultiGPUCollocatedBackend,
             MultiWorkerGenerationBackend,
             PDClusterConfig,
             PDWorkerConfig,
@@ -486,8 +565,49 @@ def main() -> int:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
         tokenizer = QwenTokenizer(args.model)
 
+        if args.trace_out:
+            if args.dataset.lower() != "synthetic":
+                parser.error("--trace-out requires --dataset synthetic")
+            spec = SyntheticSpec(
+                num_long=args.num_long,
+                long_tokens=args.long_tokens,
+                num_short=args.num_short,
+                short_tokens=args.short_tokens,
+                num_balanced=args.num_balanced,
+                balanced_min_tokens=args.balanced_min_tokens,
+                balanced_max_tokens=args.balanced_max_tokens,
+                seed=args.seed,
+            )
+            spec.validate()
+            entries: list[TraceSpec] = []
+            for index in range(spec.num_long):
+                entries.append(
+                    TraceSpec(f"long-{index}", "long", spec.long_tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
+                )
+            for index in range(spec.num_short):
+                entries.append(
+                    TraceSpec(f"short-{index}", "short", spec.short_tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
+                )
+            from random import Random as _Random
+
+            rng = _Random(args.seed)
+            for index in range(spec.num_balanced):
+                tokens = rng.randint(spec.balanced_min_tokens, spec.balanced_max_tokens)
+                entries.append(
+                    TraceSpec(f"balanced-{index}", "balanced", tokens, args.max_new_tokens, ignore_eos=True, seed=args.seed)
+                )
+            meta = write_trace(tokenizer, entries, args.trace_out, seed=args.seed)
+            print(json.dumps(meta, ensure_ascii=False, indent=2))
+            return 0
+
         def build_samples():
-            if args.dataset.lower() == "synthetic":
+            if args.trace:
+                samples = list(iter_trace(tokenizer, args.trace, seed=args.seed))
+                max_prompt_tokens = max(
+                    args.max_prompt_tokens,
+                    max(sample.metadata["target_tokens"] for sample in samples),
+                )
+            elif args.dataset.lower() == "synthetic":
                 spec = SyntheticSpec(
                     num_long=args.num_long,
                     long_tokens=args.long_tokens,
@@ -522,19 +642,24 @@ def main() -> int:
                 max_prompt_tokens = args.max_prompt_tokens
             return samples, max_prompt_tokens
 
+        if args.dp_devices and (args.dp_proxy or args.pd or args.adaptive):
+            parser.error("--dp-devices is engine-only 4xDP; combine with neither --dp-proxy nor --pd/--adaptive")
+
         if args.dp_proxy:
-            samples, _ = build_samples()
+            samples, max_prompt_tokens = build_samples()
             summary = run_http_benchmark(
                 args.dp_proxy,
                 tokenizer,
                 samples,
                 max_new_tokens=args.max_new_tokens,
                 concurrency=args.concurrency,
+                max_prompt_tokens=max_prompt_tokens,
                 warmup_requests=args.warmup,
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,
             )
+            summary = replace(summary, metadata=_collect_benchmark_metadata(args))
             output = json.dumps(summary.to_dict(), ensure_ascii=False, indent=2)
             if args.output:
                 args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -567,7 +692,25 @@ def main() -> int:
                 )
         except (OSError, ValueError) as exc:
             parser.error(f"cannot load router profile: {exc}")
-        if args.adaptive and args.decode_devices:
+        if args.dp_devices:
+            backend = MultiGPUCollocatedBackend(
+                CollocatedClusterConfig(
+                    str(args.model),
+                    tuple(args.dp_devices),
+                    cache_tokens_per_worker=args.cache_tokens,
+                    block_size=args.block_size,
+                    max_state_slots_per_worker=args.concurrency,
+                    max_decode_batch_size_per_worker=args.concurrency,
+                    use_flash_attention=not args.no_flash_attention,
+                    prefill_chunk_size=args.prefill_chunk_size,
+                    prefix_cache_blocks=args.prefix_cache_blocks,
+                    prefix_cache_min_frequency=args.prefix_cache_min_frequency,
+                    kv_headroom_blocks=args.kv_headroom_blocks,
+                    kv_quant=args.kv_quant,
+                    worker_log_dir=args.worker_log_dir,
+                ),
+            )
+        elif args.adaptive and args.decode_devices:
             backend = MultiWorkerGenerationBackend(
                 PDClusterConfig(
                     str(args.model),
@@ -722,6 +865,7 @@ def main() -> int:
             )
         finally:
             loop.close()
+        summary = replace(summary, metadata=_collect_benchmark_metadata(args))
         output = json.dumps(summary.to_dict(), ensure_ascii=False, indent=2)
         if args.output:
             args.output.parent.mkdir(parents=True, exist_ok=True)

@@ -45,6 +45,10 @@ from hydraserve.engine.multi_worker import (
     WorkerStateLostError,
     WorkerUnavailableError,
 )
+from hydraserve.engine.collocated_multi import (
+    CollocatedClusterConfig,
+    MultiGPUCollocatedBackend,
+)
 
 __all__ = [
     "AdmissionDecision",
@@ -76,6 +80,8 @@ __all__ = [
     "GenerationHandle",
     "OverloadedError",
     "PartialDecodeError",
+    "CollocatedClusterConfig",
+    "MultiGPUCollocatedBackend",
     "MultiWorkerGenerationBackend",
     "PDClusterConfig",
     "PrefillRecoveryStats",

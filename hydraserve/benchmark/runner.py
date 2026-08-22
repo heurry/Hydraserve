@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import json
 from math import ceil
 from random import Random
 from time import perf_counter, sleep
-from typing import Iterable
+from typing import Any, Iterable
 from urllib import error, request
 
 from hydraserve.benchmark.datasets import BenchmarkSample
@@ -38,6 +38,10 @@ class RequestMetrics:
     route_observed_prefill_service_ms: float | None = None
     admission_wait_ms: float | None = None
     observed_prefill_queue_wait_ms: float | None = None
+    # P0 trace fields (V3 plan).
+    klass: str = "default"
+    ignore_eos: bool = False
+    target_new_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,6 +62,10 @@ class BenchmarkSummary:
     prefix_cache_stats: dict[str, int | float]
     per_worker: dict[str, dict[str, int | float]]
     results: tuple[RequestMetrics, ...]
+    # P0 additions (V3 plan): per-class metrics, SLO goodput, reproducibility.
+    by_class: dict[str, dict[str, int | float]] = field(default_factory=dict)
+    slo: dict[str, int | float] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -76,6 +84,9 @@ class BenchmarkSummary:
             "route_counts": self.route_counts,
             "prefix_cache_stats": self.prefix_cache_stats,
             "per_worker": self.per_worker,
+            "by_class": self.by_class,
+            "slo": self.slo,
+            "metadata": self.metadata,
             "results": [asdict(result) for result in self.results],
         }
 
@@ -149,6 +160,108 @@ def _per_worker_stats(results: Iterable[RequestMetrics]) -> dict[str, dict[str, 
     return {str(worker_id): bucket for worker_id, bucket in sorted(workers.items())}
 
 
+SLO_SHORT_TTFT_MS = 5000.0
+SLO_SHORT_TPOT_MS = 200.0
+
+
+def _by_class_stats(
+    results: Iterable[RequestMetrics], wall_time: float
+) -> dict[str, dict[str, int | float]]:
+    """Per-request-class aggregation (P0.3): throughput, percentiles, failures."""
+    buckets: dict[str, list[RequestMetrics]] = {}
+    for result in results:
+        buckets.setdefault(result.klass, []).append(result)
+    out: dict[str, dict[str, int | float]] = {}
+    for klass, rs in sorted(buckets.items()):
+        succeeded = [r for r in rs if r.error is None]
+        divisor = wall_time if wall_time > 0 else float("inf")
+        out[klass] = {
+            "requests": len(rs),
+            "succeeded": len(succeeded),
+            "failed": len(rs) - len(succeeded),
+            "output_tokens": sum(r.completion_tokens for r in succeeded),
+            "request_throughput": round(len(succeeded) / divisor, 4),
+            "output_token_throughput": round(
+                sum(r.completion_tokens for r in succeeded) / divisor, 4
+            ),
+            "ttft_ms": _percentiles(
+                r.ttft_ms for r in succeeded if r.ttft_ms is not None
+            ),
+            "tpot_ms": _percentiles(
+                r.tpot_ms for r in succeeded if r.tpot_ms is not None
+            ),
+            "latency_ms": _percentiles(r.latency_ms for r in succeeded),
+            "error_reasons": _count_errors(rs),
+        }
+    return out
+
+
+def _count_errors(results: Iterable[RequestMetrics]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        if result.error:
+            counts[result.error] = counts.get(result.error, 0) + 1
+    return counts
+
+
+def _slo_stats(
+    results: Iterable[RequestMetrics], wall_time: float
+) -> dict[str, int | float]:
+    """Short-request SLO goodput (P0.3, V3 plan).
+
+    A short request meets SLO when: TTFT <= 5s, TPOT <= 200ms, it produced its
+    full target output token count, and it did not error. Goodput is the met
+    requests (and their output tokens) per wall-clock second.
+    """
+    met = 0
+    met_tokens = 0
+    total_short = 0
+    ttft_ok = tpot_ok = full_ok = no_error = 0
+    for result in results:
+        if result.klass != "short":
+            continue
+        total_short += 1
+        ok = True
+        if result.error:
+            no_error += 0
+            ok = False
+        else:
+            no_error += 1
+        if result.ttft_ms is not None and result.ttft_ms <= SLO_SHORT_TTFT_MS:
+            ttft_ok += 1
+        else:
+            ok = False
+        if result.tpot_ms is not None and result.tpot_ms <= SLO_SHORT_TPOT_MS:
+            tpot_ok += 1
+        else:
+            ok = False
+        target = result.target_new_tokens
+        if target is not None and result.completion_tokens >= target:
+            full_ok += 1
+        elif target is None:
+            full_ok += 1
+        else:
+            ok = False
+        if ok:
+            met += 1
+            met_tokens += result.completion_tokens
+    divisor = wall_time if wall_time > 0 else float("inf")
+    return {
+        "short_requests": total_short,
+        "met_requests": met,
+        "met_rate": round(met / total_short, 4) if total_short else 0.0,
+        "goodput_requests_s": round(met / divisor, 4),
+        "goodput_tokens_s": round(met_tokens / divisor, 4),
+        "ttft_ok": ttft_ok,
+        "tpot_ok": tpot_ok,
+        "full_output_ok": full_ok,
+        "no_error": no_error,
+        "ttft_threshold_ms": SLO_SHORT_TTFT_MS,
+        "tpot_threshold_ms": SLO_SHORT_TPOT_MS,
+        "require_full_output": True,
+    }
+
+
 def run_benchmark(
     generation_loop,
     tokenizer,
@@ -204,6 +317,7 @@ def run_benchmark(
     def run_one(item) -> tuple[int, RequestMetrics]:
         index, sample = item
         token_ids = encode(sample)
+        per_sample_max = sample.max_new_tokens or max_new_tokens
         started = perf_counter()
         first_token_at = None
         completion_tokens = 0
@@ -211,7 +325,7 @@ def run_benchmark(
         error = None
         handle = None
         try:
-            handle = generation_loop.submit(token_ids, max_new_tokens)
+            handle = generation_loop.submit(token_ids, per_sample_max)
             for event in handle:
                 now = perf_counter()
                 if event.token_id is not None:
@@ -283,6 +397,9 @@ def run_benchmark(
             route_observed_prefill_service_ms=observed_service_ms,
             admission_wait_ms=admission_wait_ms,
             observed_prefill_queue_wait_ms=observed_queue_ms,
+            klass=sample.klass,
+            ignore_eos=sample.ignore_eos,
+            target_new_tokens=sample.max_new_tokens or max_new_tokens,
         )
 
     offsets: list[float] = []
@@ -303,7 +420,9 @@ def run_benchmark(
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
         for item, offset in zip(indexed, offsets, strict=True):
-            delay = wall_started + offset - perf_counter()
+            index, sample = item
+            trace_offset = sample.arrival_offset_ms / 1000.0
+            delay = wall_started + offset + trace_offset - perf_counter()
             if delay > 0:
                 sleep(delay)
             futures.append(executor.submit(run_one, item))
@@ -339,6 +458,8 @@ def run_benchmark(
         prefix_cache_stats=_prefix_cache_stats(generation_loop),
         per_worker=_per_worker_stats(results),
         results=results,
+        by_class=_by_class_stats(results, wall_time),
+        slo=_slo_stats(results, wall_time),
     )
 
 
@@ -392,6 +513,7 @@ def run_http_benchmark(
     *,
     max_new_tokens: int = 32,
     concurrency: int = 1,
+    max_prompt_tokens: int | None = None,
     warmup_requests: int = 0,
     request_rate: float | None = None,
     arrival_pattern: str = "burst",
@@ -403,9 +525,13 @@ def run_http_benchmark(
     Unlike :func:`run_benchmark`, requests are issued over HTTP to ``endpoint``
     (an OpenAI-style ``/v1/completions`` server) rather than an in-process
     generation loop, so multi-process DP deployments can be driven directly.
+    ``max_prompt_tokens`` is applied the same way as the in-process runner
+    (tail-truncation of the encoded prompt) so both paths feed identical tokens.
     """
     if max_new_tokens <= 0 or concurrency <= 0:
         raise ValueError("max_new_tokens and concurrency must be positive")
+    if max_prompt_tokens is not None and max_prompt_tokens <= 0:
+        raise ValueError("max_prompt_tokens must be positive")
     if warmup_requests < 0:
         raise ValueError("warmup_requests must be non-negative")
     if request_rate is not None and request_rate <= 0:
@@ -415,20 +541,33 @@ def run_http_benchmark(
     if arrival_pattern != "burst" and request_rate is None:
         raise ValueError("fixed/poisson arrivals require request_rate")
 
+    def truncate_prompt(sample: BenchmarkSample) -> str:
+        if max_prompt_tokens is None:
+            return sample.prompt
+        ids = tokenizer.encode(sample.prompt)
+        if len(ids) <= max_prompt_tokens:
+            return sample.prompt
+        return tokenizer.decode(ids[-max_prompt_tokens:])
+
     all_samples = tuple(samples)
     warmups = all_samples[:warmup_requests]
     indexed = tuple(enumerate(all_samples[warmup_requests:]))
 
     for sample in warmups:
         for kind, value in _iter_completion_sse(
-            endpoint, sample.prompt, max_new_tokens, timeout=timeout_s
+            endpoint,
+            truncate_prompt(sample),
+            sample.max_new_tokens or max_new_tokens,
+            timeout=timeout_s,
         ):
             if kind == "error":
                 raise RuntimeError(f"warmup request {sample.sample_id} failed: {value}")
 
     def run_one(item) -> tuple[int, RequestMetrics]:
         index, sample = item
-        prompt_tokens = len(tokenizer.encode(sample.prompt))
+        per_sample_max = sample.max_new_tokens or max_new_tokens
+        prompt = truncate_prompt(sample)
+        prompt_tokens = len(tokenizer.encode(prompt))
         started = perf_counter()
         first_token_at = None
         completion_tokens = 0
@@ -436,7 +575,7 @@ def run_http_benchmark(
         error = None
         try:
             for kind, value in _iter_completion_sse(
-                endpoint, sample.prompt, max_new_tokens, timeout=timeout_s
+                endpoint, prompt, per_sample_max, timeout=timeout_s
             ):
                 now = perf_counter()
                 if kind == "token":
@@ -468,6 +607,9 @@ def run_http_benchmark(
             route=None,
             route_reason=None,
             worker_id=None,
+            klass=sample.klass,
+            ignore_eos=sample.ignore_eos,
+            target_new_tokens=per_sample_max,
         )
 
     if arrival_pattern == "burst":
@@ -488,7 +630,9 @@ def run_http_benchmark(
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
         for item, offset in zip(indexed, offsets, strict=True):
-            delay = wall_started + offset - perf_counter()
+            index, sample = item
+            trace_offset = sample.arrival_offset_ms / 1000.0
+            delay = wall_started + offset + trace_offset - perf_counter()
             if delay > 0:
                 sleep(delay)
             futures.append(executor.submit(run_one, item))
@@ -524,4 +668,6 @@ def run_http_benchmark(
         prefix_cache_stats={},
         per_worker={},
         results=results,
+        by_class=_by_class_stats(results, wall_time),
+        slo=_slo_stats(results, wall_time),
     )
