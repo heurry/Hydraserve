@@ -50,6 +50,35 @@ def test_persistent_real_two_gpu_pd_generation() -> None:
     assert second_events[-1].finish_reason == "length"
 
 
+def test_real_host_prefix_radix_reuses_divergent_prefix() -> None:
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+        pytest.skip("two CUDA devices are required")
+    backend = DisaggregatedGenerationBackend(
+        PDWorkerConfig(
+            "/mnt/nvme-data/models/LLM_model/Qwen3.5-4B",
+            cache_tokens=2048,
+            block_size=256,
+            prefill_chunk_size=256,
+            max_state_slots=1,
+            max_decode_batch_size=1,
+            host_prefix_cache_bytes=1 << 30,
+        )
+    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1)
+    shared = tuple((index % 200) + 1 for index in range(256))
+    first_prompt = shared + tuple((index % 97) + 201 for index in range(256))
+    second_prompt = shared + tuple((index % 89) + 401 for index in range(256))
+    try:
+        assert list(loop.submit(first_prompt, max_new_tokens=1))[-1].finish_reason == "length"
+        assert backend.prefix_match_tokens(second_prompt) == 256
+        assert list(loop.submit(second_prompt, max_new_tokens=1))[-1].finish_reason == "length"
+        stats = backend.cache_stats()
+        assert stats["host_prefix_entries"] >= 2
+        assert stats["host_prefix_hits"] >= 1
+    finally:
+        loop.close(timeout=120)
+
+
 def test_real_pd_preemption_recovery_matches_uninterrupted_generation() -> None:
     from threading import Event
 

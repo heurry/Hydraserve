@@ -5,7 +5,7 @@ import json
 import numpy as np
 import pytest
 
-from hydraserve.cache import Int4Tensor, LinearState
+from hydraserve.cache import Int4Tensor, Int8Tensor, LinearState, dequantize_int8
 from hydraserve.transfer import (
     CudaP2PTransferBackend,
     HybridStateBundle,
@@ -13,6 +13,7 @@ from hydraserve.transfer import (
     RegionDescriptor,
     RegionType,
     SharedMemoryTransferBackend,
+    SharedMemoryRingTransferBackend,
     StateTransferDescriptor,
     TransferMode,
     TransferPipeline,
@@ -119,6 +120,25 @@ def test_quantized_transfer_packs_kv(tiny_model) -> None:
     assert backend.supports_layer_pipeline()
 
 
+def test_int8_transfer_quantizes_and_shared_memory_round_trips(tiny_model) -> None:
+    backend = SharedMemoryTransferBackend(
+        namespace="hydraserve-int8-pytest", mode=TransferMode.INT8_TRANSFER
+    )
+    try:
+        pipeline = TransferPipeline(backend)
+        kv = np.linspace(-1, 1, 256, dtype=np.float32).reshape(2, 128)
+        descriptor = pipeline.send(
+            6, tiny_model, 16, HybridStateBundle(_state(tiny_model), kv)
+        )
+        _, received = pipeline.receive(6, timeout=1)
+        assert descriptor.regions[-1].dtype == "int8"
+        assert isinstance(received.kv_cache, Int8Tensor)
+        np.testing.assert_allclose(dequantize_int8(received.kv_cache), kv, atol=0.01)
+        assert received.kv_cache.nbytes < kv.nbytes / 2
+    finally:
+        backend.close()
+
+
 def test_chunked_kv_manifest_and_final_bundle(tiny_model) -> None:
     backend = InMemoryTransferBackend(TransferMode.FULL_TRANSFER)
     pipeline = TransferPipeline(
@@ -187,6 +207,29 @@ def test_shared_memory_typed_codec_rejects_unsupported_objects() -> None:
     backend = SharedMemoryTransferBackend(namespace="hydraserve-typed-reject")
     with pytest.raises(TypeError, match="unsupported"):
         backend.send("bad", {"value": object()}, 1)
+
+
+def test_persistent_shared_memory_ring_reuses_slots() -> None:
+    namespace = "hydraserve-ring-pytest"
+    sender = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    try:
+        for sequence in range(4):
+            payload = {
+                "sequence": sequence,
+                "value": np.full((32, 16), sequence, dtype=np.float32),
+            }
+            sender.send(f"chunk-{sequence}", payload, 1)
+            restored = receiver.receive(f"chunk-{sequence}", 1, timeout=1)
+            assert restored["sequence"] == sequence
+            np.testing.assert_array_equal(restored["value"], payload["value"])
+    finally:
+        receiver.close()
+        sender.close()
 
 
 def test_cuda_p2p_default_receive_waits_on_current_stream(monkeypatch) -> None:

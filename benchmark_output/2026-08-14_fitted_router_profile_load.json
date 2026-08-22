@@ -1,0 +1,46 @@
+{
+  "collocated": {
+    "fixed_ms": 16.767807395778988,
+    "linear_ms_per_token": 0.775929730019134,
+    "quadratic_ms_per_token2": 0.00026724709023354896,
+    "decode_load_scale": 1.0836663196165324
+  },
+  "pd_disaggregated": {
+    "fixed_ms": 264.67172221148587,
+    "linear_ms_per_token": 0.6056289161730537,
+    "quadratic_ms_per_token2": 0.00045792580777039157,
+    "decode_load_scale": 1.8343988443004484
+  },
+  "minimum_pd_prompt_tokens": 256,
+  "minimum_savings_ms": 5.0,
+  "minimum_savings_ratio": 0.05,
+  "pd_uncertainty_multiplier": 1.1,
+  "ewma_alpha": 0.2,
+  "hysteresis_ms": 5.0,
+  "hysteresis_ratio": 0.02,
+  "drift_ratio_threshold": 1.5,
+  "drift_min_observations": 5,
+  "fail_closed_on_drift": true,
+  "metadata": {
+    "fit": {
+      "collocated": {
+        "samples": 18,
+        "unique_prompt_lengths": 9,
+        "minimum_prompt_tokens": 26,
+        "maximum_prompt_tokens": 9000,
+        "rmse_ms": 58.22010689163022,
+        "loaded_samples": 7
+      },
+      "pd_disaggregated": {
+        "samples": 18,
+        "unique_prompt_lengths": 9,
+        "minimum_prompt_tokens": 26,
+        "maximum_prompt_tokens": 9000,
+        "rmse_ms": 246.30469620297816,
+        "loaded_samples": 7
+      }
+    },
+    "latency_metric": "ttft_ms",
+    "recommended_input": "warmed C1 baselines plus optional loaded traces carrying route_decode_load"
+  }
+}

@@ -11,7 +11,9 @@ from hydraserve.cache import (
     GpuLinearStatePool,
     RequestStateSlotManager,
     dequantize_int4,
+    dequantize_int8,
     quantize_int4,
+    quantize_int8,
 )
 from hydraserve.cache.state_pool import cuda_state_memory_budget
 
@@ -294,3 +296,11 @@ def test_int4_round_trip_and_actual_packing() -> None:
     assert restored.shape == source.shape
     assert encoded.packed.nbytes < source.nbytes / 4
     assert np.max(np.abs(restored - source)) < 0.25
+
+
+def test_int8_transfer_round_trip_and_size_reduction() -> None:
+    source = np.linspace(-3, 3, 513, dtype=np.float32).reshape(27, 19)
+    encoded = quantize_int8(source, group_size=32)
+    restored = dequantize_int8(encoded)
+    np.testing.assert_allclose(restored, source, atol=0.025, rtol=0.025)
+    assert encoded.nbytes < source.nbytes / 2

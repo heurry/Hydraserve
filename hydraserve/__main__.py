@@ -90,6 +90,14 @@ def main() -> int:
     serve_parser.add_argument("--max-step-tokens", type=int, default=8192)
     serve_parser.add_argument("--dp-graph-sync", action="store_true")
     serve_parser.add_argument("--host-prefix-cache-gb", type=float, default=0.0)
+    serve_parser.add_argument(
+        "--pd-transfer-backend", choices=("shm-ring", "shm"), default="shm-ring"
+    )
+    serve_parser.add_argument("--pd-transfer-quant", choices=("int8",), default=None)
+    serve_parser.add_argument("--pd-transfer-target-mb", type=float, default=8.0)
+    serve_parser.add_argument("--pd-transfer-inflight", type=int, default=2)
+    serve_parser.add_argument("--shm-ring-slots", type=int, default=3)
+    serve_parser.add_argument("--shm-ring-slot-mb", type=float, default=64.0)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     serve_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     serve_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
@@ -149,6 +157,14 @@ def main() -> int:
     benchmark_parser.add_argument("--max-step-tokens", type=int, default=8192)
     benchmark_parser.add_argument("--dp-graph-sync", action="store_true")
     benchmark_parser.add_argument("--host-prefix-cache-gb", type=float, default=0.0)
+    benchmark_parser.add_argument(
+        "--pd-transfer-backend", choices=("shm-ring", "shm"), default="shm-ring"
+    )
+    benchmark_parser.add_argument("--pd-transfer-quant", choices=("int8",), default=None)
+    benchmark_parser.add_argument("--pd-transfer-target-mb", type=float, default=8.0)
+    benchmark_parser.add_argument("--pd-transfer-inflight", type=int, default=2)
+    benchmark_parser.add_argument("--shm-ring-slots", type=int, default=3)
+    benchmark_parser.add_argument("--shm-ring-slot-mb", type=float, default=64.0)
     benchmark_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     benchmark_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
     benchmark_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
@@ -219,6 +235,10 @@ def main() -> int:
             args.max_queue_tokens,
             args.max_step_tokens,
             args.prefix_cache_min_frequency,
+            args.pd_transfer_target_mb,
+            args.pd_transfer_inflight,
+            args.shm_ring_slots,
+            args.shm_ring_slot_mb,
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
         max_active_requests = args.max_active_requests or args.max_batch_size
@@ -275,6 +295,12 @@ def main() -> int:
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
                     host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
+                    transfer_backend=args.pd_transfer_backend,
+                    transfer_quant=args.pd_transfer_quant,
+                    transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
+                    max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                    shm_ring_slots=args.shm_ring_slots,
+                    shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
                 ),
@@ -297,6 +323,12 @@ def main() -> int:
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
                 host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
+                transfer_backend=args.pd_transfer_backend,
+                transfer_quant=args.pd_transfer_quant,
+                transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
+                max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                shm_ring_slots=args.shm_ring_slots,
+                shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (
@@ -437,10 +469,16 @@ def main() -> int:
             args.cache_tokens,
             args.block_size,
             args.prefix_cache_min_frequency,
+            args.pd_transfer_target_mb,
+            args.pd_transfer_inflight,
+            args.shm_ring_slots,
+            args.shm_ring_slot_mb,
         ) <= 0:
             parser.error("cache limits must be positive")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        if args.host_prefix_cache_gb < 0:
+            parser.error("host prefix cache size cannot be negative")
         if args.max_preemptions_per_request < 0:
             parser.error("--max-preemptions-per-request cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
@@ -547,6 +585,12 @@ def main() -> int:
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
                     host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
+                    transfer_backend=args.pd_transfer_backend,
+                    transfer_quant=args.pd_transfer_quant,
+                    transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
+                    max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                    shm_ring_slots=args.shm_ring_slots,
+                    shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
                 ),
@@ -568,6 +612,12 @@ def main() -> int:
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
                 host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
+                transfer_backend=args.pd_transfer_backend,
+                transfer_quant=args.pd_transfer_quant,
+                transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
+                max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                shm_ring_slots=args.shm_ring_slots,
+                shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (

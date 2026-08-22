@@ -2,12 +2,56 @@
 
 from __future__ import annotations
 
+from threading import RLock
+
 from hydraserve.cache.state_pool import LinearState
 from hydraserve.config import ModelConfig
 from hydraserve.model.runtime import RuntimeState
 from hydraserve.transfer.descriptor import StateTransferDescriptor, TransferMode
 from hydraserve.transfer.pipeline import HybridStateBundle
-from hydraserve.cache.kv_quantizer import Int4Tensor, dequantize_int4
+from hydraserve.cache.kv_quantizer import (
+    Int4Tensor,
+    Int8Tensor,
+    dequantize_int4,
+    dequantize_int8,
+    dequantize_int8_torch,
+    quantize_int8_torch,
+)
+
+
+class _PinnedStagingPool:
+    """Per-process reusable pinned buffers for synchronous transport handoff."""
+
+    def __init__(self) -> None:
+        self._buffers = {}
+        self._lock = RLock()
+
+    def stage(self, tensor, *, slot: int = 0):
+        import torch
+
+        if not tensor.is_cuda:
+            return tensor.cpu()
+        key = (tuple(tensor.shape), tensor.dtype, tensor.device.index, slot)
+        with self._lock:
+            destination = self._buffers.get(key)
+            if destination is None:
+                destination = torch.empty(
+                    tensor.shape,
+                    device="cpu",
+                    dtype=tensor.dtype,
+                    pin_memory=True,
+                )
+                self._buffers[key] = destination
+            destination.copy_(tensor, non_blocking=True)
+            ready = torch.cuda.Event()
+            ready.record(torch.cuda.current_stream(tensor.device))
+            # Wait only for this D2H copy. Unlike stream.synchronize(), later
+            # unrelated work submitted to the transfer stream is not drained.
+            ready.synchronize()
+            return destination
+
+
+_PINNED_STAGING = _PinnedStagingPool()
 
 
 class RuntimeStateCodec:
@@ -60,11 +104,13 @@ class RuntimeStateCodec:
             key, value = paged_cache.read(request_id, layer_index)
             layers.append(torch.stack((key, value), dim=0))
         stacked = torch.stack(layers, dim=0)
+        if mode is TransferMode.INT8_TRANSFER:
+            return quantize_int8_torch(stacked)
         if mode is TransferMode.QUANTIZED_TRANSFER:
             return stacked.float().cpu().numpy()
         if stacked.dtype is torch.bfloat16:
-            return stacked.view(torch.uint16).cpu().numpy()
-        return stacked.cpu().numpy()
+            return _PINNED_STAGING.stage(stacked.view(torch.uint16)).numpy()
+        return _PINNED_STAGING.stage(stacked).numpy()
 
     @staticmethod
     def extract_kv_range(
@@ -97,22 +143,26 @@ class RuntimeStateCodec:
                 start,
                 end,
             )
+            if mode is TransferMode.INT8_TRANSFER:
+                return quantize_int8_torch(stacked)
             if mode is TransferMode.QUANTIZED_TRANSFER:
                 return stacked.float().cpu().numpy()
             if stacked.dtype is torch.bfloat16:
-                return stacked.view(torch.uint16).cpu().numpy()
-            return stacked.cpu().numpy()
+                return _PINNED_STAGING.stage(stacked.view(torch.uint16)).numpy()
+            return _PINNED_STAGING.stage(stacked).numpy()
 
         layers = []
         for layer_index in model.full_attention_layer_indices:
             key, value = paged_cache.read(request_id, layer_index, num_tokens=end)
             layers.append(torch.stack((key[start:end], value[start:end]), dim=0))
         stacked = torch.stack(layers, dim=0).contiguous()
+        if mode is TransferMode.INT8_TRANSFER:
+            return quantize_int8_torch(stacked)
         if mode is TransferMode.QUANTIZED_TRANSFER:
             return stacked.float().cpu().numpy()
         if stacked.dtype is torch.bfloat16:
-            return stacked.view(torch.uint16).cpu().numpy()
-        return stacked.cpu().numpy()
+            return _PINNED_STAGING.stage(stacked.view(torch.uint16)).numpy()
+        return _PINNED_STAGING.stage(stacked).numpy()
 
     @staticmethod
     def install_kv(model: ModelConfig, paged_cache, request_id: int, payload) -> None:
@@ -127,7 +177,16 @@ class RuntimeStateCodec:
         import numpy as np
         import torch
 
-        values = dequantize_int4(payload) if isinstance(payload, Int4Tensor) else np.asarray(payload)
+        device_values = None
+        if isinstance(payload, Int8Tensor) and paged_cache.device.type == "cuda":
+            device_values = dequantize_int8_torch(payload, device=paged_cache.device)
+            values = device_values
+        elif isinstance(payload, Int8Tensor):
+            values = dequantize_int8(payload)
+        elif isinstance(payload, Int4Tensor):
+            values = dequantize_int4(payload)
+        else:
+            values = np.asarray(payload)
         expected_prefix = (
             model.num_full_attention_layers,
             2,
@@ -143,12 +202,11 @@ class RuntimeStateCodec:
             start, start + values.shape[2], device=paged_cache.device
         )
         # FULL transfer ships BF16 as uint16 raw bits; reinterpret, don't convert.
-        bf16_bits = values.dtype == np.uint16
+        bf16_bits = isinstance(values, np.ndarray) and values.dtype == np.uint16
         if (
             paged_cache.device.type == "cuda"
             and paged_cache.kv_quant is None
-            and bf16_bits
-            and paged_cache.matched_prefix_tokens(request_id) == 0
+            and (bf16_bits or device_values is not None)
         ):
             from hydraserve.kernels.staging import fused_scatter_paged_kv
 
@@ -158,8 +216,12 @@ class RuntimeStateCodec:
                 device=paged_cache.device,
                 dtype=torch.int32,
             )
-            staging = torch.from_numpy(values).view(torch.bfloat16).to(
-                device=paged_cache.device, non_blocking=True
+            staging = (
+                device_values.to(dtype=paged_cache.dtype)
+                if device_values is not None
+                else torch.from_numpy(values).view(torch.bfloat16).to(
+                    device=paged_cache.device, non_blocking=True
+                )
             )
             fused_scatter_paged_kv(
                 staging,
@@ -170,8 +232,12 @@ class RuntimeStateCodec:
             )
             return
         for slot, layer_index in enumerate(model.full_attention_layer_indices):
-            key = torch.from_numpy(values[slot, 0])
-            value = torch.from_numpy(values[slot, 1])
+            if isinstance(values, torch.Tensor):
+                key = values[slot, 0]
+                value = values[slot, 1]
+            else:
+                key = torch.from_numpy(values[slot, 0])
+                value = torch.from_numpy(values[slot, 1])
             if bf16_bits:
                 key = key.view(torch.bfloat16)
                 value = value.view(torch.bfloat16)
@@ -212,19 +278,10 @@ class RuntimeStateCodec:
 
         if not tensors or not tensors[0].is_cuda:
             return tuple(tensor.cpu() for tensor in tensors)
-        staged = tuple(
-            torch.empty(
-                tensor.shape,
-                device="cpu",
-                dtype=tensor.dtype,
-                pin_memory=True,
-            )
-            for tensor in tensors
+        return tuple(
+            _PINNED_STAGING.stage(tensor, slot=slot)
+            for slot, tensor in enumerate(tensors)
         )
-        for destination, source in zip(staged, tensors, strict=True):
-            destination.copy_(source, non_blocking=True)
-        torch.cuda.current_stream(tensors[0].device).synchronize()
-        return staged
 
     @staticmethod
     def _stage_to_device(*arrays, device):

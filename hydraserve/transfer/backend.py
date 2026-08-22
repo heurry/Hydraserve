@@ -12,6 +12,7 @@ from time import monotonic, sleep
 from typing import Any
 
 from hydraserve.transfer.descriptor import TransferMode
+from hydraserve.cache.kv_quantizer import Int4Tensor, Int8Tensor
 
 
 class TransferBackend(ABC):
@@ -224,6 +225,24 @@ class SharedMemoryTransferBackend(TransferBackend):
         arrays: list[np.ndarray] = []
 
         def visit(value):
+            if isinstance(value, Int4Tensor):
+                return {
+                    "__hydra_int4__": True,
+                    "packed": visit(value.packed),
+                    "scales": visit(value.scales),
+                    "shape": list(value.shape),
+                    "group_size": value.group_size,
+                    "original_dtype": value.original_dtype,
+                }
+            if isinstance(value, Int8Tensor):
+                return {
+                    "__hydra_int8__": True,
+                    "quantized": visit(value.quantized),
+                    "scales": visit(value.scales),
+                    "shape": list(value.shape),
+                    "group_size": value.group_size,
+                    "original_dtype": value.original_dtype,
+                }
             if isinstance(value, np.ndarray):
                 contiguous = np.ascontiguousarray(value)
                 index = len(arrays)
@@ -257,6 +276,22 @@ class SharedMemoryTransferBackend(TransferBackend):
 
         def visit(value):
             nonlocal cursor
+            if isinstance(value, dict) and value.get("__hydra_int4__") is True:
+                return Int4Tensor(
+                    visit(value["packed"]),
+                    visit(value["scales"]),
+                    tuple(int(item) for item in value["shape"]),
+                    int(value["group_size"]),
+                    str(value["original_dtype"]),
+                )
+            if isinstance(value, dict) and value.get("__hydra_int8__") is True:
+                return Int8Tensor(
+                    visit(value["quantized"]),
+                    visit(value["scales"]),
+                    tuple(int(item) for item in value["shape"]),
+                    int(value["group_size"]),
+                    str(value["original_dtype"]),
+                )
             if isinstance(value, dict) and "__hydra_ndarray__" in value:
                 index = int(value["__hydra_ndarray__"])
                 if index in arrays:

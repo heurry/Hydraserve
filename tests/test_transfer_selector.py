@@ -4,6 +4,7 @@ import pytest
 
 from hydraserve.transfer import (
     CudaP2PTransferBackend,
+    SharedMemoryRingTransferBackend,
     SharedMemoryTransferBackend,
     select_transfer_backend,
 )
@@ -12,6 +13,19 @@ from hydraserve.transfer import (
 def test_explicit_shm_selection() -> None:
     backend = select_transfer_backend(0, 1, backend="shm", shm_namespace="selector-test")
     assert isinstance(backend, SharedMemoryTransferBackend)
+    backend.close()
+
+
+def test_explicit_shm_ring_selection() -> None:
+    backend = select_transfer_backend(
+        0,
+        1,
+        backend="shm-ring",
+        shm_namespace="selector-ring-test",
+        ring_slots=1,
+        ring_slot_bytes=1 << 20,
+    )
+    assert isinstance(backend, SharedMemoryRingTransferBackend)
     backend.close()
 
 

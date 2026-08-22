@@ -1169,3 +1169,109 @@ dtype 完全相同；断言改为 `check_dtype=False`，原有 2e-2 数值容差
 - `2026-08-22_synthetic1024_4b_flash_ab_on.json`（2×2-token 热态复核）
 - `2026-08-22_synthetic1024_4b_flash_ab_off_final.json`（最终口径）
 - `2026-08-22_synthetic1024_4b_flash_ab_on_final.json`（最终口径）
+
+## 21. PD 传输与 Host prefix 深化优化
+
+### 21.1 起点与根因
+
+进一步审计第三节 PD 路径后，确认原有“14 项完成”仍存在四个生产热路径问题：
+
+1. `SharedMemoryTransferBackend` 每个 KV chunk 都 create/unlink 一个 POSIX SHM object；
+2. chunk callback 在 prefill 线程同步 gather、D2H 和 send，且每请求创建 executor；
+3. QUANTIZED 模式只有 CPU INT4 codec，生产 worker 固定 FULL SHM，无法使用 GPU 侧传输压缩；
+4. `HostPrefixCache` 实际是 `OrderedDict[(namespace, full_token_tuple)]` 精确命中，put/get 都
+   `deepcopy`，stream 接收结束后还把完整 KV 从 decode GPU 再读回 CPU。
+
+GPU L1 `PrefixCache` 原本已经是 block radix tree，本轮没有替换它。修改对象是 PD decode 侧的
+Host L2。
+
+### 21.2 数据面与 overlap 修改
+
+- 新增 `SharedMemoryRingTransferBackend`：固定数量、固定大小的 SHM slot 在 worker 生命周期内复用；
+  header-last 发布，READY/FREE 状态提供有界背压。配置值是 slot 下限，生产 factory 会根据模型
+  recurrent+conv bundle 自动放大，避免 27B 状态超过默认 64 MiB 时启动后才失败。
+- 第一版 ring 在每次 send/receive 都调用 `fcntl.flock`。真实 A/B 为负，因此没有停在该版本；
+  生产拓扑按 namespace 是单生产者/单消费者，最终仅在创建 slot 时加文件锁，热路径用单字节
+  state 发布。
+- prefill worker 持久复用单线程 transfer executor 和 dedicated CUDA stream；chunk 完成后记录
+  CUDA event，传输 stream 等待该 event，最多保留可配置数量的 in-flight chunk。
+- decode worker 使用 dedicated install stream；后台接收线程等待 install completion event，
+  active decode 的 default stream 不再被整段 receive/install 阻塞。后台 prepare 改为有界 executor，
+  不再为每个请求创建 daemon thread。
+- `RuntimeStateCodec` 加入按 shape/device/dtype 复用的 pinned staging；D2H 只等待该 copy event，
+  不再 `current_stream.synchronize()` 清空整条 stream。
+- adaptive chunk 同时考虑 page size、模型 KV bytes/token、目标 payload、FULL/INT4/INT8 wire mode；
+  INT8 的 chunk 不再沿用 BF16 字节模型。
+
+### 21.3 GPU INT8 wire transfer
+
+新增 `TransferMode.INT8_TRANSFER` 和 `Int8Tensor`：
+
+- source GPU 对 fused-gather 后的连续 KV 做 group-64 symmetric INT8 quantization；
+- D2H 只复制 INT8 values 和 FP32 scales；
+- SHM typed codec 可直接编码/解码 INT4/INT8 structured payload；
+- destination GPU 先搬压缩数据，再在 GPU 上反量化并 fused-scatter 到 paged KV；
+- recurrent/conv state仍保持 FP32，不做有损压缩。
+
+CLI：`--pd-transfer-quant int8`。它与 `--kv-quant int8` 含义不同：前者只控制 P→D wire payload，
+后者控制常驻 paged KV cache。短 prompt 的量化成本可能大于拷贝收益，因此 wire INT8 不默认开启。
+
+### 21.4 Host L2 从 exact LRU 到 block radix
+
+最终 `HostPrefixCache` 的逻辑为：
+
+1. token 按物理 KV block/page 分段；不足一页的尾部不作为共享前缀发布；
+2. 每个 radix 节点记录能提供该节点 KV 的 backing entries；
+3. 查询沿 block path 前进，即使缓存叶子是 `[A+B]`、查询是 `[A+C]`，也能返回 A；
+4. admission 传递的不再是 `host_cache_hit: bool`，而是 `host_prefix_tokens: int`；
+5. decode 先安装 L2 prefix，prefill manifest 从该 token offset 开始，数据面只发送 suffix；
+6. ndarray 命中返回 backing payload 的 view，不做命中 deepcopy；首次接收直接用 CPU chunk 建新
+   L2 entry，不再执行完整 decode GPU→CPU readback。
+
+真实双卡测试用两个共享前 256 tokens、后 256 tokens 分叉的 prompt，第二个请求准确报告
+`matched_tokens=256` 并完成 suffix-only transfer/generation。
+
+### 21.5 真实 A/B 与负收益记录
+
+环境：2×RTX 3090、Qwen3.5-4B BF16、FlashAttention on、block/page=256、C1、2 output tokens。
+1K 为 2 warmup + 5 measured；8K 为 1 warmup + 3 measured。
+
+| prompt / 数据面 | output tok/s | TTFT P50 | TPOT P50 | latency P50 | failed |
+|---|---:|---:|---:|---:|---:|
+| 1K one-shot SHM BF16 | 5.662 | 330.75 ms | 19.95 ms | 353.32 ms | 0 |
+| 1K ring + per-op flock（否决） | 5.585 | 333.70 ms | 19.88 ms | 359.30 ms | 0 |
+| 1K lock-free SPSC ring BF16 | **6.355** | **287.25 ms** | **19.26 ms** | **307.24 ms** | 0 |
+| 1K lock-free ring INT8 | 6.304 | 289.65 ms | 20.45 ms | 312.76 ms | 0 |
+| 8K ring BF16 | 0.899 | 1805.73 ms | 25.84 ms | 1831.56 ms | 0 |
+| 8K ring INT8（沿用 BF16 chunk 模型） | 1.083 | 1790.62 ms | 22.48 ms | 1813.11 ms | 0 |
+| 8K ring INT8 + mode-aware adaptive chunk | **1.195** | **1608.47 ms** | 24.21 ms | **1632.68 ms** | 0 |
+
+结论：
+
+- per-op `flock` 版本比 one-shot SHM 吞吐低 1.36%，已修正；
+- lock-free SPSC ring 在 1K 相对 one-shot SHM 吞吐 +12.2%、TTFT -13.2%；
+- INT8 在 1K 无净收益，保持 opt-in；
+- 8K INT8 + adaptive chunk 相对无损 ring 吞吐 +32.9%、TTFT -10.9%；
+- 样本仍小，不能外推成生产 SLA，下一轮应补 C4 与真实长文本分布。
+
+结果文件：
+
+- `2026-08-22_pd_shm_full_c1_run2.json`
+- `2026-08-22_pd_ring_full_c1_run2.json`（per-op flock，否决）
+- `2026-08-22_pd_ring_lockfree_c1.json`
+- `2026-08-22_pd_ring_int8_c1.json`
+- `2026-08-22_pd_ring_full_8k_c1.json`
+- `2026-08-22_pd_ring_int8_8k_c1.json`
+- `2026-08-22_pd_ring_int8_8k_adaptive_c1.json`
+
+### 21.6 回归
+
+- CPU/协议全仓：**310 tests collected**，全部通过或按硬件/可选依赖 marker skip；
+- 新增 SHM ring slot reuse、INT8 typed codec、INT8 size/error、adaptive chunk、Host radix 分叉、
+  suffix-only end-to-end 等测试；
+- 真实 1P1D Host radix test：通过；
+- 真实 A/B 所有 measured 请求：0 failed。
+
+边界：当前机器无 GPU peer access，CUDA P2P/NCCL/NIXL 仍不能做目标拓扑验收；生产 SHM 主路径
+采用 all-layer bulk chunk，而不是把 bulk chunk 拆成逐层小消息。`LayerTransferPipeline` 继续作为
+高带宽 transport 接口保留。

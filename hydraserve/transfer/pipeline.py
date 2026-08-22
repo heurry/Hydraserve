@@ -5,7 +5,12 @@ from typing import Any
 
 import numpy as np
 
-from hydraserve.cache.kv_quantizer import Int4Tensor, quantize_int4
+from hydraserve.cache.kv_quantizer import (
+    Int4Tensor,
+    Int8Tensor,
+    quantize_int4,
+    quantize_int8,
+)
 from hydraserve.cache.state_pool import LinearState
 from hydraserve.config import ModelConfig
 from hydraserve.transfer.backend import TransferBackend
@@ -20,7 +25,7 @@ from hydraserve.transfer.descriptor import (
 @dataclass(slots=True)
 class HybridStateBundle:
     recurrent: LinearState
-    kv_cache: np.ndarray | Int4Tensor | None = None
+    kv_cache: np.ndarray | Int4Tensor | Int8Tensor | None = None
 
 
 class TransferPipeline:
@@ -61,6 +66,7 @@ class TransferPipeline:
         state_token_count: int | None = None,
         streamed_kv_ranges: tuple[tuple[int, int], ...] = (),
         host_cache_hit: bool = False,
+        host_prefix_tokens: int = 0,
     ) -> StateTransferDescriptor:
         mode = self.backend.transfer_mode
         recurrent = state.recurrent
@@ -88,11 +94,12 @@ class TransferPipeline:
                     model.num_kv_heads,
                     model.head_dim,
                 )
-                dtype, quantized = (
-                    ("int4", True)
-                    if mode is TransferMode.QUANTIZED_TRANSFER
-                    else ("uint16", False)
-                )
+                if mode is TransferMode.QUANTIZED_TRANSFER:
+                    dtype, quantized = "int4", True
+                elif mode is TransferMode.INT8_TRANSFER:
+                    dtype, quantized = "int8", True
+                else:
+                    dtype, quantized = "uint16", False
                 kv_payload = None
             elif mode is TransferMode.QUANTIZED_TRANSFER:
                 kv_payload = (
@@ -101,6 +108,13 @@ class TransferPipeline:
                 )
                 kv_shape = kv_payload.shape
                 dtype, quantized = "int4", True
+            elif mode is TransferMode.INT8_TRANSFER:
+                kv_payload = (
+                    state.kv_cache if isinstance(state.kv_cache, Int8Tensor)
+                    else quantize_int8(state.kv_cache)
+                )
+                kv_shape = kv_payload.shape
+                dtype, quantized = "int8", True
             else:
                 kv_payload = state.kv_cache
                 kv_shape = state.kv_cache.shape
@@ -133,6 +147,7 @@ class TransferPipeline:
             streamed_kv=bool(streamed_kv_ranges),
             kv_chunk_ranges=streamed_kv_ranges,
             host_cache_hit=host_cache_hit,
+            host_prefix_tokens=host_prefix_tokens,
         )
         key = self._key(request_id)
         self.backend.send(
@@ -148,13 +163,17 @@ class TransferPipeline:
         model: ModelConfig,
         prompt_length: int,
         chunk_ranges: tuple[tuple[int, int], ...],
+        *,
+        prefix_tokens: int = 0,
     ) -> None:
         """Publish a manifest before prefill so decode can receive immediately."""
         if self.backend.transfer_mode is TransferMode.PARTIAL_TRANSFER:
             raise ValueError("partial transfer has no KV chunks")
-        if not chunk_ranges or chunk_ranges[0][0] != 0:
-            raise ValueError("chunk ranges must start at token zero")
-        previous = 0
+        if not 0 <= prefix_tokens < prompt_length:
+            raise ValueError("chunked transfer prefix must leave a suffix")
+        if not chunk_ranges or chunk_ranges[0][0] != prefix_tokens:
+            raise ValueError("chunk ranges must start after the cached prefix")
+        previous = prefix_tokens
         for start, end in chunk_ranges:
             if start != previous or end <= start or end > prompt_length:
                 raise ValueError("chunk ranges must be contiguous")
@@ -166,6 +185,7 @@ class TransferPipeline:
                 "model_name": model.name,
                 "prompt_length": prompt_length,
                 "mode": self.backend.transfer_mode.value,
+                "prefix_tokens": prefix_tokens,
                 "ranges": [list(item) for item in chunk_ranges],
             }
         if self.bootstrap is None:
@@ -203,6 +223,8 @@ class TransferPipeline:
             raise ValueError("partial transfer has no KV chunks")
         if mode is TransferMode.QUANTIZED_TRANSFER and not isinstance(payload, Int4Tensor):
             payload = quantize_int4(payload)
+        if mode is TransferMode.INT8_TRANSFER and not isinstance(payload, Int8Tensor):
+            payload = quantize_int8(payload)
         self.backend.send(
             f"{self._key(request_id)}:chunks:{start}:{end}",
             payload,

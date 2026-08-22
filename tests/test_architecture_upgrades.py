@@ -29,6 +29,50 @@ def test_host_prefix_cache_is_bounded_lru() -> None:
     assert stats.entries == 1 and stats.evictions == 1
 
 
+def test_host_prefix_cache_returns_longest_block_aligned_prefix_without_copy() -> None:
+    cache = HostPrefixCache(max_bytes=1 << 20, block_size=2)
+    payload = np.arange(2 * 2 * 6 * 2, dtype=np.uint16).reshape(2, 2, 6, 2)
+    assert cache.put("model", (1, 2, 3, 4, 5, 6), payload)
+
+    match = cache.match("model", (1, 2, 3, 4, 5, 6, 7, 8))
+    assert match.matched_tokens == 6
+    assert match.payload is cache.get("model", (1, 2, 3, 4, 5, 6))
+    np.testing.assert_array_equal(match.payload, payload)
+    assert cache.longest_prefix_tokens("model", (1, 2, 9, 9)) == 2
+
+
+def test_host_prefix_cache_drops_partial_page_tail() -> None:
+    cache = HostPrefixCache(max_bytes=1 << 20, block_size=4)
+    payload = np.arange(2 * 2 * 6, dtype=np.uint16).reshape(2, 2, 6, 1, 1)
+    assert cache.put("model", (1, 2, 3, 4, 5, 6), payload)
+    exact = cache.match("model", (1, 2, 3, 4, 5, 6))
+    assert exact.matched_tokens == 6
+    match = cache.match("model", (1, 2, 3, 4, 9, 10))
+    assert match.matched_tokens == 4
+    assert match.payload.shape[2] == 4
+
+
+def test_host_prefix_cache_matches_shared_path_before_divergent_tail() -> None:
+    cache = HostPrefixCache(max_bytes=1 << 20, block_size=2)
+    payload = np.arange(2 * 2 * 6, dtype=np.uint16).reshape(2, 2, 6, 1, 1)
+    assert cache.put("model", (1, 2, 3, 4, 5, 6), payload)
+    match = cache.match("model", (1, 2, 3, 4, 9, 10))
+    assert match.matched_tokens == 4
+    np.testing.assert_array_equal(match.payload, payload[:, :, :4])
+    assert np.shares_memory(match.payload, payload)
+
+
+def test_host_prefix_cache_pin_prevents_admission_restore_eviction() -> None:
+    cache = HostPrefixCache(max_bytes=16, block_size=1)
+    first = np.arange(4, dtype=np.float32)
+    assert cache.put("model", (1,), first)
+    lease = cache.pin("model", (1, 9))
+    assert lease.matched_tokens == 1
+    assert not cache.put("model", (2,), first + 10)
+    cache.unpin(lease)
+    assert cache.put("model", (2,), first + 10)
+
+
 def test_bootstrap_metadata_is_one_shot() -> None:
     client = BootstrapClient(BootstrapRegistry())
     client.publish(7, "kv_chunks", {"ranges": [[0, 4]]})

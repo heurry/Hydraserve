@@ -88,13 +88,24 @@ Qwen3.5/3.6 用 GDN 层替代大部分 attention 层(如 4B:32 层中 24 层 GDN
 
 ### 2.4 Gated DeltaNet 完整数学(逐行对照代码)
 
-每层输入 hidden → 投影出 q, k, v, log_decay, beta, gate。对每个 token t:
+每层输入 hidden(B×T×D)→ 线性投影出 q, k, v, log_decay, beta, gate:
+
+| 参数 | 形状 | 来源 | 约束与作用 |
+|------|------|------|-----------|
+| q / k | B×T×H×K_d | hidden 投影 | 先 L2 归一化再加权——保证每步写入状态的范数有界,递推不发散(DeltaNet 的核心技巧) |
+| v | B×T×H×V_d | hidden 投影 | 写入记忆的内容 |
+| log_decay | B×T×H | 投影,**存对数** | exp(log_decay) ∈ (0,1),是"旧状态保留比例";存对数保证符号与值域天然正确 |
+| beta | B×T×H | 投影,sigmoid 到 (0,1) | delta 写入强度的门控:接近 0 时本步几乎不更新状态 |
+| gate | B×T×H×D(或逐头) | hidden 投影,SiLU | 输出门控:y ← y·silu(gate),控制本步"读出"多少 |
+
+对每个 token t:
 
 1. **L2 归一化**:q ← q/‖q‖·K^{-1/2},k ← k/‖k‖(K = key dim);
-2. **因果 depthwise conv + SiLU**:对 q/k/v 各通道做核宽 K 的一维因果卷积再 SiLU(等价于每个 token 只看过去 K 个输入,提供局部时序信息);
+2. **因果 depthwise conv + SiLU**:对 q/k/v 各通道做核宽 K 的一维因果卷积再 SiLU
+   (公式见 §4.2,等价于每个 token 只看过去 K 个输入,提供局部时序信息);
 3. **delta rule 递推**(状态 S ∈ R^{K_d × V_d},FP32):
 
-$$S_t = \exp(\text{log\_decay}_t)\cdot S_{t-1} + \beta_t\, k_t \,(v_t - S_{t-1} k_t)^\top$$
+$$S_t = \underbrace{\exp(\text{log\_decay}_t)\cdot S_{t-1}}_{\text{衰减旧记忆}} + \underbrace{\beta_t\, k_t \,(v_t - \underbrace{S_{t-1} k_t}_{\text{当前预测}})^\top}_{\text{按残差写入}}$$
 
 4. **读取**:y_t = q_t^\top S_t;再与 gate 相乘、接输出投影 + 残差。
 
@@ -131,19 +142,65 @@ $$S_t = \exp(\text{log\_decay}_t)\cdot S_{t-1} + \beta_t\, k_t \,(v_t - S_{t-1} 
 
 ## 3. online softmax 与 Paged Attention
 
-### 3.1 朴素 softmax 的问题与 online 递推
+### 3.1 朴素 softmax 的问题与 online 递推(完整推导)
 
-softmax 需要 max 做数值稳定,朴素做法读三遍数据(求 max → 求 exp 和 → 归一)。
-**online softmax** 一遍完成,核心是"看到更大的 max 时按比例修正已积累的分子分母":
+**第一层:为什么要减 max。** softmax 直接算 exp(x_i)/Σexp(x_j) 会溢出(FP16 上限
+65504,exp(1000) 就爆)。但分子分母同时除以一个常数结果不变:
+
+$$\text{softmax}_i = \frac{e^{x_i - m}}{\sum_j e^{x_j - m}}$$
+
+取 m = max(x) 时所有 exp 参数 ≤0,值域 (0,1],永不溢出——这就是"减 max"。
+
+**第二层:流式难题。** paged attention 的 KV 在非连续物理块里,必须逐块扫描、
+扫完即丢。扫完若干块后手里只攒三个量(m_old、l_old、acc):
+
+| 符号 | 含义 | 形状 |
+|------|------|------|
+| m_old | 已见分数的最大值 | 标量 |
+| l_old = Σ exp(x_j − m_old) | 旧分母(按旧 max 缩放) | 标量 |
+| acc = Σ exp(x_j − m_old)·v_j | 旧分子:分数加权的 V 之和 | head_dim 向量 |
+
+新 tile 到了,新 max `m_new ≥ m_old`。**旧累加量按旧 max 缩放,不能与新 tile
+按新 max 缩放的值直接相加**——基准不一致。
+
+**第三层:换基准的恒等式。** 对任意旧分数 x_j:
+
+$$e^{x_j - m_{new}} = e^{x_j - m_{old}} \cdot e^{m_{old} - m_{new}}$$
+
+于是把旧累加量整体乘上修正因子 `exp(m_old − m_new)` 即可换到新基准:
 
 ```
 m_new = max(m_old, m_tile)
 l_new = l_old·exp(m_old−m_new) + Σ exp(x_tile − m_new)
-acc   = acc·exp(m_old−m_new) + Σ exp(x_tile − m_new)·V_tile
+acc   = acc·exp(m_old−m_new)   + Σ exp(x_tile − m_new)·v_tile
 ```
 
+三个关键性质:①**修正因子永远 ≤1**(m_new ≥ m_old,exp 参数 ≤0)——旧贡献只会被
+按正确比例降权,数值上从不放大误差;②m_new == m_old 时因子 = 1,旧累加量原样
+保留(常见情形);③最后输出 `acc / l` 时 max 彻底消掉——**实数意义下与一次性
+算出全部分数完全等价,不是近似**。可以理解为流式加权均值:维护的不变量是
+`acc/l` 始终等于"已见所有分数的 softmax 加权 V 之和"。
+
+**映射到代码**([kernels/paged_attention.py](../hydraserve/kernels/paged_attention.py)
+的 decode kernel):
+
+```python
+maximum = -inf; denominator = 0.0; accumulator = zeros
+for each 16-token tile:
+    score = q·k_tile / √d; score = where(valid, score, -inf)   # exp(-inf)=0 → 无效位置零贡献
+    next_maximum = max(maximum, tile_max)
+    old_scale = exp(maximum - next_maximum)                    # ← 恒等式因子
+    probability = where(valid, exp(score - next_maximum), 0)
+    accumulator = accumulator*old_scale + Σ probability·v      # ← acc 递推
+    denominator = denominator*old_scale + Σ probability        # ← l 递推
+    maximum = next_maximum
+result = accumulator / denominator
+```
+
+第一块时 m_old=−inf,exp(−inf−m_new)=0,零累加量乘 0 仍为 0,递推自洽。
+
 它是 FlashAttention 分块递推的核心,也是 [kernels/paged_attention.py](../hydraserve/kernels/paged_attention.py)
-里 decode kernel 的骨架(见该文件 `maximum / denominator / accumulator` 三行)。
+里 decode kernel 的骨架。
 
 ### 3.2 Paged Attention:块表寻址
 
@@ -176,15 +233,72 @@ continuation chunk 需要读物理页历史,走自写 Triton Paged online-softma
 
 ### 4.2 逐个 kernel(建议顺序)
 
-| kernel | 文件 | 关键点 |
-|--------|------|--------|
-| RMSNorm | [kernels/rmsnorm.py](../hydraserve/kernels/rmsnorm.py) | 每行一个 program,块内求方差;Qwen 的 zero-centered 变体是 `scale = 1 + w`;gated 版把 `x·silu(gate)` 融合进同一 kernel 省一次显存往返 |
-| causal depthwise conv | [kernels/gdn.py](../hydraserve/kernels/gdn.py) 的 `_causal_conv_kernel` | 因果性 = 每个 token 只取 `[t−K+1, t]` 窗口,越界部分用携带的 state 补齐;state 是显式 `[C, K]` 历史缓冲,另有一个小 kernel 更新下一 chunk 的 state |
-| GDN 递推 | [kernels/gdn.py](../hydraserve/kernels/gdn.py) 的 `_gdn_recurrent_kernel` | grid=(batch, heads, V/16);状态块 `[BLOCK_K, BLOCK_V]` 载入寄存器后,**token 循环全部在片上**,结束才写回;BLOCK_V=16,BLOCK_K=next_pow2(key_dim) |
-| batched KV scatter | [kernels/kv_cache.py](../hydraserve/kernels/kv_cache.py) | 每个请求一个 program 把 K/V 写进其物理页;批量化让一次 launch 覆盖整批,实测比逐请求 launch 快 10-43×(batch 8-32,微基准) |
-| Paged decode attention | [kernels/paged_attention.py](../hydraserve/kernels/paged_attention.py) | §3 已述 |
-| AWQ INT4 GEMM | [kernels/awq.py](../hydraserve/kernels/awq.py) | §5 详述 |
-| FP8 GEMM | [kernels/fp8.py](../hydraserve/kernels/fp8.py) | §5 详述 |
+#### 4.2.1 RMSNorm([kernels/rmsnorm.py](../hydraserve/kernels/rmsnorm.py),数学 oracle 在 [reference.py:24-32](../hydraserve/kernels/reference.py#L24-L32))
+
+$$y = \frac{x}{\sqrt{\frac{1}{D}\sum_{i=1}^D x_i^2 + \varepsilon}} \odot w$$
+
+参数逐项解释:
+
+| 参数 | 形状 | 含义 |
+|------|------|------|
+| x | [rows, D] | 输入 hidden(D = hidden_size,4096/2560/5120) |
+| w(weight/scale) | [D] | **可学习向量**,逐维缩放:第 i 维的输出被放大/缩小 w_i 倍 |
+| eps | 标量 | 1e-6 小常数,防止整行为零时除零(√0 会 inf) |
+| √mean(x²) | 标量/行 | RMS(Root Mean Square)——注意**不减去均值**,这是与 LayerNorm 的关键区别 |
+
+**为什么用 RMS 而不是 LayerNorm 的方差**:不减去均值少一次规约(省算力),而对
+transformer 而言均值信息在残差连接里仍然保留,后续权重矩阵能吸收这个偏移,效果
+几乎无差(LLaMA 系的共同选择)。
+
+**zero-centered 变体(默认,`zero_centered=True`)**:checkpoint 里存的 w' 是
+**增量**而不是缩放本身,运行时 `scale = 1 + w'`。动机:训练端 w' 初始化 0 → 层
+初始化为恒等映射 y=x,残差结构收敛更稳——与 LayerNorm 权重初始化为 1 是同一个
+思想,只是参数化方式不同(存增量)。gated 版调用时显式用 `zero_centered=False`
+(见代码),即 post-attention 路径的语义由 checkpoint 决定。
+
+**实现要点**:整行 x 先 `.float()` 升到 FP32 再平方求和(BF16 平方精度不足)、
+`rsqrt` 一次性算出 1/√(·)、乘 w、最后 cast 回原 dtype;每行一个 program,
+`BLOCK = next_power_of_2(D)`,num_warps 随宽度调(≥4096 用 8)。
+
+**gated 变体**:`y = RMSNorm(x, w, zero_centered=False) ⊙ SiLU(gate)`——gate 与
+x 同形状(另一路投影),SiLU(gate) 是逐元素门控(§2.4 的 gate 同一思想)。
+把 RMSNorm 与门控**融合进同一个 kernel**:x 只读写一次显存,省掉中间张量往返。
+
+#### 4.2.2 causal depthwise conv([kernels/gdn.py](../hydraserve/kernels/gdn.py) 的 `_causal_conv_kernel`)
+
+$$\text{out}[t,c] = \text{SiLU}\!\left(\sum_{j=0}^{K-1} w[c,j]\cdot \text{in}[t-K+1+j,\,c]\right)$$
+
+| 参数 | 形状 | 含义 |
+|------|------|------|
+| x(in) | [B, T, C] | 输入(C = channels) |
+| w | [C, K] | 每通道**独立**的 K 长卷积核(K = linear_conv_kernel_dim,4B 为 4) |
+| state | [B, C, K] | 最近 K 个输入的历史,跨 chunk 的载体 |
+
+- **因果性**:token t 只看 `[t−K+1, t]` 窗口;窗口越界的部分(t−K+1+j < 0)
+  从携带的 state 里读——kernel 里用 `tl.where(from_input, value, prior)` 实现;
+- **为什么需要它**:线性注意力/GDN 没有位置编码,conv 提供局部时序平滑与近邻
+  信息(与 Mamba 同思路);SiLU 在 conv 之后激活;
+- 每个 chunk 结束后有第二个小 kernel(`_causal_conv_state_kernel`)把最后 K 个
+  输入写回 state,供下一 chunk 使用。
+
+#### 4.2.3 GDN 递推([kernels/gdn.py](../hydraserve/kernels/gdn.py) 的 `_gdn_recurrent_kernel`)
+
+数学见 §2.4。kernel 视角的要点:grid=(batch, heads, V_d/16),每个 program 负责
+一个 (batch, head, value_block);状态块 `[BLOCK_K, BLOCK_V]`(BLOCK_K =
+next_pow2(key_dim),BLOCK_V=16)载入寄存器后,**整个 token 循环都在片上执行**,
+循环结束才把状态写回显存——循环状态全程驻留 SRAM/寄存器,只在进出时各一次
+显存往返(简历"循环状态驻留 SRAM"的出处)。
+
+#### 4.2.4 batched KV scatter([kernels/kv_cache.py](../hydraserve/kernels/kv_cache.py))
+
+每个请求一个 program,把其 prefill 产出的 K/V 写入自己的物理页(逻辑位置 →
+块表寻址,§3.2)。**批量化** = 一次 launch 覆盖整批请求,避免 batch 次 kernel
+启动与元数据开销:实测比逐请求 launch 快 1.15×/10.25×/42.79×(batch 1/8/32,
+微基准)。
+
+#### 4.2.5 Paged decode attention / AWQ / FP8
+
+Paged decode attention 见 §3;AWQ INT4 GEMM 与 FP8 GEMM 见 §5。
 
 ### 4.3 通用优化手法小结
 
@@ -202,13 +316,26 @@ continuation chunk 需要读物理页历史,走自写 Triton Paged online-softma
 
 ### 5.1 统一视角:权重 = 整数值 × 缩放
 
+$$w[i,j] \approx \big(q[i,j] - z\big[i,\lfloor j/g\rfloor\big]\big)\cdot s\big[i,\lfloor j/g\rfloor\big]$$
+
+参数逐项解释:
+
+| 参数 | 含义 |
+|------|------|
+| q | 量化后的整数(INT4:0~15) |
+| s(scale) | 每组的缩放因子(浮点)——把整数还原到真实量级 |
+| z(zero-point) | **整数 0 对应的原值偏移**。非对称量化:原值域不一定对称,用 z 平移让 0 无损;对称量化 z=0(值域中心就是 0) |
+| g(group_size) | 共享同一对 (s, z) 的输入通道数。g 越小精度越高、缩放参数越多;128 是精度/开销的常用平衡点 |
+
 | 类型 | 存储 | 还原公式 | 粒度 |
 |------|------|---------|------|
 | 对称 INT4 | 4 bit | w ≈ q·s | 每组共享 s |
-| 非对称 INT4(AWQ) | 4 bit + zero-point | w ≈ (q − z)·s | 组粒度(本仓库 group=128) |
+| 非对称 INT4(AWQ) | 4 bit + zero-point | w ≈ (q − z)·s | 组粒度(本仓库 g=128) |
 | FP8 E4M3FN | 1+4+3 bit | 见 §5.3 | 128×128 block-wise scale |
 
-粒度越小精度越好、缩放参数越多;128 是精度/开销的常用平衡点。
+以 g=128 为例:权重矩阵的每 128 个输入通道共享一个 scale 和一个 zero-point——
+一个 4096×2560 的矩阵需要 4096×(2560/128)= 81,920 个 (s,z) 对,参数开销
+≈ 量化后权重的 6%,换取与 BF16 接近的精度。
 
 ### 5.2 AWQ kernel 拆解([kernels/awq.py](../hydraserve/kernels/awq.py))
 

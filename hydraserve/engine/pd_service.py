@@ -43,7 +43,44 @@ class PDWorkerConfig:
     max_decode_batch_size: int = 64
     kv_quant: str | None = None
     host_prefix_cache_bytes: int = 0
+    transfer_backend: str = "shm-ring"
+    transfer_quant: str | None = None
+    transfer_target_bytes: int = 8 << 20
+    max_inflight_transfer_chunks: int = 2
+    shm_ring_slots: int = 3
+    shm_ring_slot_bytes: int = 64 << 20
     worker_log_dir: str = ""
+
+
+def _make_pd_transfer_backend(config: PDWorkerConfig, namespace: str, model=None):
+    from hydraserve.transfer import (
+        SharedMemoryRingTransferBackend,
+        SharedMemoryTransferBackend,
+        TransferMode,
+    )
+
+    mode = (
+        TransferMode.INT8_TRANSFER
+        if config.transfer_quant == "int8"
+        else TransferMode.FULL_TRANSFER
+    )
+
+    if config.transfer_backend == "shm-ring":
+        slot_bytes = config.shm_ring_slot_bytes
+        if model is not None:
+            slot_bytes = max(
+                slot_bytes,
+                model.recurrent_state_bytes + model.conv_state_bytes + (8 << 20),
+            )
+        return SharedMemoryRingTransferBackend(
+            namespace=namespace,
+            slots=config.shm_ring_slots,
+            slot_bytes=slot_bytes,
+            mode=mode,
+        )
+    if config.transfer_backend == "shm":
+        return SharedMemoryTransferBackend(namespace=namespace, mode=mode)
+    raise ValueError(f"unsupported PD transfer backend: {config.transfer_backend}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +166,6 @@ def _prefill_worker(
         from hydraserve.router import Route
         from hydraserve.transfer import (
             NetworkBootstrapClient,
-            SharedMemoryTransferBackend,
             TransferPipeline,
         )
 
@@ -201,7 +237,9 @@ def _prefill_worker(
             else None
         )
         for worker_index, worker_namespace in enumerate(namespaces):
-            backend = SharedMemoryTransferBackend(namespace=worker_namespace)
+            backend = _make_pd_transfer_backend(
+                config, worker_namespace, model=runtime.config
+            )
             backends.append(backend)
             # ``dst_gpu`` is a logical mailbox id (decode index + 1) shared by
             # every prefill worker and the matching decode worker; it is not
@@ -313,6 +351,9 @@ def _prefill_worker(
                                 command.get("streamed_transfer", False)
                             ),
                             reuse_host_kv=bool(command.get("host_cache_hit", False)),
+                            host_prefix_tokens=int(command.get("host_prefix_tokens", 0)),
+                            transfer_target_bytes=config.transfer_target_bytes,
+                            max_inflight_chunks=config.max_inflight_transfer_chunks,
                         )
                     finally:
                         cache.free(request_id)
@@ -584,6 +625,7 @@ def _decode_worker(
 
         sys.stderr = open(stderr_path, "a", buffering=1)
     backend = None
+    prepare_executor = None
     try:
         import torch
 
@@ -602,7 +644,6 @@ def _decode_worker(
         from hydraserve.model.runtime import QwenTextRuntime
         from hydraserve.transfer import (
             NetworkBootstrapClient,
-            SharedMemoryTransferBackend,
             TransferPipeline,
         )
 
@@ -668,14 +709,17 @@ def _decode_worker(
             memory_plan=memory_plan,
             kv_quant=config.kv_quant,
         )
-        backend = SharedMemoryTransferBackend(namespace=namespace)
+        backend = _make_pd_transfer_backend(config, namespace, model=runtime.config)
         bootstrap = (
             NetworkBootstrapClient(bootstrap_address)
             if bootstrap_address is not None
             else None
         )
         host_cache = (
-            HostPrefixCache(config.host_prefix_cache_bytes)
+            HostPrefixCache(
+                config.host_prefix_cache_bytes,
+                block_size=config.block_size,
+            )
             if config.host_prefix_cache_bytes > 0
             else None
         )
@@ -689,6 +733,9 @@ def _decode_worker(
             ),
             cache,
             host_cache=host_cache,
+        )
+        prepare_executor = ThreadPoolExecutor(
+            max_workers=config.max_inflight_transfer_chunks
         )
         requests = {}
         states = {}
@@ -707,17 +754,31 @@ def _decode_worker(
         from threading import Lock as _ThreadLock
 
         state_lock = _ThreadLock()
+        host_reservations = {}
+        preparing = set()
 
         def capacity_payload():
             with state_lock:
                 capacity = cache.block_manager.capacity()
                 live = len(set(states) | reservations)
+            cache_stats = {**cache.stats(), **state_pool.stats()}
+            if host_cache is not None:
+                host_stats = host_cache.stats()
+                cache_stats.update(
+                    {
+                        "host_prefix_entries": host_stats.entries,
+                        "host_prefix_bytes": host_stats.bytes_used,
+                        "host_prefix_hits": host_stats.hits,
+                        "host_prefix_misses": host_stats.misses,
+                        "host_prefix_evictions": host_stats.evictions,
+                    }
+                )
             return {
                 "kv_total_blocks": capacity.total_blocks,
                 "kv_free_blocks": capacity.free_blocks,
                 "state_total_slots": state_capacity,
                 "state_free_slots": max(0, state_capacity - live),
-                "kv_cache_stats": {**cache.stats(), **state_pool.stats()},
+                "kv_cache_stats": cache_stats,
             }
 
         responses.put(
@@ -731,15 +792,28 @@ def _decode_worker(
                     live_ids = tuple(set(states) | reservations)
                 for request_id in live_ids:
                     cache.free(request_id)
+                if host_cache is not None:
+                    for request_id, lease in tuple(host_reservations.items()):
+                        if request_id in preparing:
+                            continue
+                        host_cache.unpin(lease)
+                        host_reservations.pop(request_id, None)
                 responses.put({"op": "shutdown"})
                 return
             try:
                 if operation == "reserve":
                     request_id = command["request_id"]
-                    host_cache_hit = bool(
-                        host_cache is not None
-                        and host_cache.contains(runtime.config.name, command["token_ids"])
+                    host_prefix_tokens = (
+                        host_cache.longest_prefix_tokens(
+                            runtime.config.name, command["token_ids"]
+                        )
+                        if host_cache is not None
+                        else 0
                     )
+                    existing_lease = host_reservations.get(request_id)
+                    if existing_lease is not None:
+                        host_prefix_tokens = existing_lease.matched_tokens
+                    host_cache_hit = host_prefix_tokens == len(command["token_ids"])
                     total_tokens = len(command["token_ids"]) + max(
                         0, command["max_new_tokens"] - 1
                     )
@@ -767,6 +841,7 @@ def _decode_worker(
                                 "request_id": request_id,
                                 "admitted": True,
                                 "host_cache_hit": host_cache_hit,
+                                "host_prefix_tokens": host_prefix_tokens,
                                 **capacity_payload(),
                             }
                         )
@@ -803,17 +878,29 @@ def _decode_worker(
                             continue
                         with state_lock:
                             reservations.add(request_id)
+                        if host_cache is not None and host_prefix_tokens:
+                            lease = host_cache.pin(
+                                runtime.config.name, command["token_ids"]
+                            )
+                            host_prefix_tokens = lease.matched_tokens
+                            host_cache_hit = host_prefix_tokens == len(
+                                command["token_ids"]
+                            )
+                            if host_prefix_tokens:
+                                host_reservations[request_id] = lease
                         responses.put(
                             {
                                 "op": "admission",
                                 "request_id": request_id,
-                                    "admitted": True,
-                                    "host_cache_hit": host_cache_hit,
+                                "admitted": True,
+                                "host_cache_hit": host_cache_hit,
+                                "host_prefix_tokens": host_prefix_tokens,
                                 **capacity_payload(),
                             }
                         )
                 elif operation == "prepare":
                     request_id = command["request_id"]
+                    host_lease = host_reservations.get(request_id)
                     request = _request(
                         request_id,
                         command["token_ids"],
@@ -824,11 +911,14 @@ def _decode_worker(
 
                     # Overlap the transfer/install (SHM receive, KV install,
                     # N-1 replay) with the decode loop: other requests keep
-                    # decoding while this one's state lands. GPU ops serialize
-                    # on the default stream, so decode steps interleave
-                    # between install kernels instead of blocking behind the
-                    # whole receive window.
-                    def prepare_in_background():
+                    # decoding on the default stream while this request lands
+                    # on DecodeWorker's dedicated install stream.
+                    def prepare_in_background(
+                        request=request,
+                        request_id=request_id,
+                        command=command,
+                        host_lease=host_lease,
+                    ):
                         try:
                             prepared = worker.receive_and_prepare(
                                 request,
@@ -838,6 +928,10 @@ def _decode_worker(
                                 streamed_transfer=bool(
                                     command.get("streamed_transfer", False)
                                 ),
+                                host_prefix_tokens=int(
+                                    command.get("host_prefix_tokens", 0)
+                                ),
+                                host_match=host_lease,
                             )
                             with state_lock:
                                 requests[request_id] = request
@@ -860,10 +954,24 @@ def _decode_worker(
                                     "message": repr(exc),
                                 }
                             )
+                        finally:
+                            with state_lock:
+                                preparing.discard(request_id)
+                            lease = host_reservations.pop(request_id, None)
+                            if lease is not None and host_cache is not None:
+                                host_cache.unpin(lease)
 
-                    from threading import Thread as _Thread
-
-                    _Thread(target=prepare_in_background, daemon=True).start()
+                    with state_lock:
+                        preparing.add(request_id)
+                    try:
+                        prepare_executor.submit(prepare_in_background)
+                    except Exception:
+                        with state_lock:
+                            preparing.discard(request_id)
+                        lease = host_reservations.pop(request_id, None)
+                        if lease is not None and host_cache is not None:
+                            host_cache.unpin(lease)
+                        raise
                 elif operation == "collocated_prepare":
                     request_id = command["request_id"]
                     if request_id not in reservations:
@@ -997,21 +1105,33 @@ def _decode_worker(
                 elif operation == "release":
                     request_id = command["request_id"]
                     with state_lock:
+                        is_preparing = request_id in preparing
                         reservations.discard(request_id)
                         states.pop(request_id, None)
                         state_pool.free(request_id)
                         requests.pop(request_id, None)
+                    if not is_preparing:
+                        lease = host_reservations.pop(request_id, None)
+                        if lease is not None and host_cache is not None:
+                            host_cache.unpin(lease)
                     cache.free(request_id)
                     responses.put(
                         {"op": "release", "request_id": request_id, **capacity_payload()}
                     )
                 elif operation == "prefix_probe":
                     match = cache.probe_prefix(command["token_ids"])
+                    host_matched = (
+                        host_cache.longest_prefix_tokens(
+                            runtime.config.name, command["token_ids"]
+                        )
+                        if host_cache is not None
+                        else 0
+                    )
                     responses.put(
                         {
                             "op": "prefix_probe",
                             "request_id": command["request_id"],
-                            "matched_tokens": match.matched_tokens,
+                            "matched_tokens": max(match.matched_tokens, host_matched),
                             **capacity_payload(),
                         }
                     )
@@ -1035,6 +1155,8 @@ def _decode_worker(
     except Exception as exc:
         responses.put({"op": "startup_error", "message": repr(exc)})
     finally:
+        if prepare_executor is not None:
+            prepare_executor.shutdown(wait=True, cancel_futures=True)
         if backend is not None:
             backend.close()
 
@@ -1060,12 +1182,20 @@ class DisaggregatedGenerationBackend:
             config.max_state_slots,
             config.max_decode_batch_size,
             config.prefix_cache_min_frequency,
+            config.transfer_target_bytes,
+            config.max_inflight_transfer_chunks,
+            config.shm_ring_slots,
+            config.shm_ring_slot_bytes,
         ) <= 0:
             raise ValueError("cache limits must be positive")
         if config.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
         if config.host_prefix_cache_bytes < 0:
             raise ValueError("host prefix cache bytes cannot be negative")
+        if config.transfer_backend not in {"shm-ring", "shm"}:
+            raise ValueError("transfer_backend must be shm-ring or shm")
+        if config.transfer_quant not in {None, "int8"}:
+            raise ValueError("transfer_quant must be None or int8")
         if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
             raise ValueError("invalid worker recovery policy")
         total_blocks = (
@@ -1100,6 +1230,7 @@ class DisaggregatedGenerationBackend:
         self._closed = False
         self._prefill_lock = Lock()
         self._decode_lock = Lock()
+        self._pd_executor = ThreadPoolExecutor(max_workers=4)
         self._recovery_lock = RLock()
         self._recovery_stop = Event()
         self._prefill_healthy = True
@@ -1117,7 +1248,7 @@ class DisaggregatedGenerationBackend:
         self._admitted_requests: set[int] = set()
         self._lost_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
-        self._host_cache_hits: set[int] = set()
+        self._host_prefix_tokens: dict[int, int] = {}
         self._last_capacity: BackendCapacity | None = None
         self._last_cache_stats: dict[str, int | float] = {}
         self._replay_mismatches = 0
@@ -1167,10 +1298,9 @@ class DisaggregatedGenerationBackend:
             if result.get("admitted"):
                 self._admitted_requests.add(request.request_id)
                 self._reserved_blocks[request.request_id] = required_blocks
-                if result.get("host_cache_hit"):
-                    self._host_cache_hits.add(request.request_id)
-                else:
-                    self._host_cache_hits.discard(request.request_id)
+                self._host_prefix_tokens[request.request_id] = int(
+                    result.get("host_prefix_tokens", 0)
+                )
                 if request.route is None:
                     request.route = Route.PD_DISAGGREGATED.value
                     request.route_reason = "fixed_pd"
@@ -1192,7 +1322,8 @@ class DisaggregatedGenerationBackend:
         return self._prefill_pd(request)
 
     def _prefill_pd(self, request: ServingRequest) -> int | TokenSample:
-        host_cache_hit = request.request_id in self._host_cache_hits
+        host_prefix_tokens = self._host_prefix_tokens.get(request.request_id, 0)
+        host_cache_hit = host_prefix_tokens == len(request.token_ids)
         command = {
             "op": "prefill",
             "request_id": request.request_id,
@@ -1204,26 +1335,26 @@ class DisaggregatedGenerationBackend:
                 and os.environ.get("HYDRASERVE_CHUNKED_TRANSFER", "1") != "0"
             ),
             "host_cache_hit": host_cache_hit,
+            "host_prefix_tokens": host_prefix_tokens,
         }
         # Start decode-side manifest/chunk receive before prefill compute. The
         # transfer and KV installation then progress chunk-by-chunk while the
         # prefill GPU produces later chunks.
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            prefill_future = executor.submit(
-                self._prefill_rpc, command, request.request_id
-            )
-            prepare_future = executor.submit(
-                self._decode_rpc,
-                {
-                    **command,
-                    "op": "prepare",
-                    "timeout": self.operation_timeout,
-                },
-                "prepare",
-                request.request_id,
-            )
-            result = prefill_future.result()
-            prepared = prepare_future.result()
+        prefill_future = self._pd_executor.submit(
+            self._prefill_rpc, command, request.request_id
+        )
+        prepare_future = self._pd_executor.submit(
+            self._decode_rpc,
+            {
+                **command,
+                "op": "prepare",
+                "timeout": self.operation_timeout,
+            },
+            "prepare",
+            request.request_id,
+        )
+        result = prefill_future.result()
+        prepared = prepare_future.result()
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         if not prepared.get("replay_consistent", True):
@@ -1321,7 +1452,7 @@ class DisaggregatedGenerationBackend:
             known = request_id in self._admitted_requests
             self._admitted_requests.discard(request_id)
             self._reserved_blocks.pop(request_id, None)
-            self._host_cache_hits.discard(request_id)
+            self._host_prefix_tokens.pop(request_id, None)
             self._lost_requests.discard(request_id)
         if not known:
             return
@@ -1380,6 +1511,7 @@ class DisaggregatedGenerationBackend:
         with self._decode_lock:
             self._admitted_requests.discard(request_id)
             self._reserved_blocks.pop(request_id, None)
+            self._host_prefix_tokens.pop(request_id, None)
             self._lost_requests.discard(request_id)
 
     def is_recoverable_decode_error(
@@ -1632,6 +1764,7 @@ class DisaggregatedGenerationBackend:
         if self._bootstrap_server is not None:
             self._bootstrap_server.close()
             self._bootstrap_server = None
+        self._pd_executor.shutdown(wait=not force, cancel_futures=force)
 
     @staticmethod
     def _get(queue, timeout: float):

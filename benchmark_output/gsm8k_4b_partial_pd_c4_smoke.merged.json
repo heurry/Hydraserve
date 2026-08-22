@@ -1,0 +1,63 @@
+{
+  "name": "smoke-test",
+  "dp": {
+    "label": "dp",
+    "requests": 16,
+    "succeeded": 16,
+    "failed": 0,
+    "wall_time_s": 3.0,
+    "request_throughput": 5.273,
+    "output_token_throughput": 42.18,
+    "ttft_ms": {
+      "p50": 280.3,
+      "p95": 1122.0,
+      "p99": 1242.4
+    },
+    "tpot_ms": {
+      "p50": 58.7,
+      "p95": 168.9,
+      "p99": 187.6
+    },
+    "latency_ms": {
+      "p50": 998.9,
+      "p95": 1625.8,
+      "p99": 1625.8
+    },
+    "prompt_tokens": {
+      "p50": 63.0,
+      "p95": 110.0,
+      "p99": 110.0
+    },
+    "route_counts": {}
+  },
+  "pd": {
+    "label": "pd",
+    "requests": 8,
+    "succeeded": 8,
+    "failed": 0,
+    "wall_time_s": 2.8,
+    "request_throughput": 2.831,
+    "output_token_throughput": 22.65,
+    "ttft_ms": {
+      "p50": 679.8,
+      "p95": 1092.5,
+      "p99": 1184.8
+    },
+    "tpot_ms": {
+      "p50": 67.9,
+      "p95": 88.1,
+      "p99": 88.9
+    },
+    "latency_ms": {
+      "p50": 1171.7,
+      "p95": 1658.8,
+      "p99": 1796.8
+    },
+    "prompt_tokens": {
+      "p50": 63.0,
+      "p95": 108.6,
+      "p99": 109.7
+    },
+    "route_counts": {}
+  }
+}

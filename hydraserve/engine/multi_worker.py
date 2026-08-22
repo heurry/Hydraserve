@@ -62,6 +62,12 @@ class PDClusterConfig:
     max_decode_batch_size_per_worker: int = 64
     kv_quant: str | None = None
     host_prefix_cache_bytes: int = 0
+    transfer_backend: str = "shm-ring"
+    transfer_quant: str | None = None
+    transfer_target_bytes: int = 8 << 20
+    max_inflight_transfer_chunks: int = 2
+    shm_ring_slots: int = 3
+    shm_ring_slot_bytes: int = 64 << 20
     worker_log_dir: str = ""
     pd_schedule: str = "round-robin"
 
@@ -95,12 +101,20 @@ class PDClusterConfig:
             self.max_decode_batch_size_per_worker,
             self.prefill_chunk_size,
             self.prefix_cache_min_frequency,
+            self.transfer_target_bytes,
+            self.max_inflight_transfer_chunks,
+            self.shm_ring_slots,
+            self.shm_ring_slot_bytes,
         ) <= 0:
             raise ValueError("cluster resource limits must be positive")
         if self.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
         if self.host_prefix_cache_bytes < 0:
             raise ValueError("host prefix cache bytes cannot be negative")
+        if self.transfer_backend not in {"shm-ring", "shm"}:
+            raise ValueError("transfer_backend must be shm-ring or shm")
+        if self.transfer_quant not in {None, "int8"}:
+            raise ValueError("transfer_quant must be None or int8")
         total_blocks = (
             self.cache_tokens_per_worker + self.block_size - 1
         ) // self.block_size
@@ -132,6 +146,12 @@ class PDClusterConfig:
             kv_headroom_blocks=self.kv_headroom_blocks,
             kv_quant=self.kv_quant,
             host_prefix_cache_bytes=self.host_prefix_cache_bytes,
+            transfer_backend=self.transfer_backend,
+            transfer_quant=self.transfer_quant,
+            transfer_target_bytes=self.transfer_target_bytes,
+            max_inflight_transfer_chunks=self.max_inflight_transfer_chunks,
+            shm_ring_slots=self.shm_ring_slots,
+            shm_ring_slot_bytes=self.shm_ring_slot_bytes,
         )
 
     def prefill_config(self, index: int) -> PDWorkerConfig:
@@ -156,6 +176,12 @@ class PDClusterConfig:
             kv_headroom_blocks=self.kv_headroom_blocks,
             kv_quant=self.kv_quant,
             host_prefix_cache_bytes=self.host_prefix_cache_bytes,
+            transfer_backend=self.transfer_backend,
+            transfer_quant=self.transfer_quant,
+            transfer_target_bytes=self.transfer_target_bytes,
+            max_inflight_transfer_chunks=self.max_inflight_transfer_chunks,
+            shm_ring_slots=self.shm_ring_slots,
+            shm_ring_slot_bytes=self.shm_ring_slot_bytes,
         )
 
 
@@ -279,8 +305,9 @@ class MultiWorkerGenerationBackend:
         ]
         self._route_decisions: dict[int, RouteDecision] = {}
         self._lost_requests: set[int] = set()
-        self._host_cache_hits: set[int] = set()
+        self._host_prefix_tokens: dict[int, int] = {}
         self._state_lock = RLock()
+        self._pd_executor = ThreadPoolExecutor(max_workers=max(4, 2 * prefill_count))
         self._prefill_healthy = [True] * prefill_count
         self._prefill_pending = [0] * prefill_count
         self._closed = False
@@ -501,31 +528,32 @@ class MultiWorkerGenerationBackend:
             return token_id
         command = self._request_command("prefill", request)
         command["worker_index"] = worker_id
-        host_cache_hit = request.request_id in getattr(
-            self, "_host_cache_hits", set()
+        host_prefix_tokens = getattr(self, "_host_prefix_tokens", {}).get(
+            request.request_id, 0
         )
+        host_cache_hit = host_prefix_tokens == len(request.token_ids)
         command["streamed_transfer"] = (
             not host_cache_hit
             and os.environ.get("HYDRASERVE_CHUNKED_TRANSFER", "1") != "0"
         )
         command["host_cache_hit"] = host_cache_hit
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            prefill_future = executor.submit(
-                self._prefill_rpc, command, request.request_id
-            )
-            prepare_future = executor.submit(
-                self._decode_rpc,
-                worker_id,
-                {
-                    **command,
-                    "op": "prepare",
-                    "timeout": self.operation_timeout,
-                },
-                "prepare",
-                request.request_id,
-            )
-            result = prefill_future.result()
-            prepared = prepare_future.result()
+        command["host_prefix_tokens"] = host_prefix_tokens
+        prefill_future = self._pd_executor.submit(
+            self._prefill_rpc, command, request.request_id
+        )
+        prepare_future = self._pd_executor.submit(
+            self._decode_rpc,
+            worker_id,
+            {
+                **command,
+                "op": "prepare",
+                "timeout": self.operation_timeout,
+            },
+            "prepare",
+            request.request_id,
+        )
+        result = prefill_future.result()
+        prepared = prepare_future.result()
         if result.get("worker_index") != worker_id:
             raise RuntimeError("prefill worker returned a different decode target")
         if result["token_id"] != prepared["token_id"]:
@@ -675,7 +703,7 @@ class MultiWorkerGenerationBackend:
         finally:
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
-                getattr(self, "_host_cache_hits", set()).discard(request_id)
+                getattr(self, "_host_prefix_tokens", {}).pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
                 self._lost_requests.discard(request_id)
 
@@ -840,6 +868,7 @@ class MultiWorkerGenerationBackend:
         if self._bootstrap_server is not None:
             self._bootstrap_server.close()
             self._bootstrap_server = None
+        self._pd_executor.shutdown(wait=not force, cancel_futures=force)
 
     def _reserve_on(
         self, worker_id: int, request: ServingRequest
@@ -855,12 +884,9 @@ class MultiWorkerGenerationBackend:
                 self._reserved_blocks[worker_id][request.request_id] = self._required_blocks(
                     request
                 )
-                if result.get("host_cache_hit"):
-                    getattr(self, "_host_cache_hits", set()).add(request.request_id)
-                else:
-                    getattr(self, "_host_cache_hits", set()).discard(
-                        request.request_id
-                    )
+                getattr(self, "_host_prefix_tokens", {})[request.request_id] = int(
+                    result.get("host_prefix_tokens", 0)
+                )
             return AdmissionDecision.accept()
         if result.get("retryable"):
             return AdmissionDecision.defer(

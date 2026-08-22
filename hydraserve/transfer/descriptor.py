@@ -30,6 +30,7 @@ def compute_head_slice_params(
 class TransferMode(str, Enum):
     FULL_TRANSFER = "full"
     QUANTIZED_TRANSFER = "quant"
+    INT8_TRANSFER = "int8"
     PARTIAL_TRANSFER = "partial"
     INTRA_GPU = "intra"
 
@@ -74,8 +75,8 @@ class RegionDescriptor:
         if self.region_type in {RegionType.LINEAR_SSM, RegionType.LINEAR_CONV}:
             if self.dtype != "float32" or self.quantized:
                 raise ValueError("linear recurrent state must be unquantized float32")
-        if self.quantized and self.dtype != "int4":
-            raise ValueError("a quantized region must declare dtype='int4'")
+        if self.quantized and self.dtype not in {"int4", "int8"}:
+            raise ValueError("a quantized region must declare dtype int4 or int8")
         if self.src_gpu < 0 or self.dst_gpu < 0 or self.src_gpu == self.dst_gpu:
             raise ValueError("source and destination must be distinct non-negative GPU ids")
         if self.tp_world_size <= 0:
@@ -120,6 +121,7 @@ class StateTransferDescriptor:
     streamed_kv: bool = False
     kv_chunk_ranges: tuple[tuple[int, int], ...] = ()
     host_cache_hit: bool = False
+    host_prefix_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.request_id < 0 or self.prompt_length <= 0 or not self.model_name:
@@ -135,10 +137,12 @@ class StateTransferDescriptor:
         kv_regions = [r for r in self.regions if r.region_type is RegionType.FULL_ATTN_KV]
         if self.mode is TransferMode.PARTIAL_TRANSFER and kv_regions:
             raise ValueError("partial transfer cannot include full-attention KV")
-        if self.mode is TransferMode.QUANTIZED_TRANSFER:
+        if self.mode in {TransferMode.QUANTIZED_TRANSFER, TransferMode.INT8_TRANSFER}:
             if not kv_regions or any(not region.quantized for region in kv_regions):
-                raise ValueError("quantized transfer requires INT4 KV regions")
-        previous = 0
+                raise ValueError("quantized transfer requires quantized KV regions")
+        if not 0 <= self.host_prefix_tokens <= self.prompt_length:
+            raise ValueError("host_prefix_tokens must be within the prompt")
+        previous = self.host_prefix_tokens
         for start, end in self.kv_chunk_ranges:
             if start != previous or end <= start or end > self.prompt_length:
                 raise ValueError("KV chunk ranges must be contiguous and within the prompt")
@@ -147,7 +151,7 @@ class StateTransferDescriptor:
             if self.mode is TransferMode.PARTIAL_TRANSFER or not kv_regions:
                 raise ValueError("streamed KV requires a KV transfer region")
             if not self.kv_chunk_ranges or previous != self.prompt_length:
-                raise ValueError("streamed KV chunks must cover the complete prompt")
+                raise ValueError("streamed KV chunks must cover the uncached suffix")
         elif self.kv_chunk_ranges:
             raise ValueError("KV chunk ranges require streamed_kv=True")
         if self.host_cache_hit:
@@ -155,6 +159,12 @@ class StateTransferDescriptor:
                 raise ValueError("host KV restore cannot also stream or recompute KV")
             if not kv_regions:
                 raise ValueError("host KV restore requires a KV region descriptor")
+            if self.host_prefix_tokens != self.prompt_length:
+                raise ValueError("host_cache_hit requires the complete prompt")
+        elif self.host_prefix_tokens == self.prompt_length:
+            raise ValueError("a complete host prefix must set host_cache_hit")
+        elif self.host_prefix_tokens and not self.streamed_kv:
+            raise ValueError("a partial host prefix requires streamed suffix KV")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -168,6 +178,7 @@ class StateTransferDescriptor:
             "streamed_kv": self.streamed_kv,
             "kv_chunk_ranges": [list(item) for item in self.kv_chunk_ranges],
             "host_cache_hit": self.host_cache_hit,
+            "host_prefix_tokens": self.host_prefix_tokens,
         }
 
     @classmethod
@@ -186,4 +197,5 @@ class StateTransferDescriptor:
                 for item in data.get("kv_chunk_ranges", ())
             ),
             host_cache_hit=bool(data.get("host_cache_hit", False)),
+            host_prefix_tokens=int(data.get("host_prefix_tokens", 0)),
         )
