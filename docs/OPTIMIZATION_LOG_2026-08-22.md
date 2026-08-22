@@ -1032,7 +1032,8 @@ Triton CUDA 回归均通过。
 - #4 修正 `paged_flash_prefill`：FlashAttention 直接接收物理
   `[num_blocks, block_size, kv_heads, dim]` cache 和 int32 block table，删除此前会复制整个 cache 的
   `unsqueeze/expand/contiguous`。首 chunk 走 varlen FA，所有 continuation chunks 走 paged FA。
-  当前环境未安装 `flash-attn`，实际 kernel 测试 skip，物理 cache 零复制传参由 GPU mock 测试覆盖。
+  后续已安装 `flash-attn 2.8.3.post1`，varlen、物理 cache 零复制和 paged output 数值对照三条
+  RTX 3090 CUDA 测试全部通过；完整安装与 A/B 见第 20 节。
 
 ### 19.2 PD 流水线（#5-7、#12）
 
@@ -1088,8 +1089,8 @@ TTFT P50 改善 38.7%。只有两条 measured 请求，TPOT 差异包含 worker/
 
 ### 19.5 最终回归与单卡稳态
 
-- 全仓：**297 collected**，通过（硬件/可选依赖项按 marker skip）。
-- CUDA/Triton：**42 passed，1 skipped**。
+- 全仓：**299 collected**，通过（硬件/可选依赖项按 marker skip）。
+- CUDA/Triton：**43 passed，1 skipped**；FlashAttention 定向测试 **3 passed**。
 - 真实 1P1D smoke：1 request succeeded，0 failed，证明 bootstrap + chunk receive/install + N-1
   replay 无死锁。
 - 单卡第二次稳态：C1 **71.529 tok/s**、TTFT P50 24.70 ms、TPOT P50 12.91 ms；C4
@@ -1106,3 +1107,65 @@ TTFT P50 改善 38.7%。只有两条 measured 请求，TPOT 差异包含 worker/
 - `2026-08-22_gsm8k_4b_c1_all14_final_run2.json`
 - `2026-08-22_gsm8k_4b_c4_all14_final.json`
 - `2026-08-22_gsm8k_4b_c4_all14_final_run2.json`
+
+## 20. FlashAttention 安装、兼容修复与真实 A/B
+
+### 20.1 安装过程与问题
+
+目标环境为 Python 3.12、Torch 2.9.1+cu128、CUDA 12.8、RTX 3090。PyPI 没有匹配该组合的
+预编译 wheel，因此 `flash-attn 2.8.3.post1` 必须从源码构建。首次构建虽然设置了
+`FLASH_ATTN_CUDA_ARCHS=80 MAX_JOBS=4`，但直接调用 deepseek 环境中的绝对 `pip` 路径不会把
+该环境的 `bin` 加入 `PATH`；PyTorch 因而找不到已安装的 ninja，静默退化成单进程编译。
+
+排查依据：构建树中没有 ninja，只有一个 nvcc/cicc；`is_ninja_available()` 返回 false。停止该次
+构建、显式 `activate deepseek` 后，`is_ninja_available()` 返回 true，进程树显示
+`ninja -v -j 4`。SM80 的主 attention 与 split-KV 共约 72 个 CUDA 对象，四路构建期间仍有
+40 GiB 左右可用内存，最终成功生成并安装 57 MB wheel。
+
+安装命令：
+
+```bash
+source /home/xdu/anaconda3/bin/activate deepseek
+FLASH_ATTN_CUDA_ARCHS=80 MAX_JOBS=4 \
+  pip install 'flash-attn==2.8.3.post1' --no-build-isolation
+```
+
+ABI 验证：`flash-attn 2.8.3.post1` 可在 Torch 2.9.1+cu128 中导入，GPU 为 RTX 3090。
+
+### 20.2 真实 kernel 与端到端兼容修复
+
+新增真实 `paged_flash_prefill` 测试使用 256-token page、乱序物理 block table 和 GQA 4Q/2KV
+heads，将 FlashAttention 输出与 FP32 `causal_gqa_attention` oracle 对照；连同 varlen smoke、
+零复制传参测试全部通过。
+
+第一次端到端基准在 warmup 报错：`block_t must be a power of two and a multiple of block_size`。
+原因不是 FlashAttention，而是其 paged KV 要求 page size 256，HydraServe decode split-K 默认
+`block_t=64`。修复为默认 `block_t=max(64, block_size)`，显式传入非法 tile 仍报错；新增
+256-page decode 与 reference 对照测试。最终定向 GPU 回归为 **4 passed**。
+
+安装后全仓 GPU 回归还暴露出 tiny CPU oracle 为 FP32、GPU runtime 按设计返回 BF16，而测试要求
+dtype 完全相同；断言改为 `check_dtype=False`，原有 2e-2 数值容差保持不变。最终全仓
+**299 tests collected** 并通过。
+
+### 20.3 Qwen3.5-4B 最终 A/B
+
+统一口径：单卡 GPU 0、BF16、Graph off、4 条 1024-token synthetic prompt、chunk 256、page 256、
+2 条 warmup、每条 16 output tokens、C1。第一次 Flash-off 短测受首次 Triton 256-tile 编译污染，
+原始文件保留但不用于结论；先热 cache 后完成最终 A/B。
+
+| 模式 | output tok/s | TTFT P50 | TPOT P50 | latency P50 | failed |
+|---|---:|---:|---:|---:|---:|
+| FlashAttention off | 37.533 | 212.03 ms | 14.065 ms | 422.73 ms | 0 |
+| FlashAttention on | **38.416** | **201.52 ms** | 14.080 ms | **413.21 ms** | 0 |
+| 变化 | **+2.35%** | **-4.96%** | +0.11% | **-2.25%** | — |
+
+结论：该 workload 的收益集中在长 prompt prefill/TTFT；decode TPOT 持平。4 条 measured 仍是小样本，
+应在生产 prompt 长度分布和并发下复测，不能把 2.35% 外推为所有数据集的固定收益。
+
+新增结果：
+
+- `2026-08-22_synthetic1024_4b_flash_ab_off.json`（首次 256-tile 编译污染，排除）
+- `2026-08-22_synthetic1024_4b_flash_ab_off_run2.json`（2×2-token 热态复核）
+- `2026-08-22_synthetic1024_4b_flash_ab_on.json`（2×2-token 热态复核）
+- `2026-08-22_synthetic1024_4b_flash_ab_off_final.json`（最终口径）
+- `2026-08-22_synthetic1024_4b_flash_ab_on_final.json`（最终口径）

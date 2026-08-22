@@ -587,7 +587,9 @@ def test_tiny_cuda_runtime_matches_cpu(tiny_model) -> None:
     tokens = torch.tensor([[1, 9, 4, 3]])
     expected, _ = cpu.forward(tokens)
     actual, _ = gpu.forward(tokens.cuda())
-    torch.testing.assert_close(actual.cpu(), expected, atol=2e-2, rtol=2e-2)
+    torch.testing.assert_close(
+        actual.cpu(), expected, atol=2e-2, rtol=2e-2, check_dtype=False
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

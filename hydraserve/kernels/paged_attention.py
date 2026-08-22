@@ -209,7 +209,7 @@ def paged_attention_splitk(
     sequence_lengths,
     *,
     num_splits: int = 4,
-    block_t: int = 64,
+    block_t: int | None = None,
     num_warps: int = 4,
 ):
     """FlashDecoding-style split-K decode attention over paged KV.
@@ -235,6 +235,11 @@ def paged_attention_splitk(
         raise ValueError("incompatible attention heads or head dimension")
     if block_size & (block_size - 1):
         raise ValueError("block_size must be a power of two")
+    # FlashAttention's paged KV API requires pages of at least 256 tokens.
+    # Keep the fast 64-token decode tile for ordinary pages, but select a
+    # compatible tile automatically when the physical page itself is wider.
+    if block_t is None:
+        block_t = max(64, block_size)
     if block_t & (block_t - 1) or block_t % block_size:
         raise ValueError("block_t must be a power of two and a multiple of block_size")
     if num_splits <= 0 or num_splits & (num_splits - 1):

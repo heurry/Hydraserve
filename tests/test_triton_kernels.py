@@ -376,6 +376,31 @@ def test_triton_paged_attention_splitk_matches_reference(
     torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
 
 
+def test_triton_paged_attention_splitk_supports_flash_page_size() -> None:
+    from hydraserve.kernels.paged_attention import paged_attention_splitk
+
+    torch.manual_seed(31)
+    batch, query_heads, kv_heads, head_dim = 1, 4, 2, 32
+    block_size = 256
+    sequence_lengths = torch.tensor([259], device="cuda", dtype=torch.int32)
+    query = torch.randn(batch, query_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.randn(2, block_size, kv_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = torch.randn_like(key)
+    table = torch.tensor([[1, 0]], device="cuda", dtype=torch.int32)
+
+    expected = reference_paged_attention(query, key, value, table, sequence_lengths)
+    actual = paged_attention_splitk(
+        query,
+        key,
+        value,
+        table,
+        sequence_lengths,
+        num_splits=2,
+    )
+
+    torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.skip(
     reason="tiny-model CUDA decode hits a device assert that poisons the CUDA context for subsequent tests; graph-vs-eager equivalence is verified bit-exact on the real 4B model"

@@ -200,6 +200,22 @@ CUDA Graph 对该单卡短上下文 C1 的收益是 5–7%，不是分析报告�
 需要在高并发、长上下文和 4 卡正式负载上重新测量。不同 block-table 宽度的首次图捕获仍会
 抬高 TTFT 尾部，服务预热策略需要覆盖常用宽度。
 
+## FlashAttention 长 prompt A/B
+
+安装 `flash-attn 2.8.3.post1` 后，使用 Graph off、C1、4 条 1024-token synthetic prompt、
+chunk/page=256、2 warmup、16 output tokens 做热态 A/B。paged KV、varlen GQA 和 reference
+数值对照测试均通过。
+
+| 模式 | output tok/s | TTFT P50 | TPOT P50 | Latency P50 |
+|---|---:|---:|---:|---:|
+| FlashAttention off | 37.533 | 212.03 ms | 14.065 ms | 422.73 ms |
+| FlashAttention on | **38.416** | **201.52 ms** | 14.080 ms | **413.21 ms** |
+| 变化 | **+2.35%** | **-4.96%** | +0.11% | **-2.25%** |
+
+收益集中在 prefill/TTFT，TPOT 基本持平。原始结果：
+`2026-08-22_synthetic1024_4b_flash_ab_off_final.json`、
+`2026-08-22_synthetic1024_4b_flash_ab_on_final.json`。
+
 ## 原始结果
 
 - `2026-08-14_gsm8k_4b_collocated_c1.json`
