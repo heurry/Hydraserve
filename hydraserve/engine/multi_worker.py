@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import multiprocessing as mp
+import os
 from pathlib import Path
 from queue import Empty
 from threading import Event, Lock, RLock, Thread
@@ -60,6 +61,7 @@ class PDClusterConfig:
     topologies: tuple[WorkerTopology, ...] = ()
     max_decode_batch_size_per_worker: int = 64
     kv_quant: str | None = None
+    host_prefix_cache_bytes: int = 0
     worker_log_dir: str = ""
     pd_schedule: str = "round-robin"
 
@@ -97,6 +99,8 @@ class PDClusterConfig:
             raise ValueError("cluster resource limits must be positive")
         if self.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
+        if self.host_prefix_cache_bytes < 0:
+            raise ValueError("host prefix cache bytes cannot be negative")
         total_blocks = (
             self.cache_tokens_per_worker + self.block_size - 1
         ) // self.block_size
@@ -127,6 +131,7 @@ class PDClusterConfig:
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
             kv_headroom_blocks=self.kv_headroom_blocks,
             kv_quant=self.kv_quant,
+            host_prefix_cache_bytes=self.host_prefix_cache_bytes,
         )
 
     def prefill_config(self, index: int) -> PDWorkerConfig:
@@ -150,6 +155,7 @@ class PDClusterConfig:
             prefix_cache_min_frequency=self.prefix_cache_min_frequency,
             kv_headroom_blocks=self.kv_headroom_blocks,
             kv_quant=self.kv_quant,
+            host_prefix_cache_bytes=self.host_prefix_cache_bytes,
         )
 
 
@@ -219,6 +225,15 @@ class MultiWorkerGenerationBackend:
             f"{self.namespace}-decode-{index}" for index in range(worker_count)
         )
         self._context = mp.get_context("spawn")
+        self._bootstrap_server = None
+        self._bootstrap_address = None
+        try:
+            from hydraserve.transfer import BootstrapServer
+
+            self._bootstrap_server = BootstrapServer().start()
+            self._bootstrap_address = self._bootstrap_server.address
+        except PermissionError:
+            self._bootstrap_server = None
         if config.worker_log_dir:
             Path(config.worker_log_dir).mkdir(parents=True, exist_ok=True)
         prefill_count = len(config.prefill_devices)
@@ -264,6 +279,7 @@ class MultiWorkerGenerationBackend:
         ]
         self._route_decisions: dict[int, RouteDecision] = {}
         self._lost_requests: set[int] = set()
+        self._host_cache_hits: set[int] = set()
         self._state_lock = RLock()
         self._prefill_healthy = [True] * prefill_count
         self._prefill_pending = [0] * prefill_count
@@ -485,19 +501,33 @@ class MultiWorkerGenerationBackend:
             return token_id
         command = self._request_command("prefill", request)
         command["worker_index"] = worker_id
-        result = self._prefill_rpc(command, request.request_id)
+        host_cache_hit = request.request_id in getattr(
+            self, "_host_cache_hits", set()
+        )
+        command["streamed_transfer"] = (
+            not host_cache_hit
+            and os.environ.get("HYDRASERVE_CHUNKED_TRANSFER", "1") != "0"
+        )
+        command["host_cache_hit"] = host_cache_hit
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            prefill_future = executor.submit(
+                self._prefill_rpc, command, request.request_id
+            )
+            prepare_future = executor.submit(
+                self._decode_rpc,
+                worker_id,
+                {
+                    **command,
+                    "op": "prepare",
+                    "timeout": self.operation_timeout,
+                },
+                "prepare",
+                request.request_id,
+            )
+            result = prefill_future.result()
+            prepared = prepare_future.result()
         if result.get("worker_index") != worker_id:
             raise RuntimeError("prefill worker returned a different decode target")
-        prepared = self._decode_rpc(
-            worker_id,
-            {
-                **command,
-                "op": "prepare",
-                "timeout": self.operation_timeout,
-            },
-            "prepare",
-            request.request_id,
-        )
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         if not prepared.get("replay_consistent", True):
@@ -645,6 +675,7 @@ class MultiWorkerGenerationBackend:
         finally:
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
+                getattr(self, "_host_cache_hits", set()).discard(request_id)
                 self._route_decisions.pop(request_id, None)
                 self._lost_requests.discard(request_id)
 
@@ -806,6 +837,9 @@ class MultiWorkerGenerationBackend:
             if process.is_alive():
                 process.terminate()
                 process.join(10)
+        if self._bootstrap_server is not None:
+            self._bootstrap_server.close()
+            self._bootstrap_server = None
 
     def _reserve_on(
         self, worker_id: int, request: ServingRequest
@@ -821,6 +855,12 @@ class MultiWorkerGenerationBackend:
                 self._reserved_blocks[worker_id][request.request_id] = self._required_blocks(
                     request
                 )
+                if result.get("host_cache_hit"):
+                    getattr(self, "_host_cache_hits", set()).add(request.request_id)
+                else:
+                    getattr(self, "_host_cache_hits", set()).discard(
+                        request.request_id
+                    )
             return AdmissionDecision.accept()
         if result.get("retryable"):
             return AdmissionDecision.defer(
@@ -1154,6 +1194,7 @@ class MultiWorkerGenerationBackend:
                 self._decode_responses[worker_id],
                 worker_id,
                 self._worker_log_path("decode", worker_id),
+                self._bootstrap_address,
             ),
             name=f"hydraserve-decode-{worker_id}",
         )
@@ -1167,6 +1208,7 @@ class MultiWorkerGenerationBackend:
                 self._prefill_commands[index],
                 self._prefill_responses[index],
                 self._worker_log_path("prefill", index),
+                self._bootstrap_address,
             ),
             name=f"hydraserve-prefill-{index}",
         )

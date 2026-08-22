@@ -369,6 +369,14 @@ class PagedKVCache:
             return key.to(self.dtype), value.to(self.dtype)
         return self.key[slot], self.value[slot]
 
+    def raw_layer_cache(self, layer_index: int):
+        """Return physical storage tensors used to snapshot graph warmups."""
+        slot = self._layer_slot(layer_index)
+        tensors = [self.key[slot], self.value[slot]]
+        if self.kv_quant == "int8":
+            tensors.extend((self.key_scales[slot], self.value_scales[slot]))
+        return tuple(tensors)
+
     def write_decode_batch(
         self,
         request_ids,
@@ -416,27 +424,35 @@ class PagedKVCache:
         if self.kv_quant == "int8":
             key, value, key_scale, value_scale = self._quantize_kv(key, value)
             if self.device.type == "cuda":
-                from hydraserve.kernels.kv_cache import write_paged_kv_batch
+                from hydraserve.kernels.kv_cache import (
+                    write_paged_kv_batch_quantized,
+                )
 
-                write_paged_kv_batch(
-                    key, value, positions, block_table, self.key[slot], self.value[slot]
+                write_paged_kv_batch_quantized(
+                    key,
+                    value,
+                    key_scale,
+                    value_scale,
+                    positions,
+                    block_table,
+                    self.key[slot],
+                    self.value[slot],
+                    self.key_scales[slot],
+                    self.value_scales[slot],
                 )
             else:
-                for row, request_id in enumerate(request_ids):
-                    self.write(
-                        request_id,
-                        layer_index,
-                        positions[row : row + 1],
-                        key[row : row + 1],
-                        value[row : row + 1],
-                    )
-            block_size = self.block_manager.block_size
-            for row in range(batch):
-                logical_block = int(positions[row].item()) // block_size
-                offset = int(positions[row].item()) % block_size
-                physical = int(block_table[row, logical_block].item())
-                self.key_scales[slot, physical, offset] = key_scale[row]
-                self.value_scales[slot, physical, offset] = value_scale[row]
+                logical = torch.div(
+                    positions,
+                    self.block_manager.block_size,
+                    rounding_mode="floor",
+                ).long()
+                offsets = positions.remainder(self.block_manager.block_size).long()
+                rows = torch.arange(batch, device=self.device)
+                physical = block_table[rows, logical].long()
+                self.key[slot, physical, offsets] = key
+                self.value[slot, physical, offsets] = value
+                self.key_scales[slot, physical, offsets] = key_scale
+                self.value_scales[slot, physical, offsets] = value_scale
             return
         if self.device.type == "cuda":
             from hydraserve.kernels.kv_cache import write_paged_kv_batch
@@ -498,7 +514,11 @@ class PagedKVCache:
         return keys.to(self.dtype).contiguous(), values.to(self.dtype).contiguous()
 
     def batch_metadata(
-        self, request_ids: Iterable[int], *, logical_lengths: Iterable[int] | None = None
+        self,
+        request_ids: Iterable[int],
+        *,
+        logical_lengths: Iterable[int] | None = None,
+        bucket_width: bool = False,
     ):
         import torch
 
@@ -506,6 +526,11 @@ class PagedKVCache:
         if not allocations:
             raise ValueError("cannot build empty KV batch metadata")
         width = max(len(allocation.block_ids) for allocation in allocations)
+        if bucket_width:
+            # CUDA Graphs are keyed by table width. Power-of-two buckets keep
+            # nearby sequence lengths on one reusable graph instead of
+            # capturing a new graph at every block boundary.
+            width = 1 << (width - 1).bit_length()
         lengths_override = (
             [allocation.num_tokens for allocation in allocations]
             if logical_lengths is None
@@ -538,9 +563,7 @@ class PagedKVCache:
             raise ValueError(f"layer {layer_index} is not a full-attention layer") from exc
 
     def _bytes_per_block(self) -> int:
-        import torch
-
-        element_size = torch.empty((), dtype=self.dtype).element_size()
+        element_size = self.dtype.itemsize
         if self.kv_quant == "int8":
             # 1 byte per value plus 4 bytes per (token, head) scale.
             return self.model.num_full_attention_layers * self.block_manager.block_size * (

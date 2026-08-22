@@ -39,6 +39,8 @@ class PrefillWorker:
         *,
         n_minus_one: bool = True,
         chunk_size: int = 4096,
+        streamed_transfer: bool = False,
+        reuse_host_kv: bool = False,
     ) -> PrefillResult:
         import torch
 
@@ -61,12 +63,46 @@ class PrefillWorker:
             device=getattr(self.runtime, "input_device", self.runtime.device),
             dtype=torch.long,
         )
+        stream_kv = (
+            streamed_transfer
+            and not reuse_host_kv
+            and self.paged_cache is not None
+            and self.pipeline.backend.transfer_mode is not TransferMode.PARTIAL_TRANSFER
+        )
+        chunk_ranges = tuple(
+            (start, min(start + chunk_size, split))
+            for start in range(0, split, chunk_size)
+        )
+        if use_n_minus_one:
+            chunk_ranges += ((split, split + 1),)
+        if stream_kv:
+            self.pipeline.begin_chunked_send(
+                request.request_id,
+                self.runtime.config,
+                len(request.token_ids),
+                chunk_ranges,
+            )
+
+        def publish_kv_chunk(start, end, _state) -> None:
+            if not stream_kv:
+                return
+            payload = RuntimeStateCodec.extract_kv_range(
+                self.runtime.config,
+                self.paged_cache,
+                request.request_id,
+                start,
+                end,
+                mode=self.pipeline.backend.transfer_mode,
+            )
+            self.pipeline.send_kv_chunk(request.request_id, start, end, payload)
+
         with torch.inference_mode():
             logits, state = self.runtime.prefill(
                 prefix_ids,
                 chunk_size=chunk_size,
                 paged_cache=self.paged_cache,
                 request_id=request.request_id if self.paged_cache is not None else None,
+                chunk_callback=publish_kv_chunk,
             )
         bundle = RuntimeStateCodec.extract(self.runtime.config, state)
         if use_n_minus_one:
@@ -82,7 +118,12 @@ class PrefillWorker:
                     paged_cache=self.paged_cache,
                     request_id=request.request_id if self.paged_cache is not None else None,
                 )
-        if self.pipeline.backend.transfer_mode is not TransferMode.PARTIAL_TRANSFER:
+            publish_kv_chunk(split, split + 1, state)
+        if (
+            self.pipeline.backend.transfer_mode is not TransferMode.PARTIAL_TRANSFER
+            and not stream_kv
+            and not reuse_host_kv
+        ):
             bundle.kv_cache = RuntimeStateCodec.extract_kv(
                 self.runtime.config, self.paged_cache, request.request_id,
                 mode=self.pipeline.backend.transfer_mode,
@@ -102,6 +143,8 @@ class PrefillWorker:
             bundle,
             first_token_id=first_token,
             state_token_count=split,
+            streamed_kv_ranges=chunk_ranges if stream_kv else (),
+            host_cache_hit=reuse_host_kv,
         )
         return PrefillResult(first_token, state, split, sample)
 
@@ -109,10 +152,13 @@ class PrefillWorker:
 class DecodeWorker:
     """GPU worker that recomputes KV for PARTIAL mode and installs transferred state."""
 
-    def __init__(self, runtime, pipeline: TransferPipeline, paged_cache) -> None:
+    def __init__(
+        self, runtime, pipeline: TransferPipeline, paged_cache, host_cache=None
+    ) -> None:
         self.runtime = runtime
         self.pipeline = pipeline
         self.paged_cache = paged_cache
+        self.host_cache = host_cache
 
     def receive_and_prepare(
         self,
@@ -121,6 +167,7 @@ class DecodeWorker:
         timeout: float | None = None,
         preallocated: bool = False,
         chunk_size: int = 4096,
+        streamed_transfer: bool = False,
     ) -> DecodePrepared:
         import torch
 
@@ -143,6 +190,22 @@ class DecodeWorker:
                     reserve_tokens=total_tokens,
                     token_ids=request.token_ids,
                 )
+            received_ranges = ()
+            if streamed_transfer:
+                received_ranges = self.pipeline.begin_chunked_receive(
+                    request.request_id, timeout=timeout
+                )
+                for start, end in received_ranges:
+                    payload = self.pipeline.receive_kv_chunk(
+                        request.request_id, start, end, timeout=timeout
+                    )
+                    RuntimeStateCodec.install_kv_range(
+                        self.runtime.config,
+                        self.paged_cache,
+                        request.request_id,
+                        payload,
+                        start=start,
+                    )
             descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
             token_ids = torch.tensor(
                 [request.token_ids],
@@ -158,14 +221,42 @@ class DecodeWorker:
                         request_id=request.request_id,
                     )
             else:
-                if bundle.kv_cache is None:
+                if descriptor.host_cache_hit:
+                    if self.host_cache is None:
+                        raise RuntimeError("host KV restore requested without HiCache L2")
+                    payload = self.host_cache.get(
+                        self.runtime.config.name, request.token_ids
+                    )
+                    if payload is None:
+                        raise RuntimeError("host KV cache entry disappeared before restore")
+                    RuntimeStateCodec.install_kv(
+                        self.runtime.config,
+                        self.paged_cache,
+                        request.request_id,
+                        payload,
+                    )
+                elif descriptor.streamed_kv:
+                    if tuple(descriptor.kv_chunk_ranges) != tuple(received_ranges):
+                        raise RuntimeError("received KV chunks do not match final descriptor")
+                elif bundle.kv_cache is None:
                     raise RuntimeError("full/quantized transfer did not include KV")
-                RuntimeStateCodec.install_kv(
-                    self.runtime.config,
-                    self.paged_cache,
-                    request.request_id,
-                    bundle.kv_cache,
-                )
+                else:
+                    RuntimeStateCodec.install_kv(
+                        self.runtime.config,
+                        self.paged_cache,
+                        request.request_id,
+                        bundle.kv_cache,
+                    )
+                if self.host_cache is not None and not descriptor.host_cache_hit:
+                    cached = RuntimeStateCodec.extract_kv(
+                        self.runtime.config,
+                        self.paged_cache,
+                        request.request_id,
+                        mode=TransferMode.FULL_TRANSFER,
+                    )
+                    self.host_cache.put(
+                        self.runtime.config.name, request.token_ids, cached
+                    )
             state = RuntimeStateCodec.install(
                 self.runtime.config,
                 descriptor,

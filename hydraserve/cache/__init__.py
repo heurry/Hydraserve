@@ -1,4 +1,5 @@
 from hydraserve.cache.block_manager import BlockAllocation, BlockCapacity, KVBlockManager
+from hydraserve.cache.host_prefix_cache import HostPrefixCache, HostPrefixCacheStats
 from hydraserve.cache.kv_quantizer import Int4Tensor, dequantize_int4, quantize_int4
 from hydraserve.cache.memory_planner import PagedKVMemoryPlan, plan_paged_kv_blocks
 from hydraserve.cache.paged_kv import PagedKVCache
@@ -21,6 +22,8 @@ from hydraserve.cache.state_pool import (
 )
 
 __all__ = [
+    "HostPrefixCache",
+    "HostPrefixCacheStats",
     "BlockAllocation",
     "BlockCapacity",
     "CacheNamespace",

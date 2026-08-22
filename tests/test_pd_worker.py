@@ -4,7 +4,7 @@ import pytest
 
 torch = pytest.importorskip("torch")
 
-from hydraserve.cache import KVBlockManager, PagedKVCache
+from hydraserve.cache import HostPrefixCache, KVBlockManager, PagedKVCache
 from hydraserve.engine import (
     CentralScheduler,
     DecodeWorker,
@@ -95,6 +95,74 @@ def test_quantized_pd_workers_install_kv_without_recompute(tiny_model) -> None:
     target_key, target_value = decode_cache.read(request.request_id, layer)
     torch.testing.assert_close(target_key, source_key, atol=0.15, rtol=0.15)
     torch.testing.assert_close(target_value, source_value, atol=0.15, rtol=0.15)
+
+
+def test_chunked_prefill_streams_and_installs_kv(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    prefill_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    decode_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    pipeline = TransferPipeline(
+        InMemoryTransferBackend(TransferMode.QUANTIZED_TRANSFER)
+    )
+    prefill_cache = PagedKVCache(
+        tiny_model, KVBlockManager(16, 2), device="cpu", dtype=torch.float32
+    )
+    decode_cache = PagedKVCache(
+        tiny_model, KVBlockManager(16, 2), device="cpu", dtype=torch.float32
+    )
+    request = CentralScheduler().submit([2, 4, 6, 8, 10], max_new_tokens=2)
+    result = PrefillWorker(prefill_runtime, pipeline, prefill_cache).process(
+        request, chunk_size=2, streamed_transfer=True
+    )
+    prepared = DecodeWorker(decode_runtime, pipeline, decode_cache).receive_and_prepare(
+        request, streamed_transfer=True
+    )
+    assert prepared.first_token_id == result.first_token_id
+    layer = tiny_model.full_attention_layer_indices[0]
+    source_key, _ = prefill_cache.read(request.request_id, layer)
+    target_key, _ = decode_cache.read(request.request_id, layer)
+    torch.testing.assert_close(target_key, source_key, atol=0.15, rtol=0.15)
+
+
+def test_hicache_restores_repeated_prefix_without_second_kv_transfer(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    prefill_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    decode_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    pipeline = TransferPipeline(InMemoryTransferBackend(TransferMode.FULL_TRANSFER))
+    prefill_cache = PagedKVCache(
+        tiny_model, KVBlockManager(32, 2), device="cpu", dtype=torch.float32
+    )
+    decode_cache = PagedKVCache(
+        tiny_model, KVBlockManager(32, 2), device="cpu", dtype=torch.float32
+    )
+    host_cache = HostPrefixCache(1 << 20)
+    decode_worker = DecodeWorker(
+        decode_runtime, pipeline, decode_cache, host_cache=host_cache
+    )
+    tokens = [1, 3, 5, 7]
+
+    scheduler = CentralScheduler()
+    first = scheduler.submit(tokens, max_new_tokens=2)
+    PrefillWorker(prefill_runtime, pipeline, prefill_cache).process(first)
+    decode_worker.receive_and_prepare(first)
+    assert host_cache.contains(tiny_model.name, tokens)
+    decode_cache.free(first.request_id)
+
+    second = scheduler.submit(tokens, max_new_tokens=2)
+    PrefillWorker(prefill_runtime, pipeline, prefill_cache).process(
+        second, reuse_host_kv=True
+    )
+    prepared = decode_worker.receive_and_prepare(second)
+    assert prepared.first_token_id is not None
+    assert host_cache.stats().hits == 1
 
 
 def test_n_minus_one_replay_drift_is_observed_but_prefill_token_is_authoritative(

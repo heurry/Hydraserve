@@ -71,21 +71,28 @@ def paged_flash_prefill(
     if key_pages.shape != value_pages.shape:
         raise ValueError("key and value pages must share a shape")
     batch, _tokens, _heads, head_dim = query.shape
+    if block_table.ndim != 2 or block_table.shape[0] != batch:
+        raise ValueError("block table batch does not match query")
     try:
         from flash_attn import flash_attn_with_kvcache
     except ImportError as exc:
         raise RuntimeError("paged flash prefill requires flash-attn") from exc
     query = query.contiguous()
-    k_cache = key_pages.unsqueeze(0).expand(batch, -1, -1, -1, -1).contiguous()
-    v_cache = value_pages.unsqueeze(0).expand(batch, -1, -1, -1, -1).contiguous()
     table = torch.as_tensor(block_table, device=query.device, dtype=torch.int32).contiguous()
-    seqlens = torch.as_tensor(cache_seqlens, device=query.device, dtype=torch.int32)
+    seqlens = torch.as_tensor(
+        cache_seqlens, device=query.device, dtype=torch.int32
+    ).contiguous()
     if seqlens.ndim == 0:
-        seqlens = seqlens.expand(batch)
+        seqlens = seqlens.expand(batch).contiguous()
+    if seqlens.shape != (batch,):
+        raise ValueError("cache sequence lengths must be scalar or [batch]")
+    # With block_table set, FlashAttention expects the physical paged layout
+    # directly: [num_blocks, page_block_size, kv_heads, head_dim]. Expanding it
+    # to [batch, ...] duplicates the whole cache and violates the API layout.
     return flash_attn_with_kvcache(
         query,
-        k_cache,
-        v_cache,
+        key_pages,
+        value_pages,
         cache_seqlens=seqlens,
         block_table=table,
         causal=causal,

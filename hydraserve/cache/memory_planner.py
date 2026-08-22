@@ -59,7 +59,7 @@ def plan_paged_kv_blocks(
             * (2 * model.num_kv_heads * model.head_dim + 2 * model.num_kv_heads * 4)
         )
     else:
-        element_size = torch.empty((), dtype=dtype).element_size()
+        element_size = dtype.itemsize
         bytes_per_block = (
             model.num_full_attention_layers
             * block_size

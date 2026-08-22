@@ -7,6 +7,7 @@ import pytest
 
 from hydraserve.cache import Int4Tensor, LinearState
 from hydraserve.transfer import (
+    CudaP2PTransferBackend,
     HybridStateBundle,
     InMemoryTransferBackend,
     RegionDescriptor,
@@ -15,6 +16,7 @@ from hydraserve.transfer import (
     StateTransferDescriptor,
     TransferMode,
     TransferPipeline,
+    StateType,
 )
 
 
@@ -47,6 +49,22 @@ def test_descriptor_is_json_round_trip_safe(tiny_model) -> None:
     descriptor = StateTransferDescriptor(2, tiny_model.name, 10, 42, TransferMode.PARTIAL_TRANSFER, (region, conv))
     restored = StateTransferDescriptor.from_dict(json.loads(json.dumps(descriptor.to_dict())))
     assert restored == descriptor
+
+
+def test_state_type_and_tp_topology_round_trip(tiny_model) -> None:
+    region = RegionDescriptor(
+        StateType.SLIDING_WINDOW_KV,
+        (1,),
+        (2, 4, 8),
+        "float16",
+        False,
+        0,
+        1,
+        src_tp_rank=1,
+        dst_tp_rank=0,
+        tp_world_size=2,
+    )
+    assert RegionDescriptor.from_dict(region.to_dict()) == region
 
 
 def test_recurrent_state_cannot_be_quantized(tiny_model) -> None:
@@ -101,6 +119,41 @@ def test_quantized_transfer_packs_kv(tiny_model) -> None:
     assert backend.supports_layer_pipeline()
 
 
+def test_chunked_kv_manifest_and_final_bundle(tiny_model) -> None:
+    backend = InMemoryTransferBackend(TransferMode.FULL_TRANSFER)
+    pipeline = TransferPipeline(
+        backend, src_tp_rank=1, dst_tp_rank=0, tp_world_size=2
+    )
+    ranges = ((0, 4), (4, 7))
+    pipeline.begin_chunked_send(51, tiny_model, 7, ranges)
+    first = np.zeros(
+        (tiny_model.num_full_attention_layers, 2, 4, tiny_model.num_kv_heads, tiny_model.head_dim),
+        dtype=np.uint16,
+    )
+    second = np.ones(
+        (tiny_model.num_full_attention_layers, 2, 3, tiny_model.num_kv_heads, tiny_model.head_dim),
+        dtype=np.uint16,
+    )
+    pipeline.send_kv_chunk(51, 0, 4, first)
+    pipeline.send_kv_chunk(51, 4, 7, second)
+    descriptor = pipeline.send(
+        51,
+        tiny_model,
+        7,
+        HybridStateBundle(_state(tiny_model)),
+        streamed_kv_ranges=ranges,
+    )
+
+    assert pipeline.begin_chunked_receive(51) == ranges
+    np.testing.assert_array_equal(pipeline.receive_kv_chunk(51, 0, 4), first)
+    np.testing.assert_array_equal(pipeline.receive_kv_chunk(51, 4, 7), second)
+    received, bundle = pipeline.receive(51)
+    assert received == descriptor
+    assert received.streamed_kv
+    assert bundle.kv_cache is None
+    assert all(region.tp_world_size == 2 for region in received.regions)
+
+
 def test_posix_shared_memory_partial_transfer(tiny_model) -> None:
     with SharedMemoryTransferBackend(
         namespace="hydraserve-pytest", mode=TransferMode.PARTIAL_TRANSFER
@@ -134,3 +187,32 @@ def test_shared_memory_typed_codec_rejects_unsupported_objects() -> None:
     backend = SharedMemoryTransferBackend(namespace="hydraserve-typed-reject")
     with pytest.raises(TypeError, match="unsupported"):
         backend.send("bad", {"value": object()}, 1)
+
+
+def test_cuda_p2p_default_receive_waits_on_current_stream(monkeypatch) -> None:
+    from contextlib import nullcontext
+    from threading import Condition
+
+    torch = pytest.importorskip("torch")
+
+    class Stream:
+        def __init__(self):
+            self.waited = None
+
+        def wait_event(self, event):
+            self.waited = event
+
+    backend = object.__new__(CudaP2PTransferBackend)
+    backend.dst_gpu = 1
+    backend._condition = Condition()
+    event = object()
+    payload = object()
+    backend._messages = {"ready": (payload, event)}
+    stream = Stream()
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: stream)
+
+    received = backend.receive("ready", 1)
+
+    assert received is payload
+    assert stream.waited is event

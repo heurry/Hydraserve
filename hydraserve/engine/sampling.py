@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, replace
 from typing import Iterable
 
@@ -58,15 +59,22 @@ def sample_logits(
     steps: Iterable[int],
 ) -> tuple[TokenSample, ...]:
     """Apply per-request penalties/filters and sample independently of batching."""
-    import torch
-
     if logits.ndim != 2:
         raise ValueError("sampling logits must have shape [batch, vocabulary]")
-    histories = tuple(tuple(int(token) for token in history) for history in histories)
+    histories = tuple(histories)
     params = tuple(params)
     steps = tuple(int(step) for step in steps)
     if not (len(histories) == len(params) == len(steps) == logits.shape[0]):
         raise ValueError("sampling metadata must match the logits batch")
+    if os.environ.get("HYDRASERVE_BATCHED_GREEDY", "1") != "0" and all(
+        _is_plain_greedy(config) for config in params
+    ):
+        token_ids = logits.argmax(dim=-1).tolist()
+        return tuple(TokenSample(int(token_id)) for token_id in token_ids)
+
+    histories = tuple(
+        tuple(int(token) for token in history) for history in histories
+    )
     return tuple(
         _sample_row(row.float(), history, config, step)
         for row, history, config, step in zip(
@@ -75,11 +83,27 @@ def sample_logits(
     )
 
 
+def _is_plain_greedy(params: SamplingParams) -> bool:
+    return (
+        params.temperature == 0.0
+        and not _has_penalties(params)
+        and params.logprobs is None
+    )
+
+
+def _has_penalties(params: SamplingParams) -> bool:
+    return (
+        params.repetition_penalty != 1.0
+        or params.presence_penalty != 0.0
+        or params.frequency_penalty != 0.0
+    )
+
+
 def _sample_row(logits, history, params: SamplingParams, step: int) -> TokenSample:
     import torch
 
     scores = logits.clone()
-    if history:
+    if history and _has_penalties(params):
         counts: dict[int, int] = {}
         for token in history:
             if 0 <= token < scores.numel():
@@ -114,7 +138,6 @@ def _sample_row(logits, history, params: SamplingParams, step: int) -> TokenSamp
             remove[0] = False
             scores[sorted_indices[remove]] = float("-inf")
 
-    log_probabilities = torch.log_softmax(scores, dim=-1)
     if greedy:
         token_id = int(scores.argmax())
     else:
@@ -128,6 +151,7 @@ def _sample_row(logits, history, params: SamplingParams, step: int) -> TokenSamp
 
     if params.logprobs is None:
         return TokenSample(token_id)
+    log_probabilities = torch.log_softmax(scores, dim=-1)
     top_count = min(params.logprobs, scores.numel())
     top = ()
     if top_count:
@@ -137,4 +161,3 @@ def _sample_row(logits, history, params: SamplingParams, step: int) -> TokenSamp
             for index, value in zip(indices.tolist(), values.tolist(), strict=True)
         )
     return TokenSample(token_id, float(log_probabilities[token_id]), top)
-

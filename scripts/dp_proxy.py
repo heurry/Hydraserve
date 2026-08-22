@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Load-aware reverse proxy for N data-parallel HydraServe workers.
+"""Data-parallel HydraServe proxy (ZeroMQ by default, legacy HTTP optional).
 
 Forwards each request to the backend with the fewest ``scheduler.active_requests``
 (as reported by its ``/health`` endpoint), keeping a 4xDP benchmark load balanced
-across serve processes. Pure stdlib (``http.server`` + ``urllib``), no dependencies.
+The ZeroMQ ROUTER/DEALER data plane avoids per-request HTTP parsing and Python
+thread contention. ``--backends`` keeps the old HTTP adapter for compatibility.
 """
 
 from __future__ import annotations
@@ -143,14 +144,31 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=9000)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument(
-        "--backends", required=True, help="comma-separated backend addresses"
+        "--backends", help="legacy HTTP: comma-separated backend addresses"
     )
+    parser.add_argument(
+        "--transport", choices=("zmq", "http"),
+        help="defaults to zmq unless legacy --backends is supplied",
+    )
+    parser.add_argument("--zmq-frontend")
+    parser.add_argument("--zmq-backend", default="tcp://127.0.0.1:9001")
     parser.add_argument("--health-timeout", type=float, default=1.0)
     parser.add_argument("--forward-timeout", type=float, default=600.0)
     args = parser.parse_args()
 
+    transport = args.transport or ("http" if args.backends else "zmq")
+    if transport == "zmq":
+        from hydraserve.engine.zmq_proxy import run_zmq_broker
+
+        run_zmq_broker(
+            args.zmq_frontend or f"tcp://{args.host}:{args.port}",
+            args.zmq_backend,
+        )
+        return 0
     LoadAwareProxyHandler.backends = tuple(
-        _normalize_backend(part) for part in args.backends.split(",") if part.strip()
+        _normalize_backend(part)
+        for part in (args.backends or "").split(",")
+        if part.strip()
     )
     if not LoadAwareProxyHandler.backends:
         parser.error("--backends must list at least one backend")

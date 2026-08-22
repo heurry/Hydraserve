@@ -258,6 +258,7 @@ def test_gpu_state_batch_is_invisible_until_atomic_commit(tiny_model) -> None:
     conv_workspace = pool.conv_workspace.data_ptr()
     first_layer = tiny_model.linear_layer_indices[0]
     with pool.batch((20, 10), (states[20], states[10])) as batch:
+        slot_ids_workspace = batch.slot_ids.data_ptr()
         recurrent, convolution, next_convolution = batch.layer(first_layer)
         assert recurrent[:, 0, 0, 0].tolist() == [2.0, 1.0]
         assert convolution[:, 0, 0].tolist() == [12.0, 11.0]
@@ -276,9 +277,10 @@ def test_gpu_state_batch_is_invisible_until_atomic_commit(tiny_model) -> None:
     assert states[10].recurrent[first_layer].flatten()[0] == 21
     assert states[20].convolution[first_layer].flatten()[0] == 42
     assert states[10].convolution[first_layer].flatten()[0] == 41
-    with pool.batch((10,), (states[10],)):
+    with pool.batch((10,), (states[10],)) as batch:
         assert pool.ssm_workspace.data_ptr() == recurrent_workspace
         assert pool.conv_workspace.data_ptr() == conv_workspace
+        assert batch.slot_ids.data_ptr() == slot_ids_workspace
     with pytest.raises(MemoryError, match="workspace"):
         with pool.batch((10, 20, 30), (states[10], states[20], states[10])):
             pass

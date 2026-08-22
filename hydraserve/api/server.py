@@ -752,10 +752,11 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _sse(self, payload: dict[str, Any]) -> None:
+        # BaseHTTPRequestHandler uses an unbuffered _SocketWriter by default;
+        # write() already sends the event immediately and flush() is a no-op.
         self.wfile.write(
             f"data: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
         )
-        self.wfile.flush()
 
     def _error(self, status: int, error_type: str, message: str) -> None:
         self._json(status, {"error": {"message": message, "type": error_type}})

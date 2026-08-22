@@ -30,6 +30,66 @@ def test_greedy_penalties_and_logprobs() -> None:
     assert len(samples[0].top_logprobs) == 2
 
 
+def test_plain_greedy_sampling_uses_batched_fast_path(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    import hydraserve.engine.sampling as sampling
+
+    def fail_per_row(*_args, **_kwargs):
+        raise AssertionError("plain greedy sampling should not use the per-row path")
+
+    monkeypatch.setattr(sampling, "_sample_row", fail_per_row)
+    logits = torch.tensor([[0.0, 5.0, 4.0], [9.0, 2.0, 3.0]])
+    samples = sampling.sample_logits(
+        logits,
+        histories=((1, 1), (2,)),
+        params=(SamplingParams(), SamplingParams()),
+        steps=(0, 4),
+    )
+    assert tuple(sample.token_id for sample in samples) == (1, 0)
+
+
+def test_batched_greedy_fast_path_can_be_disabled(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    import hydraserve.engine.sampling as sampling
+
+    calls = 0
+    original = sampling._sample_row
+
+    def count_per_row(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setenv("HYDRASERVE_BATCHED_GREEDY", "0")
+    monkeypatch.setattr(sampling, "_sample_row", count_per_row)
+    logits = torch.tensor([[0.0, 5.0], [9.0, 2.0]])
+    samples = sampling.sample_logits(
+        logits,
+        histories=((), ()),
+        params=(SamplingParams(), SamplingParams()),
+        steps=(0, 0),
+    )
+    assert tuple(sample.token_id for sample in samples) == (1, 0)
+    assert calls == 2
+
+
+def test_sampling_without_logprobs_skips_log_softmax(monkeypatch) -> None:
+    torch = pytest.importorskip("torch")
+    import hydraserve.engine.sampling as sampling
+
+    def fail_log_softmax(*_args, **_kwargs):
+        raise AssertionError("log_softmax should only run when logprobs are requested")
+
+    monkeypatch.setattr(torch, "log_softmax", fail_log_softmax)
+    sample = sampling._sample_row(
+        torch.tensor([0.0, 5.0, 4.0]),
+        history=(1,),
+        params=SamplingParams(frequency_penalty=1.0),
+        step=0,
+    )
+    assert sample.token_id == 1
+
+
 def test_seeded_sampling_is_independent_of_batch_order() -> None:
     torch = pytest.importorskip("torch")
     from hydraserve.engine import sample_logits

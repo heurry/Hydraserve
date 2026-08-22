@@ -62,10 +62,68 @@ class RuntimeStateCodec:
         stacked = torch.stack(layers, dim=0)
         if mode is TransferMode.QUANTIZED_TRANSFER:
             return stacked.float().cpu().numpy()
-        return stacked.view(torch.uint16).cpu().numpy()
+        if stacked.dtype is torch.bfloat16:
+            return stacked.view(torch.uint16).cpu().numpy()
+        return stacked.cpu().numpy()
+
+    @staticmethod
+    def extract_kv_range(
+        model: ModelConfig,
+        paged_cache,
+        request_id: int,
+        start: int,
+        end: int,
+        *,
+        mode: TransferMode = TransferMode.FULL_TRANSFER,
+    ):
+        """Gather one completed logical token range for streaming transfer."""
+        if start < 0 or end <= start:
+            raise ValueError("invalid KV token range")
+        import torch
+
+        if paged_cache.device.type == "cuda" and paged_cache.kv_quant is None:
+            from hydraserve.kernels.staging import fused_gather_paged_kv
+
+            allocation = paged_cache.block_manager.get(request_id)
+            block_ids = torch.tensor(
+                allocation.block_ids,
+                device=paged_cache.device,
+                dtype=torch.int32,
+            )
+            stacked = fused_gather_paged_kv(
+                paged_cache.key,
+                paged_cache.value,
+                block_ids,
+                start,
+                end,
+            )
+            if mode is TransferMode.QUANTIZED_TRANSFER:
+                return stacked.float().cpu().numpy()
+            if stacked.dtype is torch.bfloat16:
+                return stacked.view(torch.uint16).cpu().numpy()
+            return stacked.cpu().numpy()
+
+        layers = []
+        for layer_index in model.full_attention_layer_indices:
+            key, value = paged_cache.read(request_id, layer_index, num_tokens=end)
+            layers.append(torch.stack((key[start:end], value[start:end]), dim=0))
+        stacked = torch.stack(layers, dim=0).contiguous()
+        if mode is TransferMode.QUANTIZED_TRANSFER:
+            return stacked.float().cpu().numpy()
+        if stacked.dtype is torch.bfloat16:
+            return stacked.view(torch.uint16).cpu().numpy()
+        return stacked.cpu().numpy()
 
     @staticmethod
     def install_kv(model: ModelConfig, paged_cache, request_id: int, payload) -> None:
+        RuntimeStateCodec.install_kv_range(
+            model, paged_cache, request_id, payload, start=0
+        )
+
+    @staticmethod
+    def install_kv_range(
+        model: ModelConfig, paged_cache, request_id: int, payload, *, start: int
+    ) -> None:
         import numpy as np
         import torch
 
@@ -79,9 +137,38 @@ class RuntimeStateCodec:
             model.head_dim,
         ):
             raise ValueError(f"invalid transferred KV shape {values.shape}")
-        positions = torch.arange(values.shape[2], device=paged_cache.device)
+        if start < 0:
+            raise ValueError("KV range start must be non-negative")
+        positions = torch.arange(
+            start, start + values.shape[2], device=paged_cache.device
+        )
         # FULL transfer ships BF16 as uint16 raw bits; reinterpret, don't convert.
         bf16_bits = values.dtype == np.uint16
+        if (
+            paged_cache.device.type == "cuda"
+            and paged_cache.kv_quant is None
+            and bf16_bits
+            and paged_cache.matched_prefix_tokens(request_id) == 0
+        ):
+            from hydraserve.kernels.staging import fused_scatter_paged_kv
+
+            allocation = paged_cache.block_manager.get(request_id)
+            block_ids = torch.tensor(
+                allocation.block_ids,
+                device=paged_cache.device,
+                dtype=torch.int32,
+            )
+            staging = torch.from_numpy(values).view(torch.bfloat16).to(
+                device=paged_cache.device, non_blocking=True
+            )
+            fused_scatter_paged_kv(
+                staging,
+                paged_cache.key,
+                paged_cache.value,
+                block_ids,
+                start,
+            )
+            return
         for slot, layer_index in enumerate(model.full_attention_layer_indices):
             key = torch.from_numpy(values[slot, 0])
             value = torch.from_numpy(values[slot, 1])

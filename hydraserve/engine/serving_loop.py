@@ -202,6 +202,9 @@ class ContinuousGenerationLoop:
         eos_token_id: int | None = None,
         idle_wait_s: float = 0.01,
         max_preemptions_per_request: int = 2,
+        max_step_tokens: int | None = None,
+        dp_graph_sync: bool = False,
+        dp_process_group=None,
     ) -> None:
         active_limit = max_batch_size if max_active_requests is None else max_active_requests
         if (
@@ -209,6 +212,7 @@ class ContinuousGenerationLoop:
             or idle_wait_s <= 0
             or active_limit < max_batch_size
             or max_preemptions_per_request < 0
+            or (max_step_tokens is not None and max_step_tokens <= 0)
         ):
             raise ValueError("invalid serving-loop limits")
         self.backend = backend
@@ -219,6 +223,11 @@ class ContinuousGenerationLoop:
         self.eos_token_id = eos_token_id
         self.idle_wait_s = idle_wait_s
         self.max_preemptions_per_request = max_preemptions_per_request
+        self.max_step_tokens = (
+            max_queue_tokens if max_step_tokens is None else max_step_tokens
+        )
+        self.dp_graph_sync = dp_graph_sync
+        self.dp_process_group = dp_process_group
         self._ids = count()
         self._incoming: Queue[tuple[ServingRequest, GenerationHandle]] = Queue()
         self._deferred: deque[tuple[ServingRequest, GenerationHandle]] = deque()
@@ -326,10 +335,13 @@ class ContinuousGenerationLoop:
                 self._run_disaggregated(active)
             else:
                 while not self._stop.is_set():
-                    did_work = self._admit(active)
+                    did_work = self._admit(
+                        active,
+                        token_budget=max(0, self.max_step_tokens - len(active)),
+                    )
                     did_work = self._remove_cancelled_or_expired(active) or did_work
                     self._publish_scheduler_depth(len(active), 0)
-                    if active:
+                    if active or self.dp_graph_sync:
                         self._decode_once(active)
                         did_work = True
                     if not did_work:
@@ -351,10 +363,11 @@ class ContinuousGenerationLoop:
             max_workers=prefill_workers, thread_name_prefix="hydraserve-prefill"
         ) as executor:
             while not self._stop.is_set():
-                did_work = self._submit_async_prefill(active, pending, executor)
-                did_work = (
-                    self._collect_async_prefill(active, pending, recovering=recovering)
-                    or did_work
+                # Decode consumes one token per active sequence. Prefill
+                # admission shares the remaining per-step token budget.
+                prefill_budget = max(0, self.max_step_tokens - len(active))
+                did_work = self._submit_async_prefill(
+                    active, pending, executor, token_budget=prefill_budget
                 )
                 did_work = self._remove_cancelled_or_expired(active) or did_work
                 did_work = (
@@ -364,9 +377,15 @@ class ContinuousGenerationLoop:
                     or did_work
                 )
                 self._publish_scheduler_depth(len(active), len(pending))
-                if active:
+                if active or self.dp_graph_sync:
                     self._decode_once(active)
                     did_work = True
+                # Resolve CPU futures after launching the active decode step;
+                # this keeps response handling off the decode critical path.
+                did_work = (
+                    self._collect_async_prefill(active, pending, recovering=recovering)
+                    or did_work
+                )
                 if not did_work:
                     self._wake.wait(self.idle_wait_s)
                     self._wake.clear()
@@ -377,7 +396,9 @@ class ContinuousGenerationLoop:
                     active, pending, recovering=recovering, wait=True
                 )
 
-    def _submit_async_prefill(self, active, pending, executor) -> bool:
+    def _submit_async_prefill(
+        self, active, pending, executor, *, token_budget: int | None = None
+    ) -> bool:
         did_work = False
         available_slots = self.max_active_requests - len(active) - len(pending)
         candidates = self._waiting_candidates()
@@ -389,6 +410,15 @@ class ContinuousGenerationLoop:
                     self._defer_remaining(candidates[index:])
                     break
             request, handle = waiting
+            demand = len(request.token_ids)
+            if token_budget is not None and demand > token_budget:
+                # Avoid starvation when a single prompt exceeds a complete
+                # step budget and there is otherwise no GPU work.
+                if active or pending or token_budget != self.max_step_tokens:
+                    self._defer_remaining(candidates[index:])
+                    break
+            if token_budget is not None:
+                token_budget = max(0, token_budget - demand)
             if request.cancelled.is_set():
                 self._pending_done(request)
                 self._finish(request, "cancelled", active=active, release=False)
@@ -587,7 +617,9 @@ class ContinuousGenerationLoop:
                 self._fail(request, exc, active=active, release=True)
         return bool(completed)
 
-    def _admit(self, active: OrderedDict[int, ServingRequest]) -> bool:
+    def _admit(
+        self, active: OrderedDict[int, ServingRequest], *, token_budget: int | None = None
+    ) -> bool:
         did_work = False
         available_slots = self.max_active_requests - len(active)
         candidates = self._waiting_candidates()
@@ -599,6 +631,13 @@ class ContinuousGenerationLoop:
                     self._defer_remaining(candidates[index:])
                     break
             request, handle = waiting
+            demand = len(request.token_ids)
+            if token_budget is not None and demand > token_budget:
+                if active or token_budget != self.max_step_tokens:
+                    self._defer_remaining(candidates[index:])
+                    break
+            if token_budget is not None:
+                token_budget = max(0, token_budget - demand)
             if request.cancelled.is_set():
                 self._pending_done(request)
                 self._finish(request, "cancelled", active=active, release=False)
@@ -791,9 +830,29 @@ class ContinuousGenerationLoop:
         return did_work
 
     def _decode_once(self, active: OrderedDict[int, ServingRequest]) -> None:
-        batch = self._decode_scheduler.select(active.values(), self.max_batch_size)
+        batch = self._decode_scheduler.select(
+            active.values(), min(self.max_batch_size, self.max_step_tokens)
+        )
         try:
-            token_ids = self.backend.decode(batch)
+            if self.dp_graph_sync:
+                from hydraserve.engine.dp_graph_sync import synchronize_dp_token_count
+
+                plan = synchronize_dp_token_count(
+                    len(batch), process_group=self.dp_process_group
+                )
+                if plan.padding_tokens:
+                    decode_padded = getattr(self.backend, "decode_padded", None)
+                    if not callable(decode_padded):
+                        raise RuntimeError(
+                            "DP CUDA Graph synchronization requires backend.decode_padded"
+                        )
+                    token_ids = decode_padded(batch, plan.synchronized_tokens)
+                elif batch:
+                    token_ids = self.backend.decode(batch)
+                else:
+                    return
+            else:
+                token_ids = self.backend.decode(batch)
             if len(token_ids) != len(batch):
                 raise RuntimeError("decode output count does not match the batch")
         except PartialDecodeError as exc:

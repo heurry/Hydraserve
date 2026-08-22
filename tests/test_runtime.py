@@ -14,7 +14,7 @@ from hydraserve.cache import (
 )
 from hydraserve.model.runtime import QwenTextRuntime, RuntimeState
 from hydraserve.model.weights import LANGUAGE_PREFIX, layer_prefix
-from hydraserve.model.weights import BlockScaledFP8Weight
+from hydraserve.model.weights import BlockScaledFP8Weight, PackedInt4Weight
 
 
 def make_weights(model, *, device="cpu", dtype=torch.float32):
@@ -112,6 +112,319 @@ def test_whole_prefill_matches_token_by_token_decode(tiny_model) -> None:
     for layer in tiny_model.linear_layer_indices:
         torch.testing.assert_close(state.recurrent[layer], full_state.recurrent[layer])
         torch.testing.assert_close(state.convolution[layer], full_state.convolution[layer])
+
+
+def test_prefill_reports_completed_chunk_boundaries(tiny_model) -> None:
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+    )
+    completed = []
+    runtime.prefill(
+        torch.tensor([[3, 7, 11, 5, 2]]),
+        chunk_size=2,
+        chunk_callback=lambda start, end, state: completed.append(
+            (start, end, state.sequence_length)
+        ),
+    )
+    assert completed == [(0, 2, 2), (2, 4, 4), (4, 5, 5)]
+
+
+def test_fused_projections_match_unfused_runtime(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    fused = QwenTextRuntime(
+        tiny_model,
+        weights,
+        use_triton=False,
+        use_flash_attention=False,
+        fuse_projections=True,
+    )
+    unfused = QwenTextRuntime(
+        tiny_model,
+        weights,
+        use_triton=False,
+        use_flash_attention=False,
+        fuse_projections=False,
+    )
+    full_layer = tiny_model.full_attention_layer_indices[0]
+    attention = f"{layer_prefix(full_layer)}.self_attn"
+    assert f"{attention}.qkv_proj.weight" in fused.weights
+    assert f"{layer_prefix(0)}.mlp.gate_up_proj.weight" in fused.weights
+    assert f"{layer_prefix(0)}.linear_attn.in_proj_qkvz.weight" in fused.weights
+    assert f"{layer_prefix(0)}.linear_attn.in_proj_ba.weight" in fused.weights
+    assert f"{attention}.qkv_proj.weight" not in unfused.weights
+
+    token_ids = torch.tensor([[3, 7, 11, 5, 2]])
+    actual, actual_state = fused.forward(token_ids)
+    expected, expected_state = unfused.forward(token_ids)
+
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+    for layer in tiny_model.linear_layer_indices:
+        torch.testing.assert_close(
+            actual_state.recurrent[layer], expected_state.recurrent[layer]
+        )
+        torch.testing.assert_close(
+            actual_state.convolution[layer], expected_state.convolution[layer]
+        )
+
+def test_torch_compile_opt_in_wraps_runtime_transactions(
+    tiny_model, monkeypatch
+) -> None:
+    compiled = []
+    invoked = []
+
+    def fake_compile(function, **options):
+        compiled.append((function.__name__, options))
+
+        def wrapped(*args, **kwargs):
+            invoked.append(function.__name__)
+            return function(*args, **kwargs)
+
+        return wrapped
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    monkeypatch.setenv("HYDRASERVE_TORCH_COMPILE_BACKEND", "eager")
+    monkeypatch.setenv("HYDRASERVE_TORCH_COMPILE_FULLGRAPH", "1")
+    monkeypatch.setenv("HYDRASERVE_TORCH_COMPILE_DYNAMIC", "1")
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+        use_torch_compile=True,
+    )
+
+    logits, state = runtime.forward(torch.tensor([[3, 7, 11]]))
+
+    assert logits.shape[:2] == (1, 3)
+    assert state.sequence_length == 3
+    assert invoked == ["_forward_transaction"]
+    assert [name for name, _ in compiled] == [
+        "_forward_transaction",
+        "_decode_batch_transaction",
+    ]
+    assert all(
+        options == {"backend": "eager", "fullgraph": True, "dynamic": True}
+        for _, options in compiled
+    )
+    assert runtime._use_cuda_graphs() is False
+
+
+def test_torch_compile_eager_backend_matches_uncompiled_forward(
+    tiny_model, monkeypatch
+) -> None:
+    monkeypatch.setenv("HYDRASERVE_TORCH_COMPILE_BACKEND", "eager")
+    compiled = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+        use_torch_compile=True,
+    )
+    eager = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+        use_torch_compile=False,
+    )
+    token_ids = torch.tensor([[3, 7, 11]])
+
+    actual, actual_state = compiled.forward(token_ids)
+    expected, expected_state = eager.forward(token_ids)
+
+    torch.testing.assert_close(actual, expected)
+    assert actual_state.sequence_length == expected_state.sequence_length
+    for layer in tiny_model.linear_layer_indices:
+        torch.testing.assert_close(
+            actual_state.recurrent[layer], expected_state.recurrent[layer]
+        )
+        torch.testing.assert_close(
+            actual_state.convolution[layer], expected_state.convolution[layer]
+        )
+
+def test_runtime_preserves_native_logits_dtype(tiny_model, monkeypatch) -> None:
+    weights = make_weights(tiny_model, dtype=torch.bfloat16)
+    token_ids = torch.tensor([[3, 7]])
+
+    monkeypatch.delenv("HYDRASERVE_FP32_LOGITS", raising=False)
+    native_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    native_logits, _ = native_runtime.forward(token_ids)
+
+    monkeypatch.setenv("HYDRASERVE_FP32_LOGITS", "1")
+    fp32_runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    fp32_logits, _ = fp32_runtime.forward(token_ids)
+
+    assert native_logits.dtype == torch.bfloat16
+    assert fp32_logits.dtype == torch.float32
+    torch.testing.assert_close(native_logits.float(), fp32_logits)
+
+
+def test_decode_positions_reuse_staging_buffers(tiny_model) -> None:
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+    )
+    states = [RuntimeState(sequence_length=3), RuntimeState(sequence_length=7)]
+
+    first = runtime._decode_positions(states)
+    states[0].sequence_length = 4
+    second = runtime._decode_positions(states)
+
+    assert first.data_ptr() == second.data_ptr()
+    assert second.tolist() == [[4], [7]]
+
+
+def test_cuda_graph_capture_policy_defaults_and_validation(
+    tiny_model, monkeypatch
+) -> None:
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+    )
+    monkeypatch.delenv("HYDRASERVE_CUDA_GRAPH_CAPTURE_AFTER", raising=False)
+    monkeypatch.delenv("HYDRASERVE_CUDA_GRAPH_WARMUP_STEPS", raising=False)
+    assert runtime._cuda_graph_capture_after() == 16
+    assert runtime._cuda_graph_warmup_steps() == 1
+
+    monkeypatch.setenv("HYDRASERVE_CUDA_GRAPH_CAPTURE_AFTER", "3")
+    monkeypatch.setenv("HYDRASERVE_CUDA_GRAPH_WARMUP_STEPS", "2")
+    assert runtime._cuda_graph_capture_after() == 3
+    assert runtime._cuda_graph_warmup_steps() == 2
+
+    monkeypatch.setenv("HYDRASERVE_CUDA_GRAPH_CAPTURE_AFTER", "0")
+    with pytest.raises(ValueError, match="positive integer"):
+        runtime._cuda_graph_capture_after()
+
+
+def test_cuda_graph_capture_is_deferred_and_reuses_bucket_metadata(
+    tiny_model, monkeypatch
+) -> None:
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+    )
+    monkeypatch.setenv("HYDRASERVE_CUDA_GRAPH_CAPTURE_AFTER", "3")
+    table = torch.tensor([[2, -1]], dtype=torch.int32)
+    lengths = torch.tensor([4], dtype=torch.int32)
+
+    class Cache:
+        def batch_metadata(self, request_ids, *, bucket_width=False):
+            assert tuple(request_ids) == (7,)
+            assert bucket_width
+            return table, lengths
+
+    calls = {"capture": 0, "transaction": 0}
+
+    def capture(*args, **kwargs):
+        calls["capture"] += 1
+        return None
+
+    def transaction(*args, **kwargs):
+        calls["transaction"] += 1
+        override = kwargs["paged_metadata_override"]
+        assert override[0] is table
+        assert override[1] is lengths
+        return "eager"
+
+    monkeypatch.setattr(runtime, "_capture_decode_graph", capture)
+    monkeypatch.setattr(runtime, "_decode_batch_transaction", transaction)
+    input_ids = torch.tensor([[3]])
+    states = [RuntimeState(sequence_length=4)]
+
+    assert runtime._decode_batch_graph(
+        input_ids, states, Cache(), (7,), object()
+    ) == "eager"
+    assert runtime._decode_batch_graph(
+        input_ids, states, Cache(), (7,), object()
+    ) == "eager"
+    assert calls == {"capture": 0, "transaction": 2}
+
+    assert runtime._decode_batch_graph(
+        input_ids, states, Cache(), (7,), object()
+    ) == "eager"
+    assert calls == {"capture": 1, "transaction": 3}
+
+
+def test_fused_projections_reduce_linear_calls(tiny_model, monkeypatch) -> None:
+    runtime = QwenTextRuntime(
+        tiny_model,
+        make_weights(tiny_model),
+        use_triton=False,
+        use_flash_attention=False,
+    )
+    original_linear = runtime._linear
+    calls = []
+
+    def counted_linear(hidden, weight):
+        calls.append(weight)
+        return original_linear(hidden, weight)
+
+    monkeypatch.setattr(runtime, "_linear", counted_linear)
+    hidden = torch.randn(2, 3, tiny_model.hidden_size)
+    full_layer = tiny_model.full_attention_layer_indices[0]
+    runtime._full_attention_projections(
+        hidden, runtime._layer_weights[full_layer].full_attention
+    )
+    assert len(calls) == 1
+
+    calls.clear()
+    runtime._linear_attention_projections(
+        hidden, runtime._layer_weights[0].linear_attention
+    )
+    assert len(calls) == 2
+
+    calls.clear()
+    runtime._mlp(0, hidden)
+    assert len(calls) == 2
+
+
+def test_quantized_projection_weights_can_be_fused_without_requantizing() -> None:
+    fp8_parts = tuple(
+        BlockScaledFP8Weight(
+            torch.full((128, 256), value, dtype=torch.float8_e4m3fn),
+            torch.full((1, 2), value, dtype=torch.bfloat16),
+            (128, 256),
+        )
+        for value in (1.0, 2.0)
+    )
+    fused_fp8 = QwenTextRuntime._concatenate_linear_weights(fp8_parts)
+    assert isinstance(fused_fp8, BlockScaledFP8Weight)
+    assert fused_fp8.shape == (256, 256)
+    split_fp8 = QwenTextRuntime._split_linear_weight(fused_fp8, (128, 128))
+    for expected, actual in zip(fp8_parts, split_fp8, strict=True):
+        torch.testing.assert_close(actual.data, expected.data)
+        torch.testing.assert_close(actual.scale_inv, expected.scale_inv)
+
+    int4_parts = tuple(
+        PackedInt4Weight(
+            torch.full((8, 16), value, dtype=torch.int32),
+            torch.full((8, 1), float(value), dtype=torch.bfloat16),
+            torch.full((1, 1), value, dtype=torch.int32),
+            (8, 128),
+        )
+        for value in (1, 2)
+    )
+    fused_int4 = QwenTextRuntime._concatenate_linear_weights(int4_parts)
+    assert isinstance(fused_int4, PackedInt4Weight)
+    assert fused_int4.shape == (16, 128)
+    split_int4 = QwenTextRuntime._split_linear_weight(fused_int4, (8, 8))
+    for expected, actual in zip(int4_parts, split_int4, strict=True):
+        torch.testing.assert_close(actual.packed, expected.packed)
+        torch.testing.assert_close(actual.scale, expected.scale)
+        torch.testing.assert_close(actual.zero_point, expected.zero_point)
 
 
 def test_independent_lm_head_is_used_for_logits(tiny_model) -> None:

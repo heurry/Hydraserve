@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor
 import multiprocessing as mp
+import os
 from pathlib import Path
 from queue import Empty
 from threading import Event, Lock, RLock, Thread
@@ -40,6 +42,7 @@ class PDWorkerConfig:
     kv_headroom_blocks: int = 0
     max_decode_batch_size: int = 64
     kv_quant: str | None = None
+    host_prefix_cache_bytes: int = 0
     worker_log_dir: str = ""
 
 
@@ -100,6 +103,7 @@ def _prefill_worker(
     commands,
     responses,
     stderr_path: str | None = None,
+    bootstrap_address: tuple[str, int] | None = None,
 ) -> None:
     if stderr_path:
         import sys
@@ -123,7 +127,11 @@ def _prefill_worker(
         from hydraserve.engine.sampling import sample_logits
         from hydraserve.model.runtime import QwenTextRuntime
         from hydraserve.router import Route
-        from hydraserve.transfer import SharedMemoryTransferBackend, TransferPipeline
+        from hydraserve.transfer import (
+            NetworkBootstrapClient,
+            SharedMemoryTransferBackend,
+            TransferPipeline,
+        )
 
         device = torch.device(config.prefill_device)
         torch.cuda.set_device(device)
@@ -187,6 +195,11 @@ def _prefill_worker(
         if not namespaces:
             raise ValueError("prefill worker requires at least one decode namespace")
         workers = []
+        bootstrap = (
+            NetworkBootstrapClient(bootstrap_address)
+            if bootstrap_address is not None
+            else None
+        )
         for worker_index, worker_namespace in enumerate(namespaces):
             backend = SharedMemoryTransferBackend(namespace=worker_namespace)
             backends.append(backend)
@@ -197,7 +210,10 @@ def _prefill_worker(
                 PrefillWorker(
                     runtime,
                     TransferPipeline(
-                        backend, src_gpu=0, dst_gpu=worker_index + 1
+                        backend,
+                        src_gpu=0,
+                        dst_gpu=worker_index + 1,
+                        bootstrap=bootstrap,
                     ),
                     cache,
                 )
@@ -293,6 +309,10 @@ def _prefill_worker(
                             request,
                             n_minus_one=True,
                             chunk_size=config.prefill_chunk_size,
+                            streamed_transfer=bool(
+                                command.get("streamed_transfer", False)
+                            ),
+                            reuse_host_kv=bool(command.get("host_cache_hit", False)),
                         )
                     finally:
                         cache.free(request_id)
@@ -557,6 +577,7 @@ def _decode_worker(
     responses,
     worker_index: int = 0,
     stderr_path: str | None = None,
+    bootstrap_address: tuple[str, int] | None = None,
 ) -> None:
     if stderr_path:
         import sys
@@ -574,11 +595,16 @@ def _decode_worker(
             PagedKVCache,
             PrefixCache,
             plan_paged_kv_blocks,
+            HostPrefixCache,
         )
         from hydraserve.engine.pd_worker import DecodeWorker
         from hydraserve.engine.scheduler import RequestState
         from hydraserve.model.runtime import QwenTextRuntime
-        from hydraserve.transfer import SharedMemoryTransferBackend, TransferPipeline
+        from hydraserve.transfer import (
+            NetworkBootstrapClient,
+            SharedMemoryTransferBackend,
+            TransferPipeline,
+        )
 
         device = torch.device(config.decode_device)
         torch.cuda.set_device(device)
@@ -643,10 +669,26 @@ def _decode_worker(
             kv_quant=config.kv_quant,
         )
         backend = SharedMemoryTransferBackend(namespace=namespace)
+        bootstrap = (
+            NetworkBootstrapClient(bootstrap_address)
+            if bootstrap_address is not None
+            else None
+        )
+        host_cache = (
+            HostPrefixCache(config.host_prefix_cache_bytes)
+            if config.host_prefix_cache_bytes > 0
+            else None
+        )
         worker = DecodeWorker(
             runtime,
-            TransferPipeline(backend, src_gpu=0, dst_gpu=worker_index + 1),
+            TransferPipeline(
+                backend,
+                src_gpu=0,
+                dst_gpu=worker_index + 1,
+                bootstrap=bootstrap,
+            ),
             cache,
+            host_cache=host_cache,
         )
         requests = {}
         states = {}
@@ -694,6 +736,10 @@ def _decode_worker(
             try:
                 if operation == "reserve":
                     request_id = command["request_id"]
+                    host_cache_hit = bool(
+                        host_cache is not None
+                        and host_cache.contains(runtime.config.name, command["token_ids"])
+                    )
                     total_tokens = len(command["token_ids"]) + max(
                         0, command["max_new_tokens"] - 1
                     )
@@ -720,6 +766,7 @@ def _decode_worker(
                                 "op": "admission",
                                 "request_id": request_id,
                                 "admitted": True,
+                                "host_cache_hit": host_cache_hit,
                                 **capacity_payload(),
                             }
                         )
@@ -760,7 +807,8 @@ def _decode_worker(
                             {
                                 "op": "admission",
                                 "request_id": request_id,
-                                "admitted": True,
+                                    "admitted": True,
+                                    "host_cache_hit": host_cache_hit,
                                 **capacity_payload(),
                             }
                         )
@@ -787,6 +835,9 @@ def _decode_worker(
                                 timeout=command.get("timeout"),
                                 preallocated=request_id in reservations,
                                 chunk_size=config.prefill_chunk_size,
+                                streamed_transfer=bool(
+                                    command.get("streamed_transfer", False)
+                                ),
                             )
                             with state_lock:
                                 requests[request_id] = request
@@ -1013,6 +1064,8 @@ class DisaggregatedGenerationBackend:
             raise ValueError("cache limits must be positive")
         if config.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
+        if config.host_prefix_cache_bytes < 0:
+            raise ValueError("host prefix cache bytes cannot be negative")
         if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
             raise ValueError("invalid worker recovery policy")
         total_blocks = (
@@ -1027,6 +1080,16 @@ class DisaggregatedGenerationBackend:
         self.max_worker_restarts = max_worker_restarts
         self.worker_restart_backoff_s = worker_restart_backoff_s
         self.namespace = f"hydraserve-pd-{uuid4().hex}"
+        self._bootstrap_server = None
+        self._bootstrap_address = None
+        try:
+            from hydraserve.transfer import BootstrapServer
+
+            self._bootstrap_server = BootstrapServer().start()
+            self._bootstrap_address = self._bootstrap_server.address
+        except PermissionError:
+            # Restricted sandboxes can still use the SHM manifest fallback.
+            self._bootstrap_server = None
         self._context = mp.get_context("spawn")
         self._prefill_commands = self._context.Queue()
         self._prefill_responses = self._context.Queue()
@@ -1054,6 +1117,7 @@ class DisaggregatedGenerationBackend:
         self._admitted_requests: set[int] = set()
         self._lost_requests: set[int] = set()
         self._reserved_blocks: dict[int, int] = {}
+        self._host_cache_hits: set[int] = set()
         self._last_capacity: BackendCapacity | None = None
         self._last_cache_stats: dict[str, int | float] = {}
         self._replay_mismatches = 0
@@ -1103,6 +1167,10 @@ class DisaggregatedGenerationBackend:
             if result.get("admitted"):
                 self._admitted_requests.add(request.request_id)
                 self._reserved_blocks[request.request_id] = required_blocks
+                if result.get("host_cache_hit"):
+                    self._host_cache_hits.add(request.request_id)
+                else:
+                    self._host_cache_hits.discard(request.request_id)
                 if request.route is None:
                     request.route = Route.PD_DISAGGREGATED.value
                     request.route_reason = "fixed_pd"
@@ -1124,23 +1192,38 @@ class DisaggregatedGenerationBackend:
         return self._prefill_pd(request)
 
     def _prefill_pd(self, request: ServingRequest) -> int | TokenSample:
+        host_cache_hit = request.request_id in self._host_cache_hits
         command = {
             "op": "prefill",
             "request_id": request.request_id,
             "token_ids": request.token_ids,
             "max_new_tokens": request.max_new_tokens,
             "sampling_params": request.sampling_params,
+            "streamed_transfer": (
+                not host_cache_hit
+                and os.environ.get("HYDRASERVE_CHUNKED_TRANSFER", "1") != "0"
+            ),
+            "host_cache_hit": host_cache_hit,
         }
-        result = self._prefill_rpc(command, request.request_id)
-        prepared = self._decode_rpc(
-            {
-                **command,
-                "op": "prepare",
-                "timeout": self.operation_timeout,
-            },
-            "prepare",
-            request.request_id,
-        )
+        # Start decode-side manifest/chunk receive before prefill compute. The
+        # transfer and KV installation then progress chunk-by-chunk while the
+        # prefill GPU produces later chunks.
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            prefill_future = executor.submit(
+                self._prefill_rpc, command, request.request_id
+            )
+            prepare_future = executor.submit(
+                self._decode_rpc,
+                {
+                    **command,
+                    "op": "prepare",
+                    "timeout": self.operation_timeout,
+                },
+                "prepare",
+                request.request_id,
+            )
+            result = prefill_future.result()
+            prepared = prepare_future.result()
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         if not prepared.get("replay_consistent", True):
@@ -1238,6 +1321,7 @@ class DisaggregatedGenerationBackend:
             known = request_id in self._admitted_requests
             self._admitted_requests.discard(request_id)
             self._reserved_blocks.pop(request_id, None)
+            self._host_cache_hits.discard(request_id)
             self._lost_requests.discard(request_id)
         if not known:
             return
@@ -1501,6 +1585,7 @@ class DisaggregatedGenerationBackend:
                 self._prefill_commands,
                 self._prefill_responses,
                 self._worker_log_path("prefill"),
+                self._bootstrap_address,
             ),
             name="hydraserve-prefill",
         )
@@ -1515,6 +1600,7 @@ class DisaggregatedGenerationBackend:
                 self._decode_responses,
                 0,
                 self._worker_log_path("decode"),
+                self._bootstrap_address,
             ),
             name="hydraserve-decode",
         )
@@ -1543,6 +1629,9 @@ class DisaggregatedGenerationBackend:
             if process.is_alive():
                 process.terminate()
                 process.join(10)
+        if self._bootstrap_server is not None:
+            self._bootstrap_server.close()
+            self._bootstrap_server = None
 
     @staticmethod
     def _get(queue, timeout: float):

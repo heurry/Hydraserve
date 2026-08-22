@@ -71,6 +71,8 @@ class CudaP2PTransferBackend(TransferBackend):
     def receive(
         self, key: str, src: int, stream: Any = None, timeout: float | None = None
     ) -> Any:
+        import torch
+
         if src != self.dst_gpu:
             raise ValueError(f"receive endpoint must be GPU{self.dst_gpu}")
         deadline = None if timeout is None else monotonic() + timeout
@@ -81,10 +83,9 @@ class CudaP2PTransferBackend(TransferBackend):
                     raise TimeoutError(f"timed out waiting for P2P transfer {key}")
                 self._condition.wait(remaining)
             payload, event = self._messages.pop(key)
-        if stream is None:
-            event.synchronize()
-        else:
-            stream.wait_event(event)
+        with torch.cuda.device(self.dst_gpu):
+            consumer_stream = stream or torch.cuda.current_stream(self.dst_gpu)
+            consumer_stream.wait_event(event)
         return payload
 
     def get_bandwidth(self) -> float:

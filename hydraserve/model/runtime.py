@@ -6,11 +6,21 @@ applies checkpoint tensors using HydraServe kernels and basic GEMMs.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
 from hydraserve.config import LayerKind, ModelConfig, load_model_config
+from hydraserve.kernels.activation import gdn_gating as triton_gdn_gating
+from hydraserve.kernels.activation import silu_and_mul as triton_silu_and_mul
+from hydraserve.kernels.awq import awq_linear
+from hydraserve.kernels.fp8 import fp8_linear
+from hydraserve.kernels.gdn import causal_depthwise_conv as triton_causal_conv
+from hydraserve.kernels.gdn import gated_delta_recurrent
+from hydraserve.kernels.gdn import legacy_gdn_kernels_enabled
+from hydraserve.kernels.paged_attention import paged_attention
+from hydraserve.kernels.paged_attention import paged_attention_splitk
 from hydraserve.kernels.reference import (
     apply_text_rope,
     causal_depthwise_conv,
@@ -20,6 +30,8 @@ from hydraserve.kernels.reference import (
     rms_norm as reference_rms_norm,
     silu,
 )
+from hydraserve.kernels.rmsnorm import gated_rms_norm as triton_gated_rms_norm
+from hydraserve.kernels.rmsnorm import rms_norm as triton_rms_norm
 from hydraserve.model.weights import (
     BlockScaledFP8Weight,
     LANGUAGE_PREFIX,
@@ -51,6 +63,49 @@ class RuntimeState:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class _MLPWeightSet:
+    gate_up: Any | None
+    gate: Any
+    up: Any
+    down: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _FullAttentionWeightSet:
+    qkv: Any | None
+    query: Any
+    key: Any
+    value: Any
+    query_norm: Any
+    key_norm: Any
+    output: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _LinearAttentionWeightSet:
+    qkvz: Any | None
+    qkv: Any
+    gate: Any
+    ba: Any | None
+    beta: Any
+    step: Any
+    a_log: Any
+    dt_bias: Any
+    convolution: Any
+    norm: Any
+    output: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _LayerWeightSet:
+    input_norm: Any
+    post_attention_norm: Any
+    mlp: _MLPWeightSet
+    full_attention: _FullAttentionWeightSet | None
+    linear_attention: _LinearAttentionWeightSet | None
+
+
 class QwenTextRuntime:
     def __init__(
         self,
@@ -59,16 +114,37 @@ class QwenTextRuntime:
         *,
         use_triton: bool = True,
         use_flash_attention: bool = True,
+        fuse_projections: bool = True,
+        use_torch_compile: bool | None = None,
         device: str | Any | None = None,
+        _take_weights: bool = False,
     ) -> None:
         self.config = config
-        self.weights = weights
+        self.weights = (
+            weights if _take_weights and isinstance(weights, dict) else dict(weights)
+        )
         self.use_triton = use_triton
         self.use_flash_attention = use_flash_attention
         self._runtime_device = device
         self._decode_graphs: dict = {}
         self._decode_graph_failed: dict = {}
+        self._decode_graph_observations: dict = {}
+        self._decode_position_buffers: dict = {}
+        self._fp32_logits = os.environ.get("HYDRASERVE_FP32_LOGITS", "0") == "1"
+        self._torch_compile_enabled = (
+            os.environ.get("HYDRASERVE_TORCH_COMPILE", "0") != "0"
+            if use_torch_compile is None
+            else bool(use_torch_compile)
+        )
+        self._compiled_forward = None
+        self._compiled_decode_batch_transaction = None
+        self._compiled_mlp = None
         self._validate_weight_shapes()
+        if fuse_projections:
+            self._prepare_fused_projection_weights()
+        self._prepare_runtime_weight_cache()
+        if self._torch_compile_enabled:
+            self._prepare_torch_compile()
 
     @classmethod
     def from_checkpoint(
@@ -79,6 +155,8 @@ class QwenTextRuntime:
         dtype: Any = None,
         use_triton: bool = True,
         use_flash_attention: bool = True,
+        fuse_projections: bool = True,
+        use_torch_compile: bool | None = None,
         requested_cache_tokens: int | None = None,
     ) -> "QwenTextRuntime":
         import torch
@@ -103,7 +181,7 @@ class QwenTextRuntime:
             cpu_weight_names.add(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
         if fp8_names and torch.device(device).type == "cuda" and "lm_head.weight" in names:
             free_bytes, _ = torch.cuda.mem_get_info(torch.device(device))
-            element_size = torch.empty((), dtype=dtype).element_size()
+            element_size = dtype.itemsize
             estimated_sizes = {}
             for candidate in names:
                 if candidate.endswith(packed_parts):
@@ -200,7 +278,10 @@ class QwenTextRuntime:
             weights,
             use_triton=use_triton,
             use_flash_attention=use_flash_attention,
+            fuse_projections=fuse_projections,
+            use_torch_compile=use_torch_compile,
             device=device,
+            _take_weights=True,
         )
 
     @property
@@ -209,18 +290,40 @@ class QwenTextRuntime:
             import torch
 
             return torch.device(self._runtime_device)
-        return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").device
+        return self._embedding_weight.device
 
     @property
     def dtype(self):
-        return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").dtype
+        return self._embedding_weight.dtype
 
     @property
     def input_device(self):
         """Device on which token ids should be created before embedding lookup."""
-        return self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight").device
+        return self._embedding_weight.device
 
     def forward(
+        self,
+        input_ids,
+        state: RuntimeState | None = None,
+        *,
+        paged_cache=None,
+        request_id: int | None = None,
+        compute_logits: bool = True,
+        last_position_only: bool = False,
+    ):
+        target = self._compiled_forward or self._forward_transaction
+        if self._compiled_forward is not None:
+            self._mark_torch_compile_step()
+        return target(
+            input_ids,
+            state,
+            paged_cache=paged_cache,
+            request_id=request_id,
+            compute_logits=compute_logits,
+            last_position_only=last_position_only,
+        )
+
+    def _forward_transaction(
         self,
         input_ids,
         state: RuntimeState | None = None,
@@ -238,15 +341,15 @@ class QwenTextRuntime:
         batch, sequence = input_ids.shape
         start = state.sequence_length
         positions = torch.arange(start, start + sequence, device=self.device)
-        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        embedding = self._embedding_weight
         if input_ids.device != embedding.device:
             input_ids = input_ids.to(embedding.device)
         hidden = self._embedding(input_ids, embedding)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
             residual = hidden
-            prefix = layer_prefix(layer_index)
-            hidden = self._norm(hidden, self._weight(f"{prefix}.input_layernorm.weight"))
+            layer_weights = self._layer_weights[layer_index]
+            hidden = self._norm(hidden, layer_weights.input_norm)
             if layer_kind is LayerKind.LINEAR_ATTENTION:
                 hidden = self._linear_attention(layer_index, hidden, state)
             else:
@@ -260,17 +363,17 @@ class QwenTextRuntime:
                 )
             hidden = residual + hidden
             residual = hidden
-            hidden = self._norm(hidden, self._weight(f"{prefix}.post_attention_layernorm.weight"))
+            hidden = self._norm(hidden, layer_weights.post_attention_norm)
             hidden = self._mlp(layer_index, hidden)
             hidden = residual + hidden
 
-        hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
+        hidden = self._norm(hidden, self._final_norm_weight)
         state.sequence_length += sequence
         if not compute_logits:
             return None, state
         if last_position_only:
             hidden = hidden[:, -1:]
-        logits = self._linear(hidden, self._output_weight()).float()
+        logits = self._finalize_logits(self._linear(hidden, self._output_weight()))
         return logits, state
 
     def prefill(
@@ -280,6 +383,7 @@ class QwenTextRuntime:
         chunk_size: int,
         paged_cache=None,
         request_id: int | None = None,
+        chunk_callback=None,
     ):
         """Process one prompt in state-carrying chunks and return final-chunk logits."""
         if chunk_size <= 0:
@@ -300,6 +404,8 @@ class QwenTextRuntime:
                 compute_logits=is_last,
                 last_position_only=True,
             )
+            if chunk_callback is not None:
+                chunk_callback(start, end, state)
         return logits, state
 
     def decode_batch(self, input_ids, states: list[RuntimeState], paged_cache, request_ids):
@@ -321,14 +427,22 @@ class QwenTextRuntime:
             if (
                 pooled_batch is not None
                 and self._use_cuda_graphs()
-                and getattr(paged_cache, "kv_quant", None) != "int8"
             ):
                 return self._decode_batch_graph(
                     input_ids, states, paged_cache, request_ids, pooled_batch
                 )
-            return self._decode_batch_transaction(
+            return self._run_decode_batch_transaction(
                 input_ids, states, paged_cache, request_ids, pooled_batch
             )
+
+    def _run_decode_batch_transaction(self, *args, **kwargs):
+        target = (
+            self._compiled_decode_batch_transaction
+            or self._decode_batch_transaction
+        )
+        if self._compiled_decode_batch_transaction is not None:
+            self._mark_torch_compile_step()
+        return target(*args, **kwargs)
 
     def _decode_batch_transaction(
         self,
@@ -339,20 +453,17 @@ class QwenTextRuntime:
         pooled_batch,
         *,
         static: dict | None = None,
+        paged_metadata_override=None,
         advance_sequence: bool = True,
     ):
         import torch
 
         batch = input_ids.shape[0]
         if static is None:
-            positions = torch.tensor(
-                [[state.sequence_length] for state in states],
-                device=self.device,
-                dtype=torch.long,
-            )
+            positions = self._decode_positions(states)
         else:
             positions = static["positions"]
-        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        embedding = self._embedding_weight
         if static is None and input_ids.device != embedding.device:
             input_ids = input_ids.to(embedding.device)
         elif static is not None:
@@ -361,7 +472,11 @@ class QwenTextRuntime:
         combined = RuntimeState()
         if static is None:
             paged_metadata = (
-                paged_cache.batch_metadata(request_ids)
+                (
+                    paged_metadata_override
+                    if paged_metadata_override is not None
+                    else paged_cache.batch_metadata(request_ids)
+                )
                 if self.config.num_full_attention_layers
                 else None
             )
@@ -374,9 +489,9 @@ class QwenTextRuntime:
         logical_positions = tuple(state.sequence_length for state in states)
 
         for layer_index, layer_kind in enumerate(self.config.layer_types):
-            prefix = layer_prefix(layer_index)
+            layer_weights = self._layer_weights[layer_index]
             residual = hidden
-            hidden = self._norm(hidden, self._weight(f"{prefix}.input_layernorm.weight"))
+            hidden = self._norm(hidden, layer_weights.input_norm)
             if layer_kind is LayerKind.LINEAR_ATTENTION:
                 if any(layer_index not in state.recurrent for state in states):
                     raise RuntimeError(f"request lacks recurrent state for layer {layer_index}")
@@ -412,13 +527,13 @@ class QwenTextRuntime:
                 )
             hidden = residual + hidden
             residual = hidden
-            hidden = self._norm(hidden, self._weight(f"{prefix}.post_attention_layernorm.weight"))
+            hidden = self._norm(hidden, layer_weights.post_attention_norm)
             hidden = residual + self._mlp(layer_index, hidden)
 
-        hidden = self._norm(hidden, self._weight(f"{LANGUAGE_PREFIX}.norm.weight"))
+        hidden = self._norm(hidden, self._final_norm_weight)
         # The output projection is part of the transaction: do not publish state
         # if it fails after all transformer layers have run.
-        logits = self._linear(hidden, self._output_weight()).float()
+        logits = self._finalize_logits(self._linear(hidden, self._output_weight()))
         if static is not None:
             static["logits"].copy_(logits)
         if pooled_batch is None:
@@ -444,13 +559,72 @@ class QwenTextRuntime:
             return static["logits"], states
         return logits, states
 
+    def _prepare_torch_compile(self) -> None:
+        """Compile the two runtime transactions while preserving eager opt-out.
+
+        Dynamo is intentionally configured per callable instead of decorating the
+        class: checkpoint loading and cache/control-plane bookkeeping must remain
+        ordinary Python. ``fullgraph`` is available as a strict validation mode;
+        the production default permits graph breaks around mutable request/cache
+        objects while still compiling the tensor-heavy layer segments.
+        """
+        import torch
+
+        compile_fn = getattr(torch, "compile", None)
+        if compile_fn is None:
+            raise RuntimeError("HYDRASERVE_TORCH_COMPILE requires torch.compile")
+        backend = os.environ.get("HYDRASERVE_TORCH_COMPILE_BACKEND", "inductor")
+        fullgraph = os.environ.get("HYDRASERVE_TORCH_COMPILE_FULLGRAPH", "0") != "0"
+        dynamic = os.environ.get("HYDRASERVE_TORCH_COMPILE_DYNAMIC", "1") != "0"
+        options = {
+            "backend": backend,
+            "fullgraph": fullgraph,
+            "dynamic": dynamic,
+        }
+        if backend not in {"eager", "aot_eager"}:
+            options["mode"] = os.environ.get(
+                "HYDRASERVE_TORCH_COMPILE_MODE", "default"
+            )
+        scope = os.environ.get(
+            "HYDRASERVE_TORCH_COMPILE_SCOPE",
+            "tensor" if self.use_triton else "transactions",
+        )
+        if scope == "transactions":
+            self._compiled_forward = compile_fn(self._forward_transaction, **options)
+            self._compiled_decode_batch_transaction = compile_fn(
+                self._decode_batch_transaction, **options
+            )
+        elif scope == "tensor":
+            # Handwritten Triton kernels are already fused and should not be
+            # re-traced as Dynamo higher-order ops. Compile the stable dense MLP
+            # tensor subgraph used by both prefill and decode instead. This
+            # fuses SiLU-and-mul with the surrounding projection graph while
+            # keeping request/cache mutation in ordinary Python.
+            options["fullgraph"] = True
+            self._compiled_mlp = compile_fn(self._torch_mlp_dense, **options)
+        else:
+            raise ValueError(
+                "HYDRASERVE_TORCH_COMPILE_SCOPE must be 'tensor' or 'transactions'"
+            )
+
+    @staticmethod
+    def _mark_torch_compile_step() -> None:
+        """Separate inference transactions for Inductor's internal CUDA Graphs."""
+        import torch
+
+        compiler = getattr(torch, "compiler", None)
+        marker = getattr(compiler, "cudagraph_mark_step_begin", None)
+        if marker is not None:
+            marker()
+
     def _use_cuda_graphs(self) -> bool:
         import os
 
         import torch
 
         return (
-            os.environ.get("HYDRASERVE_CUDA_GRAPH", "1") != "0"
+            self._compiled_decode_batch_transaction is None
+            and os.environ.get("HYDRASERVE_CUDA_GRAPH", "1") != "0"
             and torch.cuda.is_available()
         )
 
@@ -466,41 +640,47 @@ class QwenTextRuntime:
         import torch
 
         batch = input_ids.shape[0]
-        table, lengths = paged_cache.batch_metadata(request_ids)
+        table, lengths = paged_cache.batch_metadata(
+            request_ids, bucket_width=True
+        )
         key = (batch, table.shape[1])
         entry = self._decode_graphs.get(key)
         if entry is None and not self._decode_graph_failed.get(key, False):
-            entry = self._capture_decode_graph(
-                key,
+            observations = self._decode_graph_observations.get(key, 0) + 1
+            self._decode_graph_observations[key] = observations
+            if observations >= self._cuda_graph_capture_after():
+                entry = self._capture_decode_graph(
+                    key,
+                    input_ids,
+                    states,
+                    paged_cache,
+                    request_ids,
+                    pooled_batch,
+                    table,
+                    lengths,
+                )
+                if entry is not None:
+                    self._decode_graphs[key] = entry
+                    self._decode_graph_observations.pop(key, None)
+                else:
+                    self._decode_graph_failed[key] = True
+        if entry is None:
+            return self._decode_batch_transaction(
                 input_ids,
                 states,
                 paged_cache,
                 request_ids,
                 pooled_batch,
-                table,
-                lengths,
+                paged_metadata_override=(table, lengths),
             )
-            if entry is not None:
-                self._decode_graphs[key] = entry
-            else:
-                self._decode_graph_failed[key] = True
-        if entry is None:
-            return self._decode_batch_transaction(
-                input_ids, states, paged_cache, request_ids, pooled_batch
-            )
-        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        embedding = self._embedding_weight
         ids = (
             input_ids
             if input_ids.device == embedding.device
             else input_ids.to(embedding.device)
         )
         entry["input_ids"].copy_(ids)
-        positions = torch.tensor(
-            [[state.sequence_length] for state in states],
-            device=self.device,
-            dtype=torch.long,
-        )
-        entry["positions"].copy_(positions)
+        self._decode_positions(states, target=entry["positions"])
         entry["table"].copy_(table)
         entry["lengths"].copy_(lengths)
         entry["slot_ids"].copy_(pooled_batch.slot_ids)
@@ -523,7 +703,7 @@ class QwenTextRuntime:
         import torch
 
         batch, width = key
-        embedding = self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight")
+        embedding = self._embedding_weight
         static = {
             "input_ids": torch.empty(
                 (batch, 1), device=embedding.device, dtype=torch.long
@@ -539,7 +719,7 @@ class QwenTextRuntime:
             "logits": torch.empty(
                 (batch, 1, self.config.vocab_size),
                 device=self.device,
-                dtype=torch.float32,
+                dtype=torch.float32 if self._fp32_logits else self.dtype,
             ),
         }
         # The warmup and capture passes execute the transaction for real and
@@ -564,9 +744,8 @@ class QwenTextRuntime:
                 state.sequence_length // block_size
             ]
             for layer_index in self.config.full_attention_layer_indices:
-                key_pages, value_pages = paged_cache.layer_cache(layer_index)
-                kv_snapshot.append((key_pages, block, key_pages[block].clone()))
-                kv_snapshot.append((value_pages, block, value_pages[block].clone()))
+                for pages in paged_cache.raw_layer_cache(layer_index):
+                    kv_snapshot.append((pages, block, pages[block].clone()))
         # The batch workspace is gathered once at context entry; the warmup
         # passes advance it in place, so it must be restored before the replay.
         workspace_snapshot = (
@@ -594,12 +773,7 @@ class QwenTextRuntime:
             else input_ids.to(embedding.device)
         )
         static["input_ids"].copy_(ids)
-        positions = torch.tensor(
-            [[state.sequence_length] for state in states],
-            device=self.device,
-            dtype=torch.long,
-        )
-        static["positions"].copy_(positions)
+        self._decode_positions(states, target=static["positions"])
         if table is None or lengths is None:
             table, lengths = paged_cache.batch_metadata(request_ids)
         static["table"].copy_(table)
@@ -615,7 +789,7 @@ class QwenTextRuntime:
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
-                for _ in range(3):
+                for _ in range(self._cuda_graph_warmup_steps()):
                     self._decode_batch_transaction(
                         input_ids,
                         states,
@@ -650,6 +824,47 @@ class QwenTextRuntime:
         restore()
         static["graph"] = graph
         return static
+
+    @staticmethod
+    def _positive_env_int(name: str, default: int) -> int:
+        import os
+
+        raw = os.environ.get(name)
+        if raw is None:
+            return default
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ValueError(f"{name} must be a positive integer") from exc
+        if value <= 0:
+            raise ValueError(f"{name} must be a positive integer")
+        return value
+
+    def _decode_positions(self, states, *, target=None):
+        """Stage heterogeneous sequence positions without per-step allocation."""
+        import torch
+
+        batch = len(states)
+        buffers = self._decode_position_buffers.get(batch)
+        if buffers is None:
+            host = torch.empty((batch, 1), device="cpu", dtype=torch.long)
+            device = torch.empty((batch, 1), device=self.device, dtype=torch.long)
+            buffers = (host, host.numpy(), device)
+            self._decode_position_buffers[batch] = buffers
+        host, host_array, device = buffers
+        for row, state in enumerate(states):
+            host_array[row, 0] = state.sequence_length
+        destination = device if target is None else target
+        destination.copy_(host)
+        return destination
+
+    def _cuda_graph_capture_after(self) -> int:
+        # Capturing costs several complete decode passes. Waiting for repeated
+        # observations avoids making one-off dynamic shapes slower than eager.
+        return self._positive_env_int("HYDRASERVE_CUDA_GRAPH_CAPTURE_AFTER", 16)
+
+    def _cuda_graph_warmup_steps(self) -> int:
+        return self._positive_env_int("HYDRASERVE_CUDA_GRAPH_WARMUP_STEPS", 1)
 
     @staticmethod
     def _shared_state_pool(states):
@@ -692,17 +907,19 @@ class QwenTextRuntime:
         if not hidden.is_cuda:
             raise ValueError("paged batched decode requires CUDA")
         config = self.config
-        prefix = f"{layer_prefix(layer_index)}.self_attn"
+        weights = self._layer_weights[layer_index].full_attention
+        if weights is None:
+            raise RuntimeError("full-attention layer is missing cached weights")
         batch = hidden.shape[0]
-        projected = self._linear(hidden, self._weight(f"{prefix}.q_proj.weight"))
+        projected, key, value = self._full_attention_projections(hidden, weights)
         projected = projected.reshape(batch, 1, config.num_attention_heads, config.head_dim * 2)
         query, output_gate = projected.chunk(2, dim=-1)
-        key = self._linear(hidden, self._weight(f"{prefix}.k_proj.weight")).reshape(
+        key = key.reshape(
             batch, 1, config.num_kv_heads, config.head_dim
         )
-        value = self._linear(hidden, self._weight(f"{prefix}.v_proj.weight")).reshape_as(key)
-        query = self._norm(query, self._weight(f"{prefix}.q_norm.weight"))
-        key = self._norm(key, self._weight(f"{prefix}.k_norm.weight"))
+        value = value.reshape_as(key)
+        query = self._norm(query, weights.query_norm)
+        key = self._norm(key, weights.key_norm)
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         query = apply_text_rope(query, positions, config.rope_theta, rotary_dim)
         key = apply_text_rope(key, positions, config.rope_theta, rotary_dim)
@@ -717,11 +934,6 @@ class QwenTextRuntime:
             logical_positions=logical_positions,
         )
         key_pages, value_pages = paged_cache.layer_cache(layer_index)
-        from hydraserve.kernels.paged_attention import (
-            paged_attention,
-            paged_attention_splitk,
-        )
-
         # FlashDecoding-style split-K decode attention is the default; set
         # HYDRASERVE_PAGED_ATTENTION=reference to fall back to the original
         # sequential kernel for A/B comparisons.
@@ -738,7 +950,7 @@ class QwenTextRuntime:
         attention = attention.reshape(batch, 1, -1) * torch.sigmoid(
             output_gate.reshape(batch, 1, -1)
         )
-        return self._linear(attention, self._weight(f"{prefix}.o_proj.weight"))
+        return self._linear(attention, weights.output)
 
     def _linear_attention(
         self,
@@ -751,12 +963,23 @@ class QwenTextRuntime:
         import torch
 
         config = self.config
-        prefix = f"{layer_prefix(layer_index)}.linear_attn"
-        mixed = self._linear(hidden, self._weight(f"{prefix}.in_proj_qkv.weight"))
-        gate = self._linear(hidden, self._weight(f"{prefix}.in_proj_z.weight"))
-        beta = torch.sigmoid(self._linear(hidden, self._weight(f"{prefix}.in_proj_b.weight")))
-        step = self._linear(hidden, self._weight(f"{prefix}.in_proj_a.weight"))
-        conv_weight = self._weight(f"{prefix}.conv1d.weight").reshape(config.linear_conv_width, -1)
+        weights = self._layer_weights[layer_index].linear_attention
+        if weights is None:
+            raise RuntimeError("linear-attention layer is missing cached weights")
+        mixed, gate, beta, step = self._linear_attention_projections(hidden, weights)
+        if hidden.is_cuda and self.use_triton:
+            beta, decay = triton_gdn_gating(
+                beta.contiguous(),
+                step.contiguous(),
+                weights.a_log,
+                weights.dt_bias,
+            )
+        else:
+            beta = torch.sigmoid(beta)
+            decay = -weights.a_log.float().exp() * torch.nn.functional.softplus(
+                step.float() + weights.dt_bias.float()
+            )
+        conv_weight = weights.convolution.reshape(config.linear_conv_width, -1)
         conv_state = state.convolution.get(layer_index)
         if conv_state is None:
             conv_state = torch.zeros(
@@ -767,22 +990,32 @@ class QwenTextRuntime:
                 dtype=hidden.dtype,
             )
         if hidden.is_cuda and self.use_triton:
-            from hydraserve.kernels.gdn import causal_depthwise_conv as triton_causal_conv
-
             mixed, conv_state = triton_causal_conv(
                 mixed.contiguous(),
-                conv_weight.contiguous(),
-                conv_state.contiguous(),
+                conv_weight,
+                conv_state,
                 next_state=convolution_output,
+                split_widths=(
+                    config.linear_key_width,
+                    config.linear_key_width,
+                    config.linear_value_width,
+                ),
             )
         else:
             mixed, conv_state = causal_depthwise_conv(mixed, conv_weight, conv_state)
         state.convolution[layer_index] = conv_state
-        query, key, value = torch.split(
-            mixed,
-            (config.linear_key_width, config.linear_key_width, config.linear_value_width),
-            dim=-1,
-        )
+        if isinstance(mixed, tuple):
+            query, key, value = mixed
+        else:
+            query, key, value = torch.split(
+                mixed,
+                (
+                    config.linear_key_width,
+                    config.linear_key_width,
+                    config.linear_value_width,
+                ),
+                dim=-1,
+            )
         batch, sequence, _ = query.shape
         query = query.reshape(
             batch, sequence, config.linear_num_key_heads, config.linear_key_head_dim
@@ -794,15 +1027,18 @@ class QwenTextRuntime:
         ratio = config.linear_num_value_heads // config.linear_num_key_heads
         if ratio * config.linear_num_key_heads != config.linear_num_value_heads:
             raise ValueError("GDN value heads must be divisible by key heads")
-        query = query.repeat_interleave(ratio, dim=2).contiguous()
-        key = key.repeat_interleave(ratio, dim=2).contiguous()
-        decay = -self._weight(f"{prefix}.A_log").float().exp() * torch.nn.functional.softplus(
-            step.float() + self._weight(f"{prefix}.dt_bias").float()
-        )
+        if hidden.is_cuda and self.use_triton:
+            if legacy_gdn_kernels_enabled():
+                query = query.repeat_interleave(ratio, dim=2).contiguous()
+                key = key.repeat_interleave(ratio, dim=2).contiguous()
+            else:
+                query = query.contiguous()
+                key = key.contiguous()
+        else:
+            query = query.repeat_interleave(ratio, dim=2).contiguous()
+            key = key.repeat_interleave(ratio, dim=2).contiguous()
         initial = state.recurrent.get(layer_index)
         if hidden.is_cuda and self.use_triton:
-            from hydraserve.kernels.gdn import gated_delta_recurrent
-
             if initial is None:
                 initial = torch.zeros(
                     batch,
@@ -813,7 +1049,12 @@ class QwenTextRuntime:
                     dtype=torch.float32,
                 )
             core, recurrent = gated_delta_recurrent(
-                query, key, value.contiguous(), decay.contiguous(), beta.float().contiguous(), initial
+                query,
+                key,
+                value.contiguous(),
+                decay,
+                beta,
+                initial,
             )
         else:
             core, recurrent = gated_delta_rule(query, key, value, decay, beta, initial)
@@ -822,19 +1063,17 @@ class QwenTextRuntime:
             batch, sequence, config.linear_num_value_heads, config.linear_value_head_dim
         )
         if hidden.is_cuda and self.use_triton:
-            from hydraserve.kernels.rmsnorm import gated_rms_norm as triton_gated_rms_norm
-
             core = triton_gated_rms_norm(
-                core, gate, self._weight(f"{prefix}.norm.weight"), config.rms_norm_eps
+                core, gate, weights.norm, config.rms_norm_eps
             )
         else:
             core = gated_rms_norm(
                 core,
                 gate,
-                self._weight(f"{prefix}.norm.weight"),
+                weights.norm,
                 config.rms_norm_eps,
             )
-        return self._linear(core.reshape(batch, sequence, -1), self._weight(f"{prefix}.out_proj.weight"))
+        return self._linear(core.reshape(batch, sequence, -1), weights.output)
 
     def _full_attention(
         self,
@@ -849,17 +1088,19 @@ class QwenTextRuntime:
         import torch
 
         config = self.config
-        prefix = f"{layer_prefix(layer_index)}.self_attn"
+        weights = self._layer_weights[layer_index].full_attention
+        if weights is None:
+            raise RuntimeError("full-attention layer is missing cached weights")
         batch, sequence, _ = hidden.shape
-        projected = self._linear(hidden, self._weight(f"{prefix}.q_proj.weight"))
+        projected, key, value = self._full_attention_projections(hidden, weights)
         projected = projected.reshape(batch, sequence, config.num_attention_heads, config.head_dim * 2)
         query, output_gate = projected.chunk(2, dim=-1)
-        key = self._linear(hidden, self._weight(f"{prefix}.k_proj.weight")).reshape(
+        key = key.reshape(
             batch, sequence, config.num_kv_heads, config.head_dim
         )
-        value = self._linear(hidden, self._weight(f"{prefix}.v_proj.weight")).reshape_as(key)
-        query = self._norm(query, self._weight(f"{prefix}.q_norm.weight"))
-        key = self._norm(key, self._weight(f"{prefix}.k_norm.weight"))
+        value = value.reshape_as(key)
+        query = self._norm(query, weights.query_norm)
+        key = self._norm(key, weights.key_norm)
         rotary_dim = int(config.head_dim * config.partial_rotary_factor)
         query = apply_text_rope(query, positions, config.rope_theta, rotary_dim)
         key = apply_text_rope(key, positions, config.rope_theta, rotary_dim)
@@ -896,20 +1137,35 @@ class QwenTextRuntime:
                 packed_query, packed_key, packed_value, cu, sequence
             ).reshape_as(query)
         elif sequence > 1 and paged_cache is not None:
-            from hydraserve.kernels.paged_attention import paged_prefill_attention
-
             table, _ = paged_cache.batch_metadata(
                 (request_id,),
                 logical_lengths=(state.sequence_length + sequence,),
             )
             key_pages, value_pages = paged_cache.layer_cache(layer_index)
-            attention = paged_prefill_attention(
-                query,
-                key_pages,
-                value_pages,
-                table,
-                query_start=state.sequence_length,
-            )
+            if (
+                hidden.is_cuda
+                and self.use_flash_attention
+                and os.environ.get("HYDRASERVE_PAGED_FLASH_PREFILL", "1") != "0"
+            ):
+                from hydraserve.kernels.flash_prefill import paged_flash_prefill
+
+                attention = paged_flash_prefill(
+                    query,
+                    key_pages,
+                    value_pages,
+                    table,
+                    state.sequence_length + sequence,
+                )
+            else:
+                from hydraserve.kernels.paged_attention import paged_prefill_attention
+
+                attention = paged_prefill_attention(
+                    query,
+                    key_pages,
+                    value_pages,
+                    table,
+                    query_start=state.sequence_length,
+                )
         elif sequence == 1 and paged_cache is not None:
             from hydraserve.kernels.paged_attention import paged_prefill_attention
 
@@ -931,30 +1187,83 @@ class QwenTextRuntime:
         attention = attention.reshape(batch, sequence, -1) * torch.sigmoid(
             output_gate.reshape(batch, sequence, -1)
         )
-        return self._linear(attention, self._weight(f"{prefix}.o_proj.weight"))
+        return self._linear(attention, weights.output)
 
     def _mlp(self, layer_index: int, hidden):
-        prefix = f"{layer_prefix(layer_index)}.mlp"
-        gate = silu(self._linear(hidden, self._weight(f"{prefix}.gate_proj.weight")))
-        up = self._linear(hidden, self._weight(f"{prefix}.up_proj.weight"))
-        return self._linear(gate * up, self._weight(f"{prefix}.down_proj.weight"))
+        weights = self._layer_weights[layer_index].mlp
+        if self._compiled_mlp is not None and weights.gate_up is not None:
+            import torch
+
+            if isinstance(weights.gate_up, torch.Tensor) and isinstance(
+                weights.down, torch.Tensor
+            ):
+                return self._compiled_mlp(hidden, weights.gate_up, weights.down)
+        if weights.gate_up is not None:
+            gate, up = self._linear(hidden, weights.gate_up).chunk(2, dim=-1)
+        else:
+            gate = self._linear(hidden, weights.gate)
+            up = self._linear(hidden, weights.up)
+        if hidden.is_cuda and self.use_triton:
+            activated = triton_silu_and_mul(gate.contiguous(), up.contiguous())
+        else:
+            activated = silu(gate) * up
+        return self._linear(activated, weights.down)
+
+    @staticmethod
+    def _torch_mlp_dense(hidden, gate_up, down):
+        """Pure tensor MLP subgraph compiled once and reused across layers."""
+        import torch.nn.functional as functional
+
+        gate, up = (hidden @ gate_up.transpose(0, 1)).chunk(2, dim=-1)
+        return (functional.silu(gate) * up) @ down.transpose(0, 1)
+
+    def _full_attention_projections(
+        self, hidden, weights: _FullAttentionWeightSet
+    ):
+        config = self.config
+        if weights.qkv is not None:
+            widths = (
+                config.num_attention_heads * config.head_dim * 2,
+                config.num_kv_heads * config.head_dim,
+                config.num_kv_heads * config.head_dim,
+            )
+            return self._linear(hidden, weights.qkv).split(widths, dim=-1)
+        return (
+            self._linear(hidden, weights.query),
+            self._linear(hidden, weights.key),
+            self._linear(hidden, weights.value),
+        )
+
+    def _linear_attention_projections(
+        self, hidden, weights: _LinearAttentionWeightSet
+    ):
+        if weights.qkvz is not None:
+            mixed, gate = self._linear(hidden, weights.qkvz).split(
+                (self.config.linear_conv_width, self.config.linear_value_width),
+                dim=-1,
+            )
+        else:
+            mixed = self._linear(hidden, weights.qkv)
+            gate = self._linear(hidden, weights.gate)
+        if weights.ba is not None:
+            beta, step = self._linear(hidden, weights.ba).chunk(2, dim=-1)
+        else:
+            beta = self._linear(hidden, weights.beta)
+            step = self._linear(hidden, weights.step)
+        return mixed, gate, beta, step
 
     def _norm(self, hidden, weight):
         if hidden.is_cuda and self.use_triton:
-            from hydraserve.kernels.rmsnorm import rms_norm
-
-            return rms_norm(hidden.contiguous(), weight.contiguous(), self.config.rms_norm_eps)
+            return triton_rms_norm(
+                hidden.contiguous(), weight, self.config.rms_norm_eps
+            )
         return reference_rms_norm(hidden, weight, self.config.rms_norm_eps)
 
     @staticmethod
     def _linear(hidden, weight):
         if isinstance(weight, PackedInt4Weight):
-            from hydraserve.kernels.awq import awq_linear
-
             return awq_linear(hidden, weight)
         if isinstance(weight, BlockScaledFP8Weight):
-            from hydraserve.kernels.fp8 import fp8_linear
-
             return fp8_linear(hidden, weight)
         if hidden.device != weight.device:
             hidden = hidden.to(weight.device)
@@ -973,10 +1282,228 @@ class QwenTextRuntime:
             raise KeyError(f"runtime weight is missing: {name}") from exc
 
     def _output_weight(self):
-        return self.weights.get(
-            "lm_head.weight",
-            self._weight(f"{LANGUAGE_PREFIX}.embed_tokens.weight"),
+        return self._output_projection_weight
+
+    def _finalize_logits(self, logits):
+        return logits.float() if self._fp32_logits else logits
+
+    def _prepare_runtime_weight_cache(self) -> None:
+        """Bind immutable per-layer weights once for the inference hot path."""
+        embedding_name = f"{LANGUAGE_PREFIX}.embed_tokens.weight"
+        self._embedding_weight = self._weight(embedding_name)
+        self._final_norm_weight = self._weight(f"{LANGUAGE_PREFIX}.norm.weight")
+        self._output_projection_weight = self.weights.get(
+            "lm_head.weight", self._embedding_weight
         )
+        layers = []
+        for layer_index, kind in enumerate(self.config.layer_types):
+            prefix = layer_prefix(layer_index)
+            mlp_prefix = f"{prefix}.mlp"
+            mlp = _MLPWeightSet(
+                gate_up=self.weights.get(f"{mlp_prefix}.gate_up_proj.weight"),
+                gate=self._weight(f"{mlp_prefix}.gate_proj.weight"),
+                up=self._weight(f"{mlp_prefix}.up_proj.weight"),
+                down=self._weight(f"{mlp_prefix}.down_proj.weight"),
+            )
+            full_attention = None
+            linear_attention = None
+            if kind is LayerKind.FULL_ATTENTION:
+                attention = f"{prefix}.self_attn"
+                full_attention = _FullAttentionWeightSet(
+                    qkv=self.weights.get(f"{attention}.qkv_proj.weight"),
+                    query=self._weight(f"{attention}.q_proj.weight"),
+                    key=self._weight(f"{attention}.k_proj.weight"),
+                    value=self._weight(f"{attention}.v_proj.weight"),
+                    query_norm=self._weight(f"{attention}.q_norm.weight"),
+                    key_norm=self._weight(f"{attention}.k_norm.weight"),
+                    output=self._weight(f"{attention}.o_proj.weight"),
+                )
+            else:
+                attention = f"{prefix}.linear_attn"
+                linear_attention = _LinearAttentionWeightSet(
+                    qkvz=self.weights.get(f"{attention}.in_proj_qkvz.weight"),
+                    qkv=self._weight(f"{attention}.in_proj_qkv.weight"),
+                    gate=self._weight(f"{attention}.in_proj_z.weight"),
+                    ba=self.weights.get(f"{attention}.in_proj_ba.weight"),
+                    beta=self._weight(f"{attention}.in_proj_b.weight"),
+                    step=self._weight(f"{attention}.in_proj_a.weight"),
+                    a_log=self._weight(f"{attention}.A_log"),
+                    dt_bias=self._weight(f"{attention}.dt_bias"),
+                    convolution=self._weight(f"{attention}.conv1d.weight"),
+                    norm=self._weight(f"{attention}.norm.weight"),
+                    output=self._weight(f"{attention}.out_proj.weight"),
+                )
+            layers.append(
+                _LayerWeightSet(
+                    input_norm=self._weight(f"{prefix}.input_layernorm.weight"),
+                    post_attention_norm=self._weight(
+                        f"{prefix}.post_attention_layernorm.weight"
+                    ),
+                    mlp=mlp,
+                    full_attention=full_attention,
+                    linear_attention=linear_attention,
+                )
+            )
+        self._layer_weights = tuple(layers)
+
+    def _prepare_fused_projection_weights(self) -> None:
+        """Coalesce compatible output projections without changing checkpoints."""
+        for layer_index, kind in enumerate(self.config.layer_types):
+            prefix = layer_prefix(layer_index)
+            self._install_fused_linear(
+                (
+                    f"{prefix}.mlp.gate_proj.weight",
+                    f"{prefix}.mlp.up_proj.weight",
+                ),
+                f"{prefix}.mlp.gate_up_proj.weight",
+            )
+            if kind is LayerKind.FULL_ATTENTION:
+                attention = f"{prefix}.self_attn"
+                self._install_fused_linear(
+                    (
+                        f"{attention}.q_proj.weight",
+                        f"{attention}.k_proj.weight",
+                        f"{attention}.v_proj.weight",
+                    ),
+                    f"{attention}.qkv_proj.weight",
+                )
+            else:
+                attention = f"{prefix}.linear_attn"
+                self._install_fused_linear(
+                    (
+                        f"{attention}.in_proj_qkv.weight",
+                        f"{attention}.in_proj_z.weight",
+                    ),
+                    f"{attention}.in_proj_qkvz.weight",
+                )
+                self._install_fused_linear(
+                    (
+                        f"{attention}.in_proj_b.weight",
+                        f"{attention}.in_proj_a.weight",
+                    ),
+                    f"{attention}.in_proj_ba.weight",
+                )
+
+    def _install_fused_linear(self, names: tuple[str, ...], fused_name: str) -> None:
+        parts = tuple(self._weight(name) for name in names)
+        fused = self._concatenate_linear_weights(parts)
+        if fused is None:
+            return
+        self.weights[fused_name] = fused
+        sizes = tuple(part.shape[0] for part in parts)
+        for name, view in zip(
+            names,
+            self._split_linear_weight(fused, sizes),
+            strict=True,
+        ):
+            # Keep the checkpoint names as lightweight views for diagnostics and
+            # shape validation while releasing their independent storage.
+            self.weights[name] = view
+
+    @staticmethod
+    def _concatenate_linear_weights(parts):
+        import torch
+
+        if not parts:
+            return None
+        if all(isinstance(part, torch.Tensor) for part in parts):
+            first = parts[0]
+            if not all(
+                part.ndim == 2
+                and part.shape[1] == first.shape[1]
+                and part.device == first.device
+                and part.dtype == first.dtype
+                for part in parts
+            ):
+                return None
+            return torch.cat(parts, dim=0).contiguous()
+        if all(isinstance(part, BlockScaledFP8Weight) for part in parts):
+            first = parts[0]
+            block_n, _ = first.block_size
+            if not all(
+                part.original_shape[1] == first.original_shape[1]
+                and part.block_size == first.block_size
+                and part.original_shape[0] % block_n == 0
+                and part.data.device == first.data.device
+                and part.scale_inv.device == first.scale_inv.device
+                and part.data.dtype == first.data.dtype
+                and part.scale_inv.dtype == first.scale_inv.dtype
+                for part in parts
+            ):
+                return None
+            return BlockScaledFP8Weight(
+                torch.cat(tuple(part.data for part in parts), dim=0).contiguous(),
+                torch.cat(tuple(part.scale_inv for part in parts), dim=0).contiguous(),
+                (
+                    sum(part.original_shape[0] for part in parts),
+                    first.original_shape[1],
+                ),
+                first.block_size,
+            )
+        if all(isinstance(part, PackedInt4Weight) for part in parts):
+            first = parts[0]
+            if not all(
+                part.original_shape[1] == first.original_shape[1]
+                and part.group_size == first.group_size
+                and part.original_shape[0] % 8 == 0
+                and part.packed.device == first.packed.device
+                and part.scale.device == first.scale.device
+                and part.zero_point.device == first.zero_point.device
+                and part.packed.dtype == first.packed.dtype
+                and part.scale.dtype == first.scale.dtype
+                and part.zero_point.dtype == first.zero_point.dtype
+                for part in parts
+            ):
+                return None
+            return PackedInt4Weight(
+                torch.cat(tuple(part.packed for part in parts), dim=0).contiguous(),
+                torch.cat(tuple(part.scale for part in parts), dim=0).contiguous(),
+                torch.cat(tuple(part.zero_point for part in parts), dim=0).contiguous(),
+                (
+                    sum(part.original_shape[0] for part in parts),
+                    first.original_shape[1],
+                ),
+                first.group_size,
+            )
+        return None
+
+    @staticmethod
+    def _split_linear_weight(fused, sizes: tuple[int, ...]):
+        import torch
+
+        if isinstance(fused, torch.Tensor):
+            return fused.split(sizes, dim=0)
+        if isinstance(fused, BlockScaledFP8Weight):
+            block_n, _ = fused.block_size
+            result = []
+            start = 0
+            for size in sizes:
+                result.append(
+                    BlockScaledFP8Weight(
+                        fused.data.narrow(0, start, size),
+                        fused.scale_inv.narrow(0, start // block_n, size // block_n),
+                        (size, fused.original_shape[1]),
+                        fused.block_size,
+                    )
+                )
+                start += size
+            return tuple(result)
+        if isinstance(fused, PackedInt4Weight):
+            result = []
+            start = 0
+            for size in sizes:
+                result.append(
+                    PackedInt4Weight(
+                        fused.packed.narrow(0, start, size),
+                        fused.scale.narrow(0, start, size),
+                        fused.zero_point.narrow(0, start // 8, size // 8),
+                        (size, fused.original_shape[1]),
+                        fused.group_size,
+                    )
+                )
+                start += size
+            return tuple(result)
+        raise TypeError(f"unsupported fused linear weight: {type(fused)!r}")
 
     def _validate_weight_shapes(self) -> None:
         config = self.config

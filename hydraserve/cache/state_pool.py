@@ -249,6 +249,13 @@ class GpuLinearStatePool:
             dtype=torch.float32,
         )
         self.next_conv_workspace = torch.empty_like(self.conv_workspace)
+        self._slot_ids_host = torch.empty(
+            (self.workspace_capacity,), device="cpu", dtype=torch.long
+        )
+        self._slot_ids_host_array = self._slot_ids_host.numpy()
+        self._slot_ids_workspace = torch.empty(
+            (self.workspace_capacity,), device=target, dtype=torch.long
+        )
         self._states: dict[int, object] = {}
         self._lock = RLock()
 
@@ -321,10 +328,10 @@ class GpuLinearStatePool:
                 if self._states.get(request_id) is not state:
                     raise ValueError("decode state does not match its pool owner")
                 slots.append(self.slots.get(request_id))
-            slot_ids = torch.tensor(
-                slots, device=self.ssm_storage.device, dtype=torch.long
-            )
             batch_size = len(request_ids)
+            self._slot_ids_host_array[:batch_size] = slots
+            slot_ids = self._slot_ids_workspace[:batch_size]
+            slot_ids.copy_(self._slot_ids_host[:batch_size])
             ssm = self.ssm_workspace[:, :batch_size]
             convolution = self.conv_workspace[:, :batch_size]
             next_convolution = self.next_conv_workspace[:, :batch_size]

@@ -1,0 +1,97 @@
+{
+  "requests": 2,
+  "succeeded": 2,
+  "failed": 0,
+  "wall_time_s": 1.8983098049939144,
+  "request_throughput": 1.053568808810115,
+  "output_token_throughput": 2.10713761762023,
+  "warmup_requests": 1,
+  "offered_request_rate": null,
+  "arrival_pattern": "burst",
+  "ttft_ms": {
+    "p50": 815.7663860038156,
+    "p95": 1085.1904994124197,
+    "p99": 1109.1393094931846
+  },
+  "tpot_ms": {
+    "p50": 129.77755299652927,
+    "p95": 225.13083669473417,
+    "p99": 233.6066841345746
+  },
+  "latency_ms": {
+    "p50": 945.5439390003448,
+    "p95": 1310.321336107154,
+    "p99": 1342.7459936277592
+  },
+  "route_counts": {
+    "pd_disaggregated": 2
+  },
+  "prefix_cache_stats": {
+    "hits": 0,
+    "misses": 0,
+    "hit_tokens": 0,
+    "hit_rate": 0.0,
+    "cached_blocks": 0,
+    "referenced_blocks": 0,
+    "evictable_blocks": 0
+  },
+  "per_worker": {
+    "0": {
+      "requests": 2,
+      "prompt_tokens": 2051,
+      "output_tokens": 4,
+      "max_tpot_ms": 235.72564599453472,
+      "max_ttft_ms": 1115.1265120133758
+    }
+  },
+  "results": [
+    {
+      "sample_id": "long-0",
+      "request_id": 1,
+      "prompt_tokens": 1025,
+      "completion_tokens": 2,
+      "ttft_ms": 1115.1265120133758,
+      "tpot_ms": 235.72564599453472,
+      "latency_ms": 1350.8521580079105,
+      "finish_reason": "length",
+      "error": null,
+      "route": "pd_disaggregated",
+      "route_reason": "fixed_pd",
+      "worker_id": 0,
+      "route_collocated_cost_ms": null,
+      "route_pd_cost_ms": null,
+      "route_estimated_savings_ms": null,
+      "route_cost_confidence": null,
+      "route_decode_load": 0.0,
+      "route_prefill_load": 0.0,
+      "route_prefill_queue_ahead_ms": 0.0,
+      "route_observed_prefill_service_ms": null,
+      "admission_wait_ms": 2.3893010220490396,
+      "observed_prefill_queue_wait_ms": 0.06207998376339674
+    },
+    {
+      "sample_id": "long-1",
+      "request_id": 2,
+      "prompt_tokens": 1026,
+      "completion_tokens": 2,
+      "ttft_ms": 516.4062599942554,
+      "tpot_ms": 23.829459998523816,
+      "latency_ms": 540.2357199927792,
+      "finish_reason": "length",
+      "error": null,
+      "route": "pd_disaggregated",
+      "route_reason": "fixed_pd",
+      "worker_id": 0,
+      "route_collocated_cost_ms": null,
+      "route_pd_cost_ms": null,
+      "route_estimated_savings_ms": null,
+      "route_cost_confidence": null,
+      "route_decode_load": 0.0,
+      "route_prefill_load": 0.0,
+      "route_prefill_queue_ahead_ms": 0.0,
+      "route_observed_prefill_service_ms": null,
+      "admission_wait_ms": 1.4730390103068203,
+      "observed_prefill_queue_wait_ms": 0.15196899767033756
+    }
+  ]
+}

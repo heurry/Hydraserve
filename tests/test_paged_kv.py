@@ -36,6 +36,11 @@ def test_paged_kv_write_and_batch_metadata(tiny_model, device: str) -> None:
     table, lengths = cache.batch_metadata((2, 1))
     assert lengths.tolist() == [3, 6]
     assert table[1, :2].tolist() == list(allocation.block_ids)
+    bucketed, bucketed_lengths = cache.batch_metadata(
+        (2, 1), bucket_width=True
+    )
+    assert bucketed.shape == (2, 2)
+    torch.testing.assert_close(bucketed_lengths, lengths)
     gathered_key, gathered_value = cache.read(1, layer)
     torch.testing.assert_close(gathered_key[positions], key)
     torch.testing.assert_close(gathered_value[positions], value)
@@ -63,6 +68,24 @@ def test_paged_kv_reports_memory_clamping(tiny_model) -> None:
     assert stats["memory_clamped"] == 1
     assert stats["memory_reserved_bytes"] == 7_000
     assert stats["physical_cache_bytes"] == 5 * 512
+
+
+def test_batch_metadata_buckets_graph_width_to_power_of_two(tiny_model) -> None:
+    manager = KVBlockManager(16, block_size=4)
+    cache = PagedKVCache(tiny_model, manager, device="cpu", dtype=torch.float32)
+    cache.allocate(1, 9)
+    cache.allocate(2, 5)
+
+    exact, lengths = cache.batch_metadata((1, 2))
+    bucketed, bucketed_lengths = cache.batch_metadata(
+        (1, 2), bucket_width=True
+    )
+
+    assert exact.shape == (2, 3)
+    assert bucketed.shape == (2, 4)
+    assert bucketed[:, :3].tolist() == exact.tolist()
+    assert bucketed[:, 3].tolist() == [-1, -1]
+    torch.testing.assert_close(bucketed_lengths, lengths)
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
@@ -135,6 +158,54 @@ def test_paged_kv_batched_decode_scatter(tiny_model, device: str) -> None:
     torch.testing.assert_close(first_value[4], value[0])
     torch.testing.assert_close(second_key[2], key[1])
     torch.testing.assert_close(second_value[2], value[1])
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_paged_kv_batched_decode_scatter_int8(tiny_model, device: str) -> None:
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    manager = KVBlockManager(8, block_size=4)
+    cache = PagedKVCache(
+        tiny_model,
+        manager,
+        device=device,
+        dtype=torch.float32,
+        kv_quant="int8",
+    )
+    cache.allocate(1, 5)
+    cache.allocate(2, 3)
+    table, _ = cache.batch_metadata((1, 2))
+    positions = torch.tensor([4, 2], device=device, dtype=torch.int32)
+    key = torch.linspace(
+        -3.0,
+        5.0,
+        2 * tiny_model.num_kv_heads * tiny_model.head_dim,
+        device=device,
+        dtype=torch.float32,
+    ).reshape(2, tiny_model.num_kv_heads, tiny_model.head_dim)
+    value = -0.75 * key
+    layer = tiny_model.full_attention_layer_indices[0]
+
+    cache.write_decode_batch(
+        (1, 2),
+        layer,
+        positions,
+        key,
+        value,
+        table,
+        logical_positions=(4, 2),
+    )
+
+    first_key, first_value = cache.read(1, layer)
+    second_key, second_value = cache.read(2, layer)
+    torch.testing.assert_close(first_key[4], key[0], atol=4e-2, rtol=0)
+    torch.testing.assert_close(first_value[4], value[0], atol=4e-2, rtol=0)
+    torch.testing.assert_close(second_key[2], key[1], atol=4e-2, rtol=0)
+    torch.testing.assert_close(second_value[2], value[1], atol=4e-2, rtol=0)
+    raw = cache.raw_layer_cache(layer)
+    assert len(raw) == 4
+    assert raw[0].dtype == raw[1].dtype == torch.int8
+    assert raw[2].dtype == raw[3].dtype == torch.float32
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda"])

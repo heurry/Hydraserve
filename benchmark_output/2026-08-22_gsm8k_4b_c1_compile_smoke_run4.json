@@ -1,0 +1,59 @@
+{
+  "requests": 1,
+  "succeeded": 0,
+  "failed": 1,
+  "wall_time_s": 0.33125146399834193,
+  "request_throughput": 0.0,
+  "output_token_throughput": 0.0,
+  "warmup_requests": 1,
+  "offered_request_rate": null,
+  "arrival_pattern": "burst",
+  "ttft_ms": {},
+  "tpot_ms": {},
+  "latency_ms": {},
+  "route_counts": {},
+  "prefix_cache_stats": {
+    "hits": 0,
+    "misses": 0,
+    "hit_tokens": 0,
+    "hit_rate": 0.0,
+    "cached_blocks": 0,
+    "referenced_blocks": 0,
+    "evictable_blocks": 0
+  },
+  "per_worker": {
+    "0": {
+      "requests": 1,
+      "prompt_tokens": 31,
+      "output_tokens": 1,
+      "max_tpot_ms": 0.0,
+      "max_ttft_ms": 309.68098097946495
+    }
+  },
+  "results": [
+    {
+      "sample_id": "1",
+      "request_id": 1,
+      "prompt_tokens": 31,
+      "completion_tokens": 1,
+      "ttft_ms": 309.68098097946495,
+      "tpot_ms": null,
+      "latency_ms": 329.79760799207725,
+      "finish_reason": "error",
+      "error": "RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run. Stack trace: File \"/mnt/nvme-data/LLM/HydraServe/hydraserve/model/runtime.py\", line 459, in _decode_batch_transaction\n    positions = self._decode_positions(states)\n  File \"/mnt/nvme-data/LLM/HydraServe/hydraserve/model/runtime.py\", line 860, in _decode_positions\n    destination.copy_(host). To prevent overwriting, clone the tensor outside of torch.compile() or call torch.compiler.cudagraph_mark_step_begin() before each model invocation.\n\nfrom user code:\n   File \"/mnt/nvme-data/LLM/HydraServe/hydraserve/model/runtime.py\", line 459, in _decode_batch_transaction\n    positions = self._decode_positions(states)\n  File \"/mnt/nvme-data/LLM/HydraServe/hydraserve/model/runtime.py\", line 860, in _decode_positions\n    destination.copy_(host)\n\nSet TORCHDYNAMO_VERBOSE=1 for the internal stack trace (please do this especially if you're reporting a bug to PyTorch). For even more developer context, set TORCH_LOGS=\"+dynamo\"\n",
+      "route": "collocated",
+      "route_reason": "fixed_collocated",
+      "worker_id": 0,
+      "route_collocated_cost_ms": null,
+      "route_pd_cost_ms": null,
+      "route_estimated_savings_ms": null,
+      "route_cost_confidence": null,
+      "route_decode_load": 0.0,
+      "route_prefill_load": 0.0,
+      "route_prefill_queue_ahead_ms": 0.0,
+      "route_observed_prefill_service_ms": null,
+      "admission_wait_ms": 0.13032800052314997,
+      "observed_prefill_queue_wait_ms": null
+    }
+  ]
+}

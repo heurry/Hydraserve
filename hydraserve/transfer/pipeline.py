@@ -26,12 +26,30 @@ class HybridStateBundle:
 class TransferPipeline:
     """Builds and transfers mode-correct hybrid state bundles."""
 
-    def __init__(self, backend: TransferBackend, src_gpu: int = 0, dst_gpu: int = 1) -> None:
+    def __init__(
+        self,
+        backend: TransferBackend,
+        src_gpu: int = 0,
+        dst_gpu: int = 1,
+        *,
+        src_tp_rank: int = 0,
+        dst_tp_rank: int = 0,
+        tp_world_size: int = 1,
+        bootstrap=None,
+    ) -> None:
         if src_gpu == dst_gpu:
             raise ValueError("prefill and decode endpoints must differ")
         self.backend = backend
         self.src_gpu = src_gpu
         self.dst_gpu = dst_gpu
+        self.src_tp_rank = src_tp_rank
+        self.dst_tp_rank = dst_tp_rank
+        self.tp_world_size = tp_world_size
+        self.bootstrap = bootstrap
+        if tp_world_size <= 0 or not (
+            0 <= src_tp_rank < tp_world_size and 0 <= dst_tp_rank < tp_world_size
+        ):
+            raise ValueError("invalid TP transfer topology")
 
     def send(
         self,
@@ -41,6 +59,8 @@ class TransferPipeline:
         state: HybridStateBundle,
         first_token_id: int | None = None,
         state_token_count: int | None = None,
+        streamed_kv_ranges: tuple[tuple[int, int], ...] = (),
+        host_cache_hit: bool = False,
     ) -> StateTransferDescriptor:
         mode = self.backend.transfer_mode
         recurrent = state.recurrent
@@ -58,9 +78,23 @@ class TransferPipeline:
             RegionType.LINEAR_CONV.value: recurrent.conv_state,
         }
         if mode is not TransferMode.PARTIAL_TRANSFER:
-            if state.kv_cache is None:
+            if state.kv_cache is None and not streamed_kv_ranges and not host_cache_hit:
                 raise ValueError(f"{mode.value} transfer requires a KV cache")
-            if mode is TransferMode.QUANTIZED_TRANSFER:
+            if streamed_kv_ranges or host_cache_hit:
+                kv_shape = (
+                    model.num_full_attention_layers,
+                    2,
+                    prompt_length,
+                    model.num_kv_heads,
+                    model.head_dim,
+                )
+                dtype, quantized = (
+                    ("int4", True)
+                    if mode is TransferMode.QUANTIZED_TRANSFER
+                    else ("uint16", False)
+                )
+                kv_payload = None
+            elif mode is TransferMode.QUANTIZED_TRANSFER:
                 kv_payload = (
                     state.kv_cache if isinstance(state.kv_cache, Int4Tensor)
                     else quantize_int4(state.kv_cache)
@@ -80,9 +114,13 @@ class TransferPipeline:
                     quantized,
                     self.src_gpu,
                     self.dst_gpu,
+                    self.src_tp_rank,
+                    self.dst_tp_rank,
+                    self.tp_world_size,
                 )
             )
-            payload[RegionType.FULL_ATTN_KV.value] = kv_payload
+            if kv_payload is not None:
+                payload[RegionType.FULL_ATTN_KV.value] = kv_payload
 
         descriptor = StateTransferDescriptor(
             request_id=request_id,
@@ -92,6 +130,9 @@ class TransferPipeline:
             mode=mode,
             regions=tuple(regions),
             state_token_count=state_token_count,
+            streamed_kv=bool(streamed_kv_ranges),
+            kv_chunk_ranges=streamed_kv_ranges,
+            host_cache_hit=host_cache_hit,
         )
         key = self._key(request_id)
         self.backend.send(
@@ -100,6 +141,87 @@ class TransferPipeline:
             self.dst_gpu,
         )
         return descriptor
+
+    def begin_chunked_send(
+        self,
+        request_id: int,
+        model: ModelConfig,
+        prompt_length: int,
+        chunk_ranges: tuple[tuple[int, int], ...],
+    ) -> None:
+        """Publish a manifest before prefill so decode can receive immediately."""
+        if self.backend.transfer_mode is TransferMode.PARTIAL_TRANSFER:
+            raise ValueError("partial transfer has no KV chunks")
+        if not chunk_ranges or chunk_ranges[0][0] != 0:
+            raise ValueError("chunk ranges must start at token zero")
+        previous = 0
+        for start, end in chunk_ranges:
+            if start != previous or end <= start or end > prompt_length:
+                raise ValueError("chunk ranges must be contiguous")
+            previous = end
+        if previous != prompt_length:
+            raise ValueError("chunk ranges must cover the prompt")
+        manifest = {
+                "request_id": request_id,
+                "model_name": model.name,
+                "prompt_length": prompt_length,
+                "mode": self.backend.transfer_mode.value,
+                "ranges": [list(item) for item in chunk_ranges],
+            }
+        if self.bootstrap is None:
+            self.backend.send(
+                f"{self._key(request_id)}:chunks:manifest",
+                manifest,
+                self.dst_gpu,
+            )
+        else:
+            self.bootstrap.publish(request_id, "kv_chunks", manifest)
+
+    def begin_chunked_receive(
+        self, request_id: int, *, timeout: float | None = None
+    ) -> tuple[tuple[int, int], ...]:
+        manifest = (
+            self.backend.receive(
+                f"{self._key(request_id)}:chunks:manifest",
+                self.dst_gpu,
+                timeout=timeout,
+            )
+            if self.bootstrap is None
+            else self.bootstrap.consume(
+                request_id, "kv_chunks", timeout=timeout
+            )
+        )
+        if int(manifest.get("request_id", -1)) != request_id:
+            raise RuntimeError("received KV chunk manifest for the wrong request")
+        if TransferMode(manifest["mode"]) is not self.backend.transfer_mode:
+            raise RuntimeError("KV chunk manifest transfer mode mismatch")
+        return tuple((int(item[0]), int(item[1])) for item in manifest["ranges"])
+
+    def send_kv_chunk(self, request_id: int, start: int, end: int, payload) -> None:
+        mode = self.backend.transfer_mode
+        if mode is TransferMode.PARTIAL_TRANSFER:
+            raise ValueError("partial transfer has no KV chunks")
+        if mode is TransferMode.QUANTIZED_TRANSFER and not isinstance(payload, Int4Tensor):
+            payload = quantize_int4(payload)
+        self.backend.send(
+            f"{self._key(request_id)}:chunks:{start}:{end}",
+            payload,
+            self.dst_gpu,
+        )
+
+    def receive_kv_chunk(
+        self,
+        request_id: int,
+        start: int,
+        end: int,
+        *,
+        timeout: float | None = None,
+    ):
+        return self.backend.receive(
+            f"{self._key(request_id)}:chunks:{start}:{end}",
+            self.dst_gpu,
+            timeout=timeout,
+        )
 
     def receive(self, request_id: int, timeout: float | None = None) -> tuple[StateTransferDescriptor, HybridStateBundle]:
         key = self._key(request_id)
@@ -130,6 +252,9 @@ class TransferPipeline:
             False,
             self.src_gpu,
             self.dst_gpu,
+            self.src_tp_rank,
+            self.dst_tp_rank,
+            self.tp_world_size,
         )
 
     @staticmethod

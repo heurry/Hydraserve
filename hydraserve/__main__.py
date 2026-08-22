@@ -87,6 +87,9 @@ def main() -> int:
     serve_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     serve_parser.add_argument("--max-queue-size", type=int, default=1024)
     serve_parser.add_argument("--max-queue-tokens", type=int, default=1048576)
+    serve_parser.add_argument("--max-step-tokens", type=int, default=8192)
+    serve_parser.add_argument("--dp-graph-sync", action="store_true")
+    serve_parser.add_argument("--host-prefix-cache-gb", type=float, default=0.0)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
     serve_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     serve_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
@@ -143,6 +146,9 @@ def main() -> int:
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
     benchmark_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
+    benchmark_parser.add_argument("--max-step-tokens", type=int, default=8192)
+    benchmark_parser.add_argument("--dp-graph-sync", action="store_true")
+    benchmark_parser.add_argument("--host-prefix-cache-gb", type=float, default=0.0)
     benchmark_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
     benchmark_parser.add_argument("--prefix-cache-blocks", type=int, default=0)
     benchmark_parser.add_argument("--prefix-cache-min-frequency", type=int, default=2)
@@ -211,6 +217,7 @@ def main() -> int:
             args.max_batch_size,
             args.max_queue_size,
             args.max_queue_tokens,
+            args.max_step_tokens,
             args.prefix_cache_min_frequency,
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
@@ -219,6 +226,8 @@ def main() -> int:
             parser.error("--max-active-requests cannot be below --max-batch-size")
         if args.prefix_cache_blocks < 0:
             parser.error("prefix cache blocks cannot be negative")
+        if args.host_prefix_cache_gb < 0:
+            parser.error("host prefix cache size cannot be negative")
         if args.max_preemptions_per_request < 0:
             parser.error("--max-preemptions-per-request cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
@@ -265,6 +274,7 @@ def main() -> int:
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
+                    host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
                 ),
@@ -286,6 +296,7 @@ def main() -> int:
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
+                host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (
@@ -376,6 +387,8 @@ def main() -> int:
             max_queue_tokens=args.max_queue_tokens,
             eos_token_id=tokenizer.eos_token_id,
             max_preemptions_per_request=args.max_preemptions_per_request,
+            max_step_tokens=args.max_step_tokens,
+            dp_graph_sync=args.dp_graph_sync,
         )
         server = create_server(
             args.host,
@@ -533,6 +546,7 @@ def main() -> int:
                     prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                     kv_headroom_blocks=args.kv_headroom_blocks,
                     kv_quant=args.kv_quant,
+                    host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
                 ),
@@ -553,6 +567,7 @@ def main() -> int:
                 prefix_cache_min_frequency=args.prefix_cache_min_frequency,
                 kv_headroom_blocks=args.kv_headroom_blocks,
                 kv_quant=args.kv_quant,
+                host_prefix_cache_bytes=int(args.host_prefix_cache_gb * (1 << 30)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (
@@ -638,6 +653,8 @@ def main() -> int:
             max_batch_size=args.concurrency,
             eos_token_id=tokenizer.eos_token_id,
             max_preemptions_per_request=args.max_preemptions_per_request,
+            max_step_tokens=args.max_step_tokens,
+            dp_graph_sync=args.dp_graph_sync,
         )
         try:
             samples, max_prompt_tokens = build_samples()

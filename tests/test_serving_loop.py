@@ -65,6 +65,20 @@ def test_streams_prefill_seed_then_continuous_decode() -> None:
     assert backend.live == set()
 
 
+def test_unified_step_token_budget_limits_prefill_and_decode_width() -> None:
+    backend = FakeBackend()
+    loop = ContinuousGenerationLoop(
+        backend, max_batch_size=8, max_step_tokens=1
+    )
+    first = loop.submit([1], max_new_tokens=3)
+    second = loop.submit([10], max_new_tokens=3)
+    list(first)
+    list(second)
+    loop.close()
+    assert backend.decode_batches
+    assert all(len(batch) <= 1 for batch in backend.decode_batches)
+
+
 def test_eos_stops_without_extra_decode() -> None:
     backend = FakeBackend()
     loop = ContinuousGenerationLoop(backend, eos_token_id=3)
