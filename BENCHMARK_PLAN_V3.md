@@ -289,6 +289,12 @@ receiver-first门禁应使用阻塞数据面：在D prepare dispatch event之前
 event到达后才放行P。`shm`门禁还需注入一次“名字存在但尚未ftruncate”的零长度打开竞态，确认
 receive重试而不是把`cannot mmap an empty file`记为请求失败。
 
+`badbf99`四卡复核已使P0 W1-128 seed42从挂死恢复为72/72，receiver-first正确性门禁通过。该
+C32点的D0/P0有效对比为70.4/41.5 output tok/s、short TPOT P50为264/544ms，P0不占优；P2-C
+仅70/72，禁止比较其headline吞吐。三组SLO均为0说明C32不是后续主结论的合适共同负载点。
+下一步回到容量法：先测D0/P0 short-only饱和点，再在`0.3/0.5/0.8 × min(capacity)`运行5 seeds；
+在此之前不继续用单个C32点调参或宣称PD普遍优/劣。
+
 ---
 
 ## 五、数据集与流量设计

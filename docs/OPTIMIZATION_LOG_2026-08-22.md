@@ -1426,8 +1426,8 @@ budget死锁”的初步猜测，而指向只在双P并发时出现的数据面�
 
 第一轮静态审计还发现`SharedMemoryRingTransferBackend`错误地把每个D namespace当成SPSC。
 2P+2D下两个独立P进程可能同时观察到同一FREE slot，随后都写WRITING并覆盖header/digest。D端
-等待请求A时看到请求B
-的digest而继续等待，请求B的prepare又可能排在同一D RPC串行路径之后，最终形成GPU全部空闲的
+等待请求A时看到请求B的digest而继续等待，请求B的prepare又可能排在同一D RPC串行路径之后，
+最终形成GPU全部空闲的
 协议死锁。这是必须修复的MPSC正确性风险，但后续四卡复测证明它不是本次P0挂死的充分解释。
 
 修复为每个slot仅在`FREE -> WRITING`认领期间使用跨进程`flock`；认领后立即释放锁，大payload
@@ -1461,3 +1461,31 @@ POSIX `shm_open`会先发布名字，CPython creator随后才`ftruncate`到目�
 新增回归分别验证：D prepare dispatch发生在P producer启动之前；one-shot SHM首次打开模拟零长度
 竞态后能够重试并完整还原payload。该修复尚未在四卡机复跑，P0仍必须先做seed42单点正确性门禁，
 通过前不得更新性能结论。
+
+## 29. receiver-first 四卡验收与 W1-128 完整负结果（2026-08-23）
+
+四卡机拉取`badbf99`后，P0（2P+2D、全PD）不再GPU空转，W1-128 seed42、C32、
+`max_step_tokens=8192`完成72/72。receiver-first从单元级顺序约束通过了真实2P+2D验收，原挂死run
+作废，不再需要用slots=8规避。
+
+| 组 | 成功 | output tok/s | short TPOT P50/P99 | short TTFT P50/P99 | short SLO |
+|---|---:|---:|---:|---:|---:|
+| D0（4×DP） | 72/72 | 70.4 | 264/396 ms | 1.1/7.0 s | 0/64 |
+| P2-C（1P+3D） | 70/72 | 44.4 | 319/921 ms | 1.8/18.2 s | 0/64 |
+| P0（2P+2D、全PD） | 72/72 | 41.5 | 544/741 ms | 5.4/29.9 s | 0/64 |
+
+严格口径结论：
+
+- D0与P0都完成相同72请求/输出工作量，可以直接比较。P0吞吐为D0的58.9%（-41.1%），short
+  TPOT P50/P99分别高106%/87%，TTFT P50/P99约为D0的4.9×/4.3×；当前W1-128、C32下全PD
+  没有获得隔离净收益。
+- P2-C有2条short OOM，`throughput_valid=false`。44.4 tok/s不能作headline吞吐，成功请求的延迟
+  分位数还排除了失败样本，可能偏乐观；该组只保留为容量/尾延迟诊断。
+- 三组SLO均为0只证明当前offered load超过该200ms TPOT门槛下的可服务区，不能外推为PD在所有
+  负载或prefill-heavy场景都无法达标。
+- 本表直接证明的是固定拓扑的端到端结果；“decode卡减少、P排队、传输开销”各自占比仍需
+  D-control、transfer-only和共同offered-load实验拆分，不能仅凭本表宣称transfer是主因。
+
+因此当前可写边界为：receiver-first修复了2P+2D全PD的功能性死锁；但在4×RTX 3090无P2P、
+W1-128 decode-heavy C32上，2P+2D全PD吞吐和短请求延迟均弱于4×DP。下一轮不再重复C32单seed，
+应先分别测D0/P0 short-only容量，再按共同负载档位和5 seeds比较。
