@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 
 import numpy as np
 import pytest
@@ -26,6 +27,23 @@ def _state(model) -> LinearState:
         np.ones(model.ssm_state_shape, dtype=np.float32),
         np.full(model.conv_state_shape, 2, dtype=np.float32),
     )
+
+
+def _ring_process_producer(namespace, prefix, value, rounds, barrier) -> None:
+    backend = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    try:
+        for sequence in range(rounds):
+            barrier.wait()
+            backend.send(
+                f"{prefix}-{sequence}",
+                np.full((64, 64), value + sequence, dtype=np.float32),
+                1,
+            )
+            barrier.wait()
+    finally:
+        backend.close()
 
 
 def test_descriptor_is_json_round_trip_safe(tiny_model) -> None:
@@ -230,6 +248,52 @@ def test_persistent_shared_memory_ring_reuses_slots() -> None:
     finally:
         receiver.close()
         sender.close()
+
+
+def test_persistent_ring_supports_two_concurrent_producers() -> None:
+    namespace = "hydraserve-ring-mpsc-pytest"
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    rounds = 16
+    context = mp.get_context("spawn")
+    barrier = context.Barrier(3)
+    first = context.Process(
+        target=_ring_process_producer,
+        args=(namespace, "a", 100, rounds, barrier),
+    )
+    second = context.Process(
+        target=_ring_process_producer,
+        args=(namespace, "b", 200, rounds, barrier),
+    )
+    first.start()
+    second.start()
+    try:
+        for sequence in range(rounds):
+            barrier.wait()
+            restored_a = receiver.receive(f"a-{sequence}", 1, timeout=2)
+            restored_b = receiver.receive(f"b-{sequence}", 1, timeout=2)
+            np.testing.assert_array_equal(
+                restored_a,
+                np.full((64, 64), 100 + sequence, dtype=np.float32),
+            )
+            np.testing.assert_array_equal(
+                restored_b,
+                np.full((64, 64), 200 + sequence, dtype=np.float32),
+            )
+            barrier.wait()
+    finally:
+        first.join(2)
+        second.join(2)
+        if first.is_alive():
+            first.terminate()
+            first.join(2)
+        if second.is_alive():
+            second.terminate()
+            second.join(2)
+        receiver.close()
+    assert first.exitcode == 0
+    assert second.exitcode == 0
 
 
 def test_cuda_p2p_default_receive_waits_on_current_stream(monkeypatch) -> None:

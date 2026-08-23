@@ -176,6 +176,9 @@ GPU 型号/时钟/温度/topology、P2P 状态、模型与 trace hash。每轮�
     claim分散到空闲P worker，不能多个线程同时观察旧pending值后扎堆同一卡；
 16. `scripts/v3_gate_check.py` 的P0 hash门禁必须实际启动2P+2D，不能把四卡列表截成两卡后误跑
     1P+1D；`--datasets`必须作用于子命令而非继续读取脚本默认路径。
+17. `shm-ring`门禁必须覆盖两个独立P进程并发向同一个D namespace发送，而不只是1P+1D smoke；
+    连续复用slot时每个request digest/payload必须一一对应，无transfer timeout，结束后所有请求均
+    可释放。2P+2D出现长时间四卡0%利用率且无结果JSON时按数据面死锁处理，禁止记作性能结果。
 
 ---
 
@@ -269,6 +272,11 @@ python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
 
 `MODEL`、`DATASETS`、`SHORT_RATE`、`FROZEN_CHUNK`必须显式替换，禁止原样运行。
 P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数不变。
+
+2026-08-23的首次四卡复核中，修复后的D0在8192与65536下均为72/72且性能收敛，但P0曾触发
+双P并发认领同一SHM slot的协议死锁。该问题已增加MPSC原子认领和多进程回归；恢复矩阵前只用
+上述P0命令复跑seed42。验收条件为72/72、生成结果JSON、无transfer timeout、无持续四卡0%空转。
+在该单点门禁通过前不要运行P1、多seed或把旧P0挂死记录纳入对比。
 
 ---
 

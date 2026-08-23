@@ -1190,9 +1190,11 @@ Host L2。
 - 新增 `SharedMemoryRingTransferBackend`：固定数量、固定大小的 SHM slot 在 worker 生命周期内复用；
   header-last 发布，READY/FREE 状态提供有界背压。配置值是 slot 下限，生产 factory 会根据模型
   recurrent+conv bundle 自动放大，避免 27B 状态超过默认 64 MiB 时启动后才失败。
-- 第一版 ring 在每次 send/receive 都调用 `fcntl.flock`。真实 A/B 为负，因此没有停在该版本；
-  生产拓扑按 namespace 是单生产者/单消费者，最终仅在创建 slot 时加文件锁，热路径用单字节
-  state 发布。
+- 第一版 ring 在整次 send/receive 上调用 `fcntl.flock`。1P+1D 真实 A/B 为负，因此没有停在该
+  版本；但后续四卡验证证明“namespace 是单生产者”的假设不成立：2P+2D 中两个 P 进程可以向
+  同一个 D namespace 并发写入。最终实现只在 `FREE -> WRITING` 的单字节槽位认领期间持有
+  per-slot 文件锁，payload copy、READY 发布和 receive 均不持锁；既保证 MPSC 正确性，也不把
+  大块内存复制串行到临界区内。
 - prefill worker 持久复用单线程 transfer executor 和 dedicated CUDA stream；chunk 完成后记录
   CUDA event，传输 stream 等待该 event，最多保留可配置数量的 in-flight chunk。
 - decode worker 使用 dedicated install stream；后台接收线程等待 install completion event，
@@ -1249,7 +1251,8 @@ CLI：`--pd-transfer-quant int8`。它与 `--kv-quant int8` 含义不同：前�
 结论：
 
 - per-op `flock` 版本比 one-shot SHM 吞吐低 1.36%，已修正；
-- lock-free SPSC ring 在 1K 相对 one-shot SHM 吞吐 +12.2%、TTFT -13.2%；
+- 当时测得的 1P+1D lock-free SPSC ring 在 1K 相对 one-shot SHM 吞吐 +12.2%、TTFT -13.2%；
+  该数字不能直接外推到修复后的 2P+2D MPSC 路径，需重新 A/B；
 - INT8 在 1K 无净收益，保持 opt-in；
 - 8K INT8 + adaptive chunk 相对无损 ring 吞吐 +32.9%、TTFT -10.9%；
 - 样本仍小，不能外推成生产 SLA，下一轮应补 C4 与真实长文本分布。
@@ -1405,6 +1408,32 @@ short TPOT P50/P99为151/160ms；65536时72/72成功，但short TPOT升至262/39
 该物理槽直到返回，因此不会因按chunk计费形成无界host队列。
 
 这项修改消除8192/65536决定“long是否有资格运行”的错误语义，但不会刻意让D0的long prefill
-不干扰short：D0 worker仍是collocated执行，long成功后short TPOT下降属于W1要测的基线现象；
+不干扰short：D0 worker仍是collocated执行，long成功后short TPOT恶化属于W1要测的基线现象；
 真正的隔离收益应由P0/P2-C在相同完整工作量下证明。新增单测覆盖active decode存在时long仍可
 提交，以及无route-hint的单物理池在第一个prefill阻塞时不会提前reserve第二个请求。
+
+## 27. 四卡 W1 复核：D0 收敛与 2P+2D SHM ring 并发修复（2026-08-23）
+
+外部 4×RTX 3090 复核了第26节修复后的 W1-128（seed42、C32）。D0 在
+`max_step_tokens=8192/65536` 下都完成 72/72，请求吞吐均为70.4 tok/s，short TPOT
+P50/P99分别为264/396ms和268/405ms，差异小于2%。这证明8192不再错误拒绝32K long，后续固定
+8192；两组short SLO均为0/64，则是完整long工作量进入后测得的collocated interference，不再是
+“long OOM后short看起来更快”的失真结果。
+
+同一轮中，P0（2P+2D、全PD）在72请求负载下运行5分41秒仍无JSON，四卡利用率均为0%；但3请求
+P0 smoke通过，P2-C（1P+3D）也能结束（70/72，2条short OOM）。该组合不支持“prefill token
+budget死锁”的初步猜测，而指向只在双P并发时出现的数据面问题。
+
+根因是`SharedMemoryRingTransferBackend`错误地把每个D namespace当成SPSC。2P+2D下两个独立P
+进程可能同时观察到同一FREE slot，随后都写WRITING并覆盖header/digest。D端等待请求A时看到请求B
+的digest而继续等待，请求B的prepare又可能排在同一D RPC串行路径之后，最终形成GPU全部空闲的
+协议死锁。1P+3D没有同namespace双生产者，3请求smoke则可能因时序未碰撞而通过。
+
+修复为每个slot仅在`FREE -> WRITING`认领期间使用跨进程`flock`；认领后立即释放锁，大payload
+copy和READY发布仍在锁外。新增真实双producer进程、单consumer、16轮槽位复用回归，验证每轮两份
+不同digest/payload都能准确接收，且两个子进程正常退出。
+
+本地没有复跑四卡GPU性能，因此P0原挂死run只能标为无效正确性结果，不能解释成性能负收益；
+P2-C的70/72与44.4 tok/s同样不得进入headline比较。下一步只先复跑P0 W1-128 seed42：必须达到
+72/72、无transfer timeout/长时间0% GPU空转，随后才恢复多seed性能矩阵并重新测量MPSC认领锁的
+实际开销。

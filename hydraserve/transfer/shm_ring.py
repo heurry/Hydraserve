@@ -20,10 +20,12 @@ from hydraserve.transfer.descriptor import TransferMode
 
 
 class SharedMemoryRingTransferBackend(SharedMemoryTransferBackend):
-    """Reuse fixed SHM slots instead of creating and unlinking every chunk.
+    """Reuse fixed SHM slots with bounded producer backpressure.
 
-    Slot state is protected by a tiny file lock. Payload publication remains
-    header-last, and a full ring naturally applies backpressure to prefill.
+    A namespace is single-consumer but may have multiple P-worker producers.
+    The per-slot file lock protects only the FREE -> WRITING claim across
+    processes; payload publication remains lock-free/header-last after that
+    claim, so large copies never hold the lock.
     """
 
     _RING_HEADER = struct.Struct("!8sB7xQQ32s")
@@ -113,13 +115,19 @@ class SharedMemoryRingTransferBackend(SharedMemoryTransferBackend):
         deadline = monotonic() + self.send_timeout_s
         with self._send_lock:
             while True:
-                for memory in self._memories:
-                    if memory.buf[self._STATE_OFFSET] != self._FREE:
-                        continue
-                    # Each namespace is SPSC. Reserve with a byte store, write
-                    # metadata/payload, then publish READY with a final byte
-                    # store. Startup still uses flock while creating slots.
-                    memory.buf[self._STATE_OFFSET] = self._WRITING
+                for memory, fd in zip(
+                    self._memories, self._lock_fds, strict=True
+                ):
+                    # Different P worker processes can target the same D ring.
+                    # Atomically claim a FREE slot before copying. The lock is
+                    # released immediately after the one-byte state change.
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                    try:
+                        if memory.buf[self._STATE_OFFSET] != self._FREE:
+                            continue
+                        memory.buf[self._STATE_OFFSET] = self._WRITING
+                    finally:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
                     memory.buf[: self._RING_HEADER.size] = self._RING_HEADER.pack(
                         self._RING_MAGIC,
                         self._WRITING,
