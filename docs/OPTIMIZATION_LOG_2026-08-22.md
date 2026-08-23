@@ -1384,3 +1384,27 @@ long-PD可以把short-D prefill一起串行化。
 
 验证：定向serving/multi-worker测试52项通过；随后全仓CPU测试全部通过（硬件/可选依赖项按marker
 skip）。本轮未执行GPU或四卡性能实验，不能据此更新任何吞吐、TTFT、TPOT或SLO数字。
+
+## 26. 异步 prefill token-budget 语义修复（2026-08-23）
+
+四卡W1-128 D0外部复核暴露出`max_step_tokens`的非连续反转：8192时64/72成功、8条long失败，
+short TPOT P50/P99为151/160ms；65536时72/72成功，但short TPOT升至262/397ms。该结果不能
+解释为“8192更适合short”：前者没有完成long工作量，吞吐和SLO均不能进入主比较；后者让long
+按时参与后暴露了D0 collocated prefill对short decode的真实干扰。
+
+代码根因有两层：
+
+1. async serving loop用完整prompt长度作为一次admission demand，并从`max_step_tokens`减去active
+   decode数；32K long是否能提交由一个本不应承担路由职责的全局阈值决定；
+2. 单executor-pool backend没有pre-admission group hint时不做物理槽限流，D0可以在只有4个GPU
+   prefill槽时提前admit/reserve更多请求，放大KV与激活内存压力。
+
+修复后，异步prefill使用独立admission budget：每个请求只计一个runtime chunk，且cost不超过
+`max_step_tokens`；active decode不再从该异步预算扣除。所有只有一个executor group的backend
+即使没有route hint，也默认按其物理prefill并行度限制outstanding future。完整prefill RPC仍占用
+该物理槽直到返回，因此不会因按chunk计费形成无界host队列。
+
+这项修改消除8192/65536决定“long是否有资格运行”的错误语义，但不会刻意让D0的long prefill
+不干扰short：D0 worker仍是collocated执行，long成功后short TPOT下降属于W1要测的基线现象；
+真正的隔离收益应由P0/P2-C在相同完整工作量下证明。新增单测覆盖active decode存在时long仍可
+提交，以及无route-hint的单物理池在第一个prefill阻塞时不会提前reserve第二个请求。

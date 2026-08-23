@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Event
+from time import monotonic, sleep
 
 import pytest
 
@@ -264,10 +265,14 @@ def test_disaggregated_prefill_overlaps_active_decode() -> None:
             self.decode_calls = 0
 
         def prefill(self, request):
-            if request.token_ids == (20,):
+            if request.token_ids == tuple(range(20)):
                 second_prefill_entered.set()
                 assert allow_second_prefill.wait(2)
             return super().prefill(request)
+
+        @staticmethod
+        def prefill_admission_tokens(request):
+            return min(len(request.token_ids), 4)
 
         def decode(self, requests):
             self.decode_calls += 1
@@ -282,18 +287,58 @@ def test_disaggregated_prefill_overlaps_active_decode() -> None:
             return result
 
     backend = AsyncBackend()
-    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2, max_step_tokens=8)
     first = loop.submit([1], max_new_tokens=4)
     assert first.get(timeout=2).token_id == 2
     assert first_decode_entered.wait(2)
-    second = loop.submit([20], max_new_tokens=2)
+    second = loop.submit(tuple(range(20)), max_new_tokens=2)
     allow_first_decode.set()
     first_events = list(first)
     second_events = list(second)
     loop.close()
     assert second_prefill_entered.is_set()
     assert [event.token_id for event in first_events[:-1]] == [3, 4, 5]
-    assert [event.token_id for event in second_events[:-1]] == [21, 22]
+    assert [event.token_id for event in second_events[:-1]] == [20, 21]
+
+
+def test_single_async_executor_caps_admission_before_backend_reserve() -> None:
+    first_prefill_entered = Event()
+    allow_first_prefill = Event()
+
+    class SinglePoolBackend(FakeBackend):
+        supports_async_prefill = True
+        prefill_parallelism = 1
+
+        def __init__(self):
+            super().__init__()
+            self.admitted = []
+
+        def admit(self, request):
+            self.admitted.append(request.request_id)
+            return AdmissionDecision.accept()
+
+        def prefill(self, request):
+            if not first_prefill_entered.is_set():
+                first_prefill_entered.set()
+                assert allow_first_prefill.wait(2)
+            return super().prefill(request)
+
+    backend = SinglePoolBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=2)
+    first = loop.submit([1], max_new_tokens=1)
+    assert first_prefill_entered.wait(2)
+    second = loop.submit([2], max_new_tokens=1)
+
+    deadline = monotonic() + 1
+    while loop.prefill_slot_deferrals_total == 0 and monotonic() < deadline:
+        sleep(0.005)
+    assert loop.prefill_slot_deferrals_total > 0
+    assert second.request_id not in backend.admitted
+
+    allow_first_prefill.set()
+    assert list(first)[-1].finish_reason == "length"
+    assert list(second)[-1].finish_reason == "length"
+    loop.close()
 
 
 def test_route_aware_prefill_executors_prevent_long_short_host_hol() -> None:

@@ -116,6 +116,11 @@ class MultiGPUCollocatedBackend:
         """Concurrent prefill slots = worker count (each worker collocates)."""
         return len(self.config.devices)
 
+    def prefill_admission_tokens(self, request: ServingRequest) -> int:
+        """Charge one executable chunk, not the request's full prompt."""
+
+        return min(len(request.token_ids), self.config.prefill_chunk_size)
+
     def __init__(
         self,
         config: CollocatedClusterConfig,

@@ -1404,6 +1404,11 @@ class DisaggregatedGenerationBackend:
 
     release_parallelism = 1
 
+    def prefill_admission_tokens(self, request: ServingRequest) -> int:
+        """Charge one executable prefill chunk rather than the full prompt."""
+
+        return min(len(request.token_ids), self.config.prefill_chunk_size)
+
     def __init__(
         self,
         config: PDWorkerConfig,

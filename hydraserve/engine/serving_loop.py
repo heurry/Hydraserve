@@ -429,12 +429,17 @@ class ContinuousGenerationLoop:
                 Backends return ``None`` when routing is not deterministic yet.
                 """
 
-                if not callable(group_hint_for):
-                    return True
-                hinted = group_hint_for(request)
+                hinted = group_hint_for(request) if callable(group_hint_for) else None
                 if hinted is None:
-                    return True
-                group = str(hinted)
+                    # A backend with one executor pool has an unambiguous
+                    # physical target even without a route hint (for example
+                    # N-way collocated DP). Do not let its executor's unbounded
+                    # host queue reserve KV for work that cannot run yet.
+                    if len(executor_limits) != 1:
+                        return True
+                    group = next(iter(executor_limits))
+                else:
+                    group = str(hinted)
                 limit = executor_limits.get(group)
                 if limit is None:
                     return True
@@ -451,15 +456,34 @@ class ContinuousGenerationLoop:
                         occupied += 1
                 return occupied < limit
 
+            prefill_cost_for = getattr(
+                self.backend, "prefill_admission_tokens", None
+            )
+
+            def admission_tokens(request: ServingRequest) -> int:
+                if callable(prefill_cost_for):
+                    return min(
+                        self.max_step_tokens,
+                        max(1, int(prefill_cost_for(request))),
+                    )
+                # Async execution owns a physical slot until the complete RPC
+                # returns. Charge at most one scheduling quantum here; charging
+                # the whole prompt makes 32K requests impossible whenever a
+                # decode request is active, despite the independent executor.
+                return min(len(request.token_ids), self.max_step_tokens)
+
             while not self._stop.is_set():
-                # Decode consumes one token per active sequence. Prefill
-                # admission shares the remaining per-step token budget.
-                prefill_budget = max(0, self.max_step_tokens - len(active))
+                # Async prefill runs in independently bounded physical pools.
+                # Its admission budget is therefore separate from the active
+                # decode width; worker-local serialization/preemption handles
+                # actual same-GPU contention.
+                prefill_budget = self.max_step_tokens
                 did_work = self._submit_async_prefill(
                     active,
                     pending,
                     executor_for,
                     can_submit_prefill=can_submit_prefill,
+                    admission_tokens=admission_tokens,
                     token_budget=prefill_budget,
                 )
                 did_work = self._remove_cancelled_or_expired(active) or did_work
@@ -496,6 +520,7 @@ class ContinuousGenerationLoop:
         executor_for,
         *,
         can_submit_prefill=None,
+        admission_tokens=None,
         token_budget: int | None = None,
     ) -> bool:
         did_work = False
@@ -509,16 +534,15 @@ class ContinuousGenerationLoop:
                     self._defer_remaining(candidates[index:])
                     break
             request, handle = waiting
-            demand = len(request.token_ids)
+            demand = (
+                max(1, int(admission_tokens(request)))
+                if callable(admission_tokens)
+                else len(request.token_ids)
+            )
             if token_budget is not None and demand > token_budget:
-                # Avoid starvation when a single prompt exceeds a complete
-                # step budget and there is otherwise no GPU work. Otherwise
-                # defer only this request and keep scanning: a queued long
-                # prompt must not head-of-line block short prompts that fit.
-                if active or pending or token_budget != self.max_step_tokens:
-                    request.admission_age += 1
-                    self._deferred.append((request, handle))
-                    continue
+                request.admission_age += 1
+                self._deferred.append((request, handle))
+                continue
             if request.cancelled.is_set():
                 self._pending_done(request)
                 self._finish(request, "cancelled", active=active, release=False)

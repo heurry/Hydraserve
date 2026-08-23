@@ -195,7 +195,7 @@ GPU 型号/时钟/温度/topology、P2P 状态、模型与 trace hash。每轮�
 ### 4.2 主实验固定项
 
 ```text
-block_size              = 16（FlashAttention physical page 按当前实现自动对齐）
+block_size              = 256（FlashAttention paged KV 的真实物理 page 要求）
 kv_quant                = int8
 prefix_cache            = off（主干扰实验）
 host_prefix_cache       = off（主干扰实验）
@@ -204,9 +204,11 @@ seeds                    = 42, 43, 44, 45, 46
 repetitions              = 5
 ```
 
-`prefill_chunk_size` 和 `max_step_tokens` 先在 calibration seed=41 上扫描
-`{4096,8192,16384,32768}`，按短请求 SLO 与总吞吐的帕累托点选定一次，随后冻结，不能在正式
-对比中按拓扑分别调参。
+`prefill_chunk_size` 先在 calibration seed=41 上扫描`{4096,8192,16384,32768}`，按短请求
+SLO与总吞吐的帕累托点选定一次，随后冻结，不能在正式对比中按拓扑分别调参。
+`max_step_tokens`固定为8192：同步单卡路径仍使用统一token budget；异步多worker路径只按一个
+chunk（且不超过该量子）计admission cost，并由P/D物理executor槽限制并发，不再用完整32K
+prompt和active decode数共同决定long能否提交。
 
 ### 4.3 W1 trace 与首轮开跑模板
 
@@ -243,8 +245,8 @@ D0 首轮使用进程内 engine-only 4×DP，避免 HTTP/proxy 成为 baseline �
 python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
   --trace traces/w1_128_seed42.jsonl --dp-devices 0 1 2 3 \
   --concurrency 72 --warmup 8 --arrival-pattern burst \
-  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
-  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens FROZEN_STEP \
+  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 --block-size 256 \
+  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens 8192 \
   --worker-log-dir results/v3/w1_d0_seed42_workers \
   --output results/v3/w1_d0_seed42.json --seed 42
 ```
@@ -257,15 +259,15 @@ python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
   --prefill-short-policy never \
   --prefill-devices 0 1 --decode-devices 2 3 --pd-schedule kv-aware \
   --concurrency 72 --warmup 8 --arrival-pattern burst \
-  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
+  --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 --block-size 256 \
   --pd-transfer-backend shm-ring --pd-transfer-target-mb 8 \
   --pd-transfer-inflight 2 --shm-ring-slots 3 --shm-ring-slot-mb 64 \
-  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens FROZEN_STEP \
+  --prefill-chunk-size FROZEN_CHUNK --max-step-tokens 8192 \
   --worker-log-dir results/v3/w1_p0_seed42_workers \
   --output results/v3/w1_p0_seed42.json --seed 42
 ```
 
-`MODEL`、`DATASETS`、`SHORT_RATE`、`FROZEN_CHUNK`、`FROZEN_STEP` 必须显式替换，禁止原样运行。
+`MODEL`、`DATASETS`、`SHORT_RATE`、`FROZEN_CHUNK`必须显式替换，禁止原样运行。
 P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数不变。
 
 ---

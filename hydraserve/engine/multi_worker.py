@@ -245,6 +245,11 @@ class MultiWorkerGenerationBackend:
         """Legacy aggregate concurrency for serving-loop compatibility."""
         return len(self.config.prefill_devices) + len(self.config.decode_devices)
 
+    def prefill_admission_tokens(self, request: ServingRequest) -> int:
+        """Charge one runtime chunk while the physical executor owns the RPC."""
+
+        return min(len(request.token_ids), self.config.prefill_chunk_size)
+
     @property
     def prefill_executor_limits(self) -> dict[str, int]:
         """Independent host slots for P-prefill and D-collocated prefill.
