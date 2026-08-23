@@ -108,6 +108,10 @@ class MultiGPUCollocatedBackend:
     supports_async_prefill = True
 
     @property
+    def release_parallelism(self) -> int:
+        return len(self.config.devices)
+
+    @property
     def prefill_parallelism(self) -> int:
         """Concurrent prefill slots = worker count (each worker collocates)."""
         return len(self.config.devices)
@@ -323,6 +327,7 @@ class MultiGPUCollocatedBackend:
         with self._state_lock:
             self._bound[request.request_id] = index
         request.worker_id = index
+        request.worker_pool = "collocated"
         request.route = "collocated"
         request.route_reason = "fixed_collocated"
         return AdmissionDecision.accept()
@@ -391,12 +396,29 @@ class MultiGPUCollocatedBackend:
             raise PartialDecodeError(successes, failures)
         return tuple(output)
 
+    def decode_batch_sizes(
+        self, requests: tuple[ServingRequest, ...]
+    ) -> dict[int, int]:
+        """Report per-request width after coordinator-to-GPU grouping."""
+
+        with self._state_lock:
+            bindings = dict(self._bound)
+        groups: dict[int, list[int]] = {}
+        for request in requests:
+            index = bindings.get(request.request_id)
+            if index is not None:
+                groups.setdefault(index, []).append(request.request_id)
+        return {
+            request_id: len(request_ids)
+            for request_ids in groups.values()
+            for request_id in request_ids
+        }
+
     def release(self, request_id: int) -> None:
         with self._state_lock:
-            index = self._bound.pop(request_id, None)
+            index = self._bound.get(request_id)
         if index is None:
             return
-        self._unassign_worker(index)
         try:
             self._rpc(
                 index,
@@ -406,6 +428,10 @@ class MultiGPUCollocatedBackend:
             )
         except Exception:
             pass
+        finally:
+            with self._state_lock:
+                self._bound.pop(request_id, None)
+            self._unassign_worker(index)
 
     def capacity(self) -> BackendCapacity:
         with self._state_lock:

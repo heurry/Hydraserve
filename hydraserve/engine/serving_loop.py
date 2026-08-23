@@ -141,6 +141,7 @@ class ServingRequest:
     observed_prefill_queue_wait_ms: float | None = None
     deadline_at: float | None = None
     worker_id: int | None = None
+    worker_pool: str | None = None
     priority: int = 0
     admission_age: int = 0
     preemption_count: int = 0
@@ -260,6 +261,17 @@ class ContinuousGenerationLoop:
         self._recoveries_total = 0
         self._recovery_failures_total = 0
         self._fault_suspensions_total = 0
+        self._prefill_slot_deferrals_total = 0
+        release_parallelism = max(
+            1, int(getattr(backend, "release_parallelism", min(4, active_limit)))
+        )
+        self._release_executor = ThreadPoolExecutor(
+            max_workers=release_parallelism,
+            thread_name_prefix="hydraserve-release",
+        )
+        self._release_pending_count = 0
+        self._release_total = 0
+        self._release_failures_total = 0
         self._handles: dict[int, GenerationHandle] = {}
         self._handles_lock = Lock()
         self._lifecycle_lock = Lock()
@@ -344,6 +356,9 @@ class ContinuousGenerationLoop:
             self._thread.join(timeout)
             if self._thread.is_alive():
                 raise TimeoutError("generation loop did not stop")
+        # The generation thread may have queued device-local cleanup while
+        # resolving its final active requests. Drain it before closing workers.
+        self._release_executor.shutdown(wait=True)
         close_backend = getattr(self.backend, "close", None)
         if close_backend is not None:
             close_backend()
@@ -387,6 +402,7 @@ class ContinuousGenerationLoop:
         if not executor_limits:
             executor_limits = {"default": 1}
         group_for = getattr(self.backend, "prefill_executor_group", None)
+        group_hint_for = getattr(self.backend, "prefill_executor_group_hint", None)
 
         with ExitStack() as stack:
             executors = {
@@ -405,12 +421,46 @@ class ContinuousGenerationLoop:
                     return default_executor
                 return executors.get(str(group_for(request)), default_executor)
 
+            def can_submit_prefill(request: ServingRequest) -> bool:
+                """Bound admission by the physical pool, not its host queue.
+
+                In particular, do not reserve decode-side KV for every queued
+                long request while only one or two P workers can make progress.
+                Backends return ``None`` when routing is not deterministic yet.
+                """
+
+                if not callable(group_hint_for):
+                    return True
+                hinted = group_hint_for(request)
+                if hinted is None:
+                    return True
+                group = str(hinted)
+                limit = executor_limits.get(group)
+                if limit is None:
+                    return True
+                occupied = 0
+                for pending_request, future in pending.values():
+                    if future.done():
+                        continue
+                    pending_group = (
+                        str(group_for(pending_request))
+                        if callable(group_for)
+                        else next(iter(executor_limits))
+                    )
+                    if pending_group == group:
+                        occupied += 1
+                return occupied < limit
+
             while not self._stop.is_set():
                 # Decode consumes one token per active sequence. Prefill
                 # admission shares the remaining per-step token budget.
                 prefill_budget = max(0, self.max_step_tokens - len(active))
                 did_work = self._submit_async_prefill(
-                    active, pending, executor_for, token_budget=prefill_budget
+                    active,
+                    pending,
+                    executor_for,
+                    can_submit_prefill=can_submit_prefill,
+                    token_budget=prefill_budget,
                 )
                 did_work = self._remove_cancelled_or_expired(active) or did_work
                 did_work = (
@@ -440,7 +490,13 @@ class ContinuousGenerationLoop:
                 )
 
     def _submit_async_prefill(
-        self, active, pending, executor_for, *, token_budget: int | None = None
+        self,
+        active,
+        pending,
+        executor_for,
+        *,
+        can_submit_prefill=None,
+        token_budget: int | None = None,
     ) -> bool:
         did_work = False
         available_slots = self.max_active_requests - len(active) - len(pending)
@@ -463,8 +519,6 @@ class ContinuousGenerationLoop:
                     request.admission_age += 1
                     self._deferred.append((request, handle))
                     continue
-            if token_budget is not None:
-                token_budget = max(0, token_budget - demand)
             if request.cancelled.is_set():
                 self._pending_done(request)
                 self._finish(request, "cancelled", active=active, release=False)
@@ -479,6 +533,12 @@ class ContinuousGenerationLoop:
                     release=False,
                 )
                 did_work = True
+                continue
+            if callable(can_submit_prefill) and not can_submit_prefill(request):
+                request.admission_age += 1
+                self._deferred.append((request, handle))
+                with self._stats_lock:
+                    self._prefill_slot_deferrals_total += 1
                 continue
             request.route_prefill_queue_ahead_ms = self._prefill_queue_ahead_ms(pending)
             decision = self._admission_decision(request)
@@ -499,6 +559,8 @@ class ContinuousGenerationLoop:
                 )
                 did_work = True
                 continue
+            if token_budget is not None:
+                token_budget = max(0, token_budget - demand)
             self._record_admission(request)
             self._pending_done(request)
             pending[request.request_id] = (
@@ -581,6 +643,12 @@ class ContinuousGenerationLoop:
 
     @staticmethod
     def _record_admission(request: ServingRequest) -> None:
+        # Backends without an explicit router are collocated, but assign that
+        # label only after admission succeeds. Rejected requests must remain
+        # ``unknown`` instead of being misreported as collocated failures.
+        if request.route is None:
+            request.route = "collocated"
+            request.route_reason = request.route_reason or "implicit_collocated"
         if request.admission_wait_ms is None:
             request.admitted_at = monotonic()
             request.admission_wait_ms = max(
@@ -875,6 +943,20 @@ class ContinuousGenerationLoop:
         batch = self._decode_scheduler.select(
             active.values(), min(self.max_batch_size, self.max_step_tokens)
         )
+        physical_batch_sizes = {request.request_id: len(batch) for request in batch}
+        batch_size_resolver = getattr(self.backend, "decode_batch_sizes", None)
+        if batch and callable(batch_size_resolver):
+            try:
+                resolved = batch_size_resolver(batch)
+                physical_batch_sizes.update(
+                    {
+                        int(request_id): max(1, int(size))
+                        for request_id, size in dict(resolved).items()
+                    }
+                )
+            except Exception:
+                # Observability must never fail an otherwise valid decode.
+                pass
         try:
             if self.dp_graph_sync:
                 from hydraserve.engine.dp_graph_sync import synchronize_dp_token_count
@@ -917,7 +999,7 @@ class ContinuousGenerationLoop:
                         request,
                         exc.samples[request.request_id],
                         active,
-                        decode_batch_size=len(batch),
+                        decode_batch_size=physical_batch_sizes[request.request_id],
                     )
             return
         except Exception as exc:
@@ -927,7 +1009,10 @@ class ContinuousGenerationLoop:
             return
         for request, token_id in zip(batch, token_ids, strict=True):
             self._accept_decode_sample(
-                request, token_id, active, decode_batch_size=len(batch)
+                request,
+                token_id,
+                active,
+                decode_batch_size=physical_batch_sizes[request.request_id],
             )
 
     def _suspend_recoverable_failure(
@@ -1054,21 +1139,17 @@ class ContinuousGenerationLoop:
     ) -> None:
         active.pop(request.request_id, None)
         self._decode_scheduler.forget(request.request_id)
-        error = None
-        if release:
-            try:
-                self.backend.release(request.request_id)
-            except Exception as exc:
-                error = f"release failed: {exc}"
         handle = self._pop_handle(request.request_id)
-        if handle is not None:
+        if release:
+            self._schedule_release(
+                request.request_id,
+                handle,
+                finish_reason=reason,
+                request_error=None,
+            )
+        elif handle is not None:
             handle._put(
-                GenerationEvent(
-                    request.request_id,
-                    finished=True,
-                    finish_reason="error" if error else reason,
-                    error=error,
-                )
+                GenerationEvent(request.request_id, finished=True, finish_reason=reason)
             )
 
     def _fail(
@@ -1081,13 +1162,15 @@ class ContinuousGenerationLoop:
     ) -> None:
         active.pop(request.request_id, None)
         self._decode_scheduler.forget(request.request_id)
-        if release:
-            try:
-                self.backend.release(request.request_id)
-            except Exception:
-                pass
         handle = self._pop_handle(request.request_id)
-        if handle is not None:
+        if release:
+            self._schedule_release(
+                request.request_id,
+                handle,
+                finish_reason="error",
+                request_error=str(exc),
+            )
+        elif handle is not None:
             handle._put(
                 GenerationEvent(
                     request.request_id,
@@ -1096,6 +1179,48 @@ class ContinuousGenerationLoop:
                     error=str(exc),
                 )
             )
+
+    def _schedule_release(
+        self,
+        request_id: int,
+        handle: GenerationHandle | None,
+        *,
+        finish_reason: str,
+        request_error: str | None,
+    ) -> None:
+        """Release device state off the decode loop, then emit the terminal event."""
+
+        with self._stats_lock:
+            self._release_pending_count += 1
+
+        def release_and_finish() -> None:
+            release_error = None
+            try:
+                self.backend.release(request_id)
+            except Exception as exc:
+                release_error = f"release failed: {exc}"
+            finally:
+                with self._stats_lock:
+                    self._release_pending_count = max(
+                        0, self._release_pending_count - 1
+                    )
+                    self._release_total += 1
+                    if release_error is not None:
+                        self._release_failures_total += 1
+
+            if handle is None:
+                return
+            error = request_error or release_error
+            handle._put(
+                GenerationEvent(
+                    request_id,
+                    finished=True,
+                    finish_reason="error" if error else finish_reason,
+                    error=error,
+                )
+            )
+
+        self._release_executor.submit(release_and_finish)
 
     def _cancel_incoming(self) -> None:
         empty: OrderedDict[int, ServingRequest] = OrderedDict()
@@ -1214,6 +1339,26 @@ class ContinuousGenerationLoop:
         with self._stats_lock:
             return self._fault_suspensions_total
 
+    @property
+    def release_pending_count(self) -> int:
+        with self._stats_lock:
+            return self._release_pending_count
+
+    @property
+    def release_total(self) -> int:
+        with self._stats_lock:
+            return self._release_total
+
+    @property
+    def release_failures_total(self) -> int:
+        with self._stats_lock:
+            return self._release_failures_total
+
+    @property
+    def prefill_slot_deferrals_total(self) -> int:
+        with self._stats_lock:
+            return self._prefill_slot_deferrals_total
+
     def _publish_scheduler_depth(self, active: int, prefill_pending: int) -> None:
         with self._stats_lock:
             self._active_count = active
@@ -1230,6 +1375,8 @@ class ContinuousGenerationLoop:
 
 class RuntimeGenerationBackend:
     """HydraServe runtime adapter; no external model-execution backend is used."""
+
+    release_parallelism = 1
 
     def __init__(
         self,
@@ -1338,6 +1485,7 @@ class RuntimeGenerationBackend:
                 request.route = "collocated"
                 request.route_reason = "fixed_collocated"
                 request.worker_id = 0
+                request.worker_pool = "collocated"
                 request.route_decode_load = initial_capacity.decode_load
             return AdmissionDecision.accept()
 

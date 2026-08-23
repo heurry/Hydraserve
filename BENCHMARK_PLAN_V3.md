@@ -117,7 +117,10 @@ JSON 除总体指标外，增加 `by_class.short/long/...`：
 - `e2e_ttft_ms`：trace 计划到达时刻到首 token，正式 SLO 使用此项；
 - `tpot_ms`：`(last_token_at - first_token_at) / (completion_tokens - 1)`；
 - `release_tail_ms`：最后 token 到 terminal event，单独暴露 KV release/RPC/清理尾部；
-- `itl_ms`：逐 token 间隔分布；engine-only 额外保存对应的 `decode_batch_sizes`。
+- `itl_ms`：逐 token 间隔分布；engine-only 额外保存对应的 `decode_batch_sizes`。多 GPU 后端记录
+  请求实际所在 P/D worker 的物理 batch width，不得用 coordinator 全局 batch 冒充单卡 batch；
+- `per_worker` 的 key 使用 `prefill:N`、`decode:N` 或 `collocated:N`，避免 P0 和 D0 都叫
+  `worker_id=0` 时合并统计。
 
 `route_counts`继续表示成功请求以兼容历史结果，同时必须报告`route_counts_all`和
 `route_failure_counts`。任一请求失败时`throughput_valid=false`，该轮output tok/s不得进入主表。
@@ -158,13 +161,21 @@ GPU 型号/时钟/温度/topology、P2P 状态、模型与 trace hash。每轮�
    `--cache-tokens 131072` 起步，不使用默认 65536；若 memory planner 下调，记录实际值；
 9. 同一 seed 的 D0/P0/P1 必须读取同一个 trace 文件，结果 metadata 中 trace SHA256 必须完全一致；
 10. 用带30ms同步`release()`的假backend验证`release_tail_ms`增长而TPOT不变；32-token与
-    128-token跨负载解释必须同时报告ITL、decode batch size和release tail；
+    128-token跨负载解释必须同时报告ITL、物理decode batch size和release tail；同时提交第二条
+    请求，确认第一条的release RPC未阻塞第二条decode；
 11. 用阻塞long-PD和可立即完成short-D的并发测试验证两者使用独立executor；1P+3D下short不能
     因单个long占用P worker而等待同一个host prefill线程；
 12. open-loop正式结果要求`client_queue_ms p99`接近0。若使用线程客户端，concurrency必须覆盖
     最大在途请求；否则改用异步提交，不能把线程池排队隐藏在TTFT之外；
 13. 当前机器没有可用 NVIDIA 驱动且本次未执行四卡性能测试，因此以下命令只是四卡机的开跑模板，
     不是已验证结果。第一次四卡gate通过后再批量跑5 seeds。
+14. P/D prefill executor 的 outstanding future 数不得超过对应物理 worker 数；排队等待 P 槽的
+    long 不能提前 reserve D 侧 KV。用“阻塞第一个long + 排队第二个long + 可运行short”门禁确认
+    第二个long尚未admit而short已经完成；
+15. 重复调用同一 P-short 的 `admit()`只能发出一次reserve RPC；并发 P dispatch 必须通过原子
+    claim分散到空闲P worker，不能多个线程同时观察旧pending值后扎堆同一卡；
+16. `scripts/v3_gate_check.py` 的P0 hash门禁必须实际启动2P+2D，不能把四卡列表截成两卡后误跑
+    1P+1D；`--datasets`必须作用于子命令而非继续读取脚本默认路径。
 
 ---
 
@@ -281,6 +292,12 @@ P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数�
 
 设计原因：长请求负责制造 prefill 干扰，但只短暂参与 decode，避免 8×32K KV 长时间占据
 decode batch，把“prefill 隔离”与“长 KV scan”混成一个瓶颈。
+
+容量审计必须按 block 计算，而不是只看`cache_tokens`：block=256、cache=131072时每个D worker
+只有512 blocks；32K+16输出的long需要129 blocks，2K+32/128输出的short均需要9 blocks。
+因此单卡4条long已需516 blocks，理论上必定OOM；调度器必须限制未取得P/D prefill物理槽的请求
+提前reserve KV，并在结果中保存实际并发KV占用。不得通过只统计成功token或让OOM提前缩短wall
+time制造吞吐优势。
 
 32-token 组用于放大 prefill-interference 与路由/迁移固定开销，128-token 组用于保留历史的
 decode-heavy 边界。两组使用相同 prompt、到达时刻和 seed，仅 `max_new_tokens` 不同，均完整报告，

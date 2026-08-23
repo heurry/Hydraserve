@@ -106,6 +106,10 @@ def test_completion_chat_and_sse_protocol() -> None:
         chunks = [json.loads(line[6:]) for line in lines[:-1]]
         content_chunks = [chunk for chunk in chunks if chunk["choices"]]
         assert "".join(chunk["choices"][0]["text"] for chunk in content_chunks) == "AB"
+        token_chunks = [
+            chunk for chunk in content_chunks if "hydraserve_token_id" in chunk
+        ]
+        assert len(token_chunks) == 2
         assert content_chunks[-1]["choices"][0]["finish_reason"] == "length"
         assert chunks[-1]["choices"] == []
         assert chunks[-1]["usage"]["completion_tokens"] == 2
@@ -223,6 +227,8 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
         assert health["scheduler"]["preempted_requests"] == 0
         assert health["scheduler"]["preemptions_total"] == 0
         assert health["scheduler"]["fault_suspensions_total"] == 0
+        assert health["scheduler"]["prefill_slot_deferrals_total"] == 0
+        assert health["scheduler"]["release_pending"] == 0
         assert health["status"] == "degraded"
         assert health["decode_workers"]["recovering"] == [1]
         assert health["prefill_worker"]["recovering"] is True
@@ -241,6 +247,8 @@ def test_health_and_prometheus_metrics_expose_capacity() -> None:
             in metrics
         )
         assert "hydraserve_scheduler_fault_suspensions_total 0" in metrics
+        assert "hydraserve_prefill_slot_deferrals_total 0" in metrics
+        assert "hydraserve_release_pending 0" in metrics
         assert 'hydraserve_decode_workers{state="healthy"} 1' in metrics
         assert 'hydraserve_worker_restarts_total{outcome="success"} 1' in metrics
         assert "hydraserve_prefill_worker_recovering 1" in metrics

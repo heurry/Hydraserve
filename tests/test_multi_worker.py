@@ -260,6 +260,16 @@ def test_multi_worker_decode_groups_by_worker_and_preserves_input_order() -> Non
     }
 
 
+def test_multi_worker_reports_physical_decode_batch_widths() -> None:
+    backend = FakeMultiWorkerBackend()
+    requests = tuple(ServingRequest(index, (index + 1,), 2) for index in range(3))
+    backend.registry.bind(requests[0].request_id, 0)
+    backend.registry.bind(requests[1].request_id, 0)
+    backend._prefill_bound[requests[2].request_id] = 0
+
+    assert backend.decode_batch_sizes(requests) == {0: 2, 1: 2, 2: 1}
+
+
 def test_multi_worker_decode_isolates_failed_worker_group() -> None:
     class OneWorkerFails(FakeMultiWorkerBackend):
         def _decode_rpc(self, worker_id, command, expected_op, request_id=None):
@@ -328,6 +338,13 @@ def test_prefill_bound_short_recovery_stays_on_prefill_worker() -> None:
     request = ServingRequest(12, (1, 2, 3), 5, generated_token_ids=[7, 8])
     assert backend.admit(request).admitted
     assert request.request_id in backend._prefill_bound
+    assert backend.admit(request).admitted
+    admission_commands = [
+        command
+        for worker, command in backend.rpc_commands
+        if str(worker).startswith("prefill-") and command.get("op") == "reserve"
+    ]
+    assert len(admission_commands) == 1
 
     backend.preempt(request.request_id)
     assert backend.recover(request).admitted
@@ -488,3 +505,32 @@ def test_pick_prefill_worker_prefers_least_loaded() -> None:
     backend._prefill_healthy = [False, True]
     backend._prefill_pending = [0, 5]
     assert backend._pick_prefill_worker() == 1
+
+
+def test_prefill_dispatch_claims_prevent_concurrent_worker_herding() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend._prefill_processes = [None, None]
+    backend._prefill_healthy = [True, True]
+    backend._prefill_pending = [0, 0]
+    backend._prefill_dispatch_claims = [0, 0]
+
+    first = backend._claim_prefill_worker()
+    second = backend._claim_prefill_worker()
+    assert (first, second) == (0, 1)
+    backend._release_prefill_dispatch_claim(first)
+    backend._release_prefill_dispatch_claim(second)
+    assert backend._prefill_dispatch_claims == [0, 0]
+
+
+def test_prefill_short_admission_claims_idle_worker_atomically() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend._prefill_dispatch_claims = [0]
+
+    first = backend._pick_serve_prefill_worker()
+    second = backend._pick_serve_prefill_worker()
+    assert first == 0
+    assert second is None
+    backend._release_prefill_dispatch_claim(first)
+    third = backend._pick_serve_prefill_worker()
+    assert third == 0
+    backend._release_prefill_dispatch_claim(third)

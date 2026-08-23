@@ -38,6 +38,7 @@ class RequestMetrics:
     route: str | None = None
     route_reason: str | None = None
     worker_id: int | None = None
+    worker_pool: str | None = None
     route_collocated_cost_ms: float | None = None
     route_pd_cost_ms: float | None = None
     route_estimated_savings_ms: float | None = None
@@ -173,12 +174,17 @@ def _per_worker_stats(
     results: Iterable[RequestMetrics],
 ) -> dict[str, dict[str, int | float]]:
     """Aggregate per-worker distribution across succeeded and failed requests."""
-    workers: dict[int, dict[str, int | float]] = {}
+    workers: dict[str, dict[str, int | float]] = {}
     for result in results:
         if result.worker_id is None:
             continue
+        worker_key = (
+            str(result.worker_id)
+            if result.worker_pool is None
+            else f"{result.worker_pool}:{result.worker_id}"
+        )
         bucket = workers.setdefault(
-            result.worker_id,
+            worker_key,
             {
                 "requests": 0,
                 "prompt_tokens": 0,
@@ -196,7 +202,7 @@ def _per_worker_stats(
             bucket["max_tpot_ms"] = max(float(bucket["max_tpot_ms"]), result.tpot_ms)
         if result.ttft_ms is not None:
             bucket["max_ttft_ms"] = max(float(bucket["max_ttft_ms"]), result.ttft_ms)
-    return {str(worker_id): bucket for worker_id, bucket in sorted(workers.items())}
+    return dict(sorted(workers.items()))
 
 
 SLO_SHORT_TTFT_MS = 5000.0
@@ -454,9 +460,10 @@ def run_benchmark(
             release_tail_ms=release_tail_ms,
             itl_ms=tuple(itl_ms),
             decode_batch_sizes=tuple(decode_batch_sizes),
-            route=None if handle is None else (handle.request.route or "collocated"),
+            route=None if handle is None else handle.request.route,
             route_reason=None if handle is None else handle.request.route_reason,
             worker_id=None if handle is None else handle.request.worker_id,
+            worker_pool=None if handle is None else handle.request.worker_pool,
             route_collocated_cost_ms=(
                 None if handle is None else handle.request.route_collocated_cost_ms
             ),
@@ -592,6 +599,7 @@ def _iter_completion_sse(
     )
     req.add_header("Content-Type", "application/json")
     req.add_header("Accept", "text/event-stream")
+    hydraserve_stream = False
     with request.urlopen(req, timeout=timeout) as response:
         for raw_line in response:
             line = raw_line.decode("utf-8").strip()
@@ -611,6 +619,15 @@ def _iter_completion_sse(
             choices = chunk.get("choices") or []
             if choices and choices[0].get("finish_reason") is not None:
                 yield "finish", choices[0]["finish_reason"]
+                continue
+            if "hydraserve_token_id" in chunk:
+                hydraserve_stream = True
+                yield "token", None
+                continue
+            if hydraserve_stream:
+                # ``IncrementalDecoder.finish()`` can emit one final text-only
+                # SSE chunk. It is not a generated token and must not inflate
+                # completion count or add a fake ITL sample.
                 continue
             yield "token", None
 

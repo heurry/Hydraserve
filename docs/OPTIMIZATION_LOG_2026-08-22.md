@@ -1343,3 +1343,44 @@ long-PD可以把short-D prefill一起串行化。
 
 相关CPU回归通过；本轮没有运行四卡性能压测。旧W1 short-32表中的TPOT/SLO仍采用历史污染口径，
 只能作为问题定位材料，修复后结果必须使用新JSON字段并重新生成，禁止覆盖或混用旧数值。
+
+## 25. V3 调度生命周期与审计口径补强（2026-08-23，未跑GPU压测）
+
+在第24节CPU回归之后继续做纯代码审计，发现此前的“独立P/D executor”仍不足以保证物理资源
+有界，另外有几项观测字段会误导short-32归因：
+
+1. 请求完成时，generation线程同步等待worker `release()`；一个慢KV释放/RPC会暂停所有请求的
+   decode，短输出请求频繁结束时尤其容易把其他请求ITL抬高；
+2. `ThreadPoolExecutor`队列无界，long在排队取得P执行线程前已经admit并reserve D KV；1P/2P
+   可以让大量不能开始prefill的long提前吃光D缓存；
+3. P-worker collocated short在serving loop和backend `prefill()`各admit一次，会重复reserve和
+   增加统计；并发线程的P选择与pending加一分离，可能同时选择同一张P卡；
+4. engine事件记录的是coordinator总decode batch，而多GPU真正执行的是各worker子batch；P与D
+   的整数worker ID也会在`per_worker`中碰撞；
+5. HTTP流最后的tokenizer flush可能产生一个有文本但没有新模型token的SSE chunk，旧runner会
+   把它计入completion tokens；V3 gate脚本的P0 hash检查还把四卡切成了实际1P+1D。
+
+本轮实现：
+
+- 引入有界异步release executor；active调度立即继续，但terminal event仍等待release完成，因此
+  TPOT不含清理、`release_tail_ms`仍可观察清理成本，吞吐wall口径也没有偷偷删除release；
+- release RPC完成前保留worker binding和host侧KV reservation，防止active槽提前释放后容量统计
+  虚增；
+- backend提供admission前的确定性executor group hint，serving loop按P/D物理worker数限制
+  outstanding prefill；没有P槽的long留在admission队列，不提前reserve D KV，同时继续扫描short；
+- token budget只在请求实际admit并提交prefill后扣减；因容量或物理槽defer的long不再虚耗本轮
+  budget并阻塞队列后方short；
+- P-short admission幂等；P dispatch增加原子claim，选择时使用`pending + claims`避免并发herding；
+- Prometheus新增prefill物理槽defer、release pending/complete/failure计数，便于确认优化是在消除
+  排队与主循环阻塞，而不是把开销隐藏到不可见线程；
+- `decode_batch_sizes`改为请求所在物理P/D worker的子batch；请求新增`worker_pool`，结果按
+  `prefill:N`/`decode:N`/`collocated:N`聚合；
+- HydraServe SSE token chunk增加`hydraserve_token_id`扩展，HTTP runner据此跳过decoder flush；
+- V3 gate的adaptive拓扑按完整四卡均分为2P+2D，并让`--datasets`参数真正传给子命令。
+
+容量边界也已固化进计划：block=256、每D缓存131072 tokens时共有512 blocks；一条
+32K prompt + 16 output long需要129 blocks，单卡4条long的516 blocks在没有任何short时也必然
+超容量。新限流避免“尚未开始P prefill就占D KV”的人为OOM，但不会掩盖真实并发容量上限。
+
+验证：定向serving/multi-worker测试52项通过；随后全仓CPU测试全部通过（硬件/可选依赖项按marker
+skip）。本轮未执行GPU或四卡性能实验，不能据此更新任何吞吐、TTFT、TPOT或SLO数字。

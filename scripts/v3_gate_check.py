@@ -10,7 +10,7 @@ Runs the ten gates that must pass before any V3 M1 matrix numbers are taken:
   6. --trace replay uses --arrival-pattern burst and no --request-rate
   7. --warmup uses separate synthetic warmup; results.requests == trace rows
   8. --cache-tokens 131072 + memory/health checks after run
-  9. same trace, same seed, D0 and P0 -> identical metadata.trace_sha256
+  9. same trace, same seed, 4xDP and 2P+2D -> identical metadata.trace_sha256
  10. (informational) run templates are the V3 4.3 commands
 
 Requires a 4xRTX3090 machine with a working NVIDIA driver. Exits 2 with a
@@ -82,8 +82,12 @@ def bench(trace: pathlib.Path, out: pathlib.Path, logdir: pathlib.Path, model: p
         "--output", str(out), "--seed", str(seed),
     ]
     if adaptive:
+        split = len(workers) // 2
+        if split == 0 or split == len(workers):
+            raise ValueError("adaptive gate requires at least one P and one D worker")
         cmd += ["--adaptive", "--force-pd-tokens", "1",
-                "--prefill-devices", workers[0], "--decode-devices", workers[1]]
+                "--prefill-devices", *workers[:split],
+                "--decode-devices", *workers[split:]]
     else:
         cmd += ["--dp-devices", *workers]
     if extra:
@@ -235,7 +239,7 @@ def gate9_same_trace_dp_pd(tmp: pathlib.Path, model: pathlib.Path, workers: list
     s_d0 = bench(trace, out_d0, log_d0, model, workers=workers, concurrency=8)
     out_p0 = tmp / "g9_p0.json"
     log_p0 = tmp / "g9_p0_logs"
-    s_p0 = bench(trace, out_p0, log_p0, model, workers=workers[:2],
+    s_p0 = bench(trace, out_p0, log_p0, model, workers=workers,
                  adaptive=True, concurrency=8)
     h_d0 = s_d0["metadata"].get("trace_sha256")
     h_p0 = s_p0["metadata"].get("trace_sha256")
@@ -245,6 +249,7 @@ def gate9_same_trace_dp_pd(tmp: pathlib.Path, model: pathlib.Path, workers: list
 
 
 def main() -> int:
+    global DATASETS
     parser = argparse.ArgumentParser(description="V3 P0.5 four-GPU gate check")
     parser.add_argument("--model", type=pathlib.Path, default=MODEL)
     parser.add_argument("--datasets", type=pathlib.Path, default=DATASETS)
@@ -252,6 +257,7 @@ def main() -> int:
     parser.add_argument("--only", nargs="+", help="e.g. G1 G2")
     parser.add_argument("--workdir", type=pathlib.Path, default=pathlib.Path("/tmp/v3_gates"))
     args = parser.parse_args()
+    DATASETS = args.datasets
 
     try:
         import torch

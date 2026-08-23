@@ -42,6 +42,10 @@ def test_streams_prefill_seed_then_continuous_decode() -> None:
     allow_decode = Event()
 
     class AdmissionBackend(FakeBackend):
+        @staticmethod
+        def decode_batch_sizes(requests):
+            return {request.request_id: 1 for request in requests}
+
         def decode(self, requests):
             if not first_decode.is_set():
                 first_decode.set()
@@ -62,6 +66,11 @@ def test_streams_prefill_seed_then_continuous_decode() -> None:
     assert first_events[-1].finish_reason == "length"
     assert second_events[-1].finish_reason == "length"
     assert any(len(batch) == 2 for batch in backend.decode_batches)
+    assert all(
+        event.decode_batch_size == 1
+        for event in (*first_events, *second_events)
+        if event.decode_batch_size is not None
+    )
     assert backend.live == set()
 
 
@@ -124,6 +133,41 @@ def test_cancel_active_request_releases_backend() -> None:
     loop.close()
     assert events[-1].finished
     assert events[-1].finish_reason == "cancelled"
+    assert backend.live == set()
+
+
+def test_slow_release_does_not_block_other_request_decode() -> None:
+    first_release_entered = Event()
+    allow_first_release = Event()
+
+    class SlowReleaseBackend(FakeBackend):
+        def __init__(self):
+            super().__init__()
+            self.blocked_once = False
+
+        def release(self, request_id):
+            if not self.blocked_once:
+                self.blocked_once = True
+                first_release_entered.set()
+                assert allow_first_release.wait(2)
+            super().release(request_id)
+
+    backend = SlowReleaseBackend()
+    loop = ContinuousGenerationLoop(backend)
+    first = loop.submit([1], max_new_tokens=1)
+    assert first.get(timeout=2).token_id == 2
+    assert first_release_entered.wait(2)
+
+    # Cleanup for the first request is still blocked, but it must not hold the
+    # generation thread or prevent a different request from reaching decode.
+    second = loop.submit([10], max_new_tokens=2)
+    assert second.get(timeout=1).token_id == 11
+    allow_first_release.set()
+    assert list(first)[-1].finish_reason == "length"
+    assert list(second)[-1].finish_reason == "length"
+    loop.close()
+    assert loop.release_total == 2
+    assert loop.release_failures_total == 0
     assert backend.live == set()
 
 
@@ -260,11 +304,22 @@ def test_route_aware_prefill_executors_prevent_long_short_host_hol() -> None:
         supports_async_prefill = True
         prefill_executor_limits = {"prefill": 1, "decode": 1}
 
+        def __init__(self):
+            super().__init__()
+            self.admitted = []
+
         def admit(self, request):
+            self.admitted.append(request.request_id)
             request.route = (
-                "pd_disaggregated" if request.token_ids == (20,) else "collocated"
+                "pd_disaggregated"
+                if request.token_ids in {(20,), (21,)}
+                else "collocated"
             )
             return AdmissionDecision.accept()
+
+        @staticmethod
+        def prefill_executor_group_hint(request):
+            return "prefill" if request.token_ids[0] >= 20 else "decode"
 
         @staticmethod
         def prefill_executor_group(request):
@@ -281,13 +336,17 @@ def test_route_aware_prefill_executors_prevent_long_short_host_hol() -> None:
     long_handle = loop.submit([20], max_new_tokens=1)
     assert long_prefill_entered.wait(2)
 
+    queued_long = loop.submit([21], max_new_tokens=1)
     short_handle = loop.submit([1], max_new_tokens=1)
     short_first = short_handle.get(timeout=1)
     assert short_first.token_id == 2
     assert list(short_handle)[-1].finish_reason == "length"
+    assert queued_long.request_id not in backend.admitted
+    assert loop.prefill_slot_deferrals_total > 0
 
     allow_long_prefill.set()
     assert list(long_handle)[-1].finish_reason == "length"
+    assert list(queued_long)[-1].finish_reason == "length"
     loop.close()
 
 

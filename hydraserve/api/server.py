@@ -48,6 +48,12 @@ class _Handler(BaseHTTPRequestHandler):
                     "recoveries_total": loop.recoveries_total,
                     "recovery_failures_total": loop.recovery_failures_total,
                     "fault_suspensions_total": loop.fault_suspensions_total,
+                    "prefill_slot_deferrals_total": (
+                        loop.prefill_slot_deferrals_total
+                    ),
+                    "release_pending": loop.release_pending_count,
+                    "releases_total": loop.release_total,
+                    "release_failures_total": loop.release_failures_total,
                 },
             }
             capacity = getattr(self.hydra.generation_loop.backend, "capacity", None)
@@ -468,6 +474,10 @@ class _Handler(BaseHTTPRequestHandler):
                 "object": object_name,
                 "created": created,
                 "model": self.hydra.model_name,
+                # OpenAI-compatible extension used by HydraServe's benchmark
+                # client to distinguish real model-token events from a final
+                # tokenizer flush chunk (which has text but no new token).
+                "hydraserve_token_id": event.token_id,
                 "choices": [choice],
             }
         )
@@ -571,6 +581,15 @@ class _Handler(BaseHTTPRequestHandler):
             f'hydraserve_scheduler_recoveries_total{{outcome="failure"}} {loop.recovery_failures_total}',
             "# TYPE hydraserve_scheduler_fault_suspensions_total counter",
             f"hydraserve_scheduler_fault_suspensions_total {loop.fault_suspensions_total}",
+            "# TYPE hydraserve_prefill_slot_deferrals_total counter",
+            "hydraserve_prefill_slot_deferrals_total "
+            f"{loop.prefill_slot_deferrals_total}",
+            "# TYPE hydraserve_release_pending gauge",
+            f"hydraserve_release_pending {loop.release_pending_count}",
+            "# TYPE hydraserve_releases_total counter",
+            f'hydraserve_releases_total{{outcome="success"}} '
+            f"{loop.release_total - loop.release_failures_total}",
+            f'hydraserve_releases_total{{outcome="failure"}} {loop.release_failures_total}',
         ]
         capacity = getattr(backend, "capacity", None)
         if capacity is not None:

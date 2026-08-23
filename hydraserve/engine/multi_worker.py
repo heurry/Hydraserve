@@ -237,6 +237,10 @@ class MultiWorkerGenerationBackend:
     supports_async_prefill = True
 
     @property
+    def release_parallelism(self) -> int:
+        return len(self.config.prefill_devices) + len(self.config.decode_devices)
+
+    @property
     def prefill_parallelism(self) -> int:
         """Legacy aggregate concurrency for serving-loop compatibility."""
         return len(self.config.prefill_devices) + len(self.config.decode_devices)
@@ -261,6 +265,33 @@ class MultiWorkerGenerationBackend:
         if request.route == Route.PD_DISAGGREGATED.value:
             return "prefill"
         return "decode"
+
+    def prefill_executor_group_hint(self, request: ServingRequest) -> str | None:
+        """Predict deterministic routing before decode-side KV admission.
+
+        The serving loop uses this only to cap outstanding work per physical
+        prefill pool.  Adaptive and work-conserving short routes deliberately
+        return ``None`` because their target depends on live load at admission.
+        """
+
+        conditional = int(getattr(self.config, "conditional_pd_tokens", 0) or 0)
+        force_pd = int(
+            getattr(getattr(self.router, "config", None), "force_pd_tokens", 0) or 0
+        )
+        threshold = conditional or force_pd
+        if not threshold:
+            return None
+        if not self._prefill_available():
+            return "decode"
+        if len(request.token_ids) >= threshold:
+            return "prefill"
+        if (
+            conditional
+            and getattr(self.config, "prefill_short_policy", "work-conserving")
+            == "never"
+        ):
+            return "decode"
+        return None
 
     def __init__(
         self,
@@ -351,6 +382,7 @@ class MultiWorkerGenerationBackend:
         self._prefill_healthy = [True] * prefill_count
         self._prefill_pending = [0] * prefill_count
         self._prefill_long_inflight = [0] * prefill_count
+        self._prefill_dispatch_claims = [0] * prefill_count
         self._closed = False
         self._collocated_count = 0
         self._pd_count = 0
@@ -413,6 +445,13 @@ class MultiWorkerGenerationBackend:
             raise
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
+        # ``ContinuousGenerationLoop`` admits before submitting prefill, while
+        # ``prefill()`` defensively admits again.  P-worker collocated requests
+        # are not registered in the decode registry, so recognize that binding
+        # explicitly and avoid issuing a second reserve RPC/counter increment.
+        with self._state_lock:
+            if request.request_id in self._prefill_bound:
+                return AdmissionDecision.accept()
         try:
             self.registry.worker_for(request.request_id)
             return AdmissionDecision.accept()
@@ -435,14 +474,17 @@ class MultiWorkerGenerationBackend:
             index = self._pick_serve_prefill_worker()
             if index is not None:
                 try:
-                    result = self._prefill_serving_rpc(
-                        index,
-                        self._request_command("reserve", request),
-                        "admission",
-                        request.request_id,
-                    )
-                except (TimeoutError, WorkerUnavailableError):
-                    result = {}
+                    try:
+                        result = self._prefill_serving_rpc(
+                            index,
+                            self._request_command("reserve", request),
+                            "admission",
+                            request.request_id,
+                        )
+                    except (TimeoutError, WorkerUnavailableError):
+                        result = {}
+                finally:
+                    self._release_prefill_dispatch_claim(index)
                 if result.get("admitted"):
                     self._prefill_bound[request.request_id] = index
                     with self._state_lock:
@@ -452,6 +494,7 @@ class MultiWorkerGenerationBackend:
                     request.route = "collocated"
                     request.route_reason = "prefill_worker_collocated"
                     request.worker_id = index
+                    request.worker_pool = "prefill"
                     return AdmissionDecision.accept()
         required_blocks = self._required_blocks(request)
         prefix_matches = {
@@ -487,6 +530,7 @@ class MultiWorkerGenerationBackend:
                 continue
             self.registry.bind(request.request_id, candidate.worker_id)
             request.worker_id = candidate.worker_id
+            request.worker_pool = "decode"
             with self._state_lock:
                 conditional_pd_tokens = getattr(self.config, "conditional_pd_tokens", 0)
                 if conditional_pd_tokens and not prefill_available:
@@ -750,8 +794,34 @@ class MultiWorkerGenerationBackend:
             raise PartialDecodeError(successes, failures)
         return tuple(output)
 
+    def decode_batch_sizes(
+        self, requests: tuple[ServingRequest, ...]
+    ) -> dict[int, int]:
+        """Report the batch width seen by each physical P/D worker."""
+
+        groups: dict[tuple[str, int], list[int]] = {}
+        with self._state_lock:
+            prefill_bound = dict(self._prefill_bound)
+        for request in requests:
+            prefill_index = prefill_bound.get(request.request_id)
+            if prefill_index is not None:
+                groups.setdefault(("prefill", prefill_index), []).append(
+                    request.request_id
+                )
+                continue
+            try:
+                worker_id = self.registry.worker_for(request.request_id)
+            except KeyError:
+                continue
+            groups.setdefault(("decode", worker_id), []).append(request.request_id)
+        return {
+            request_id: len(request_ids)
+            for request_ids in groups.values()
+            for request_id in request_ids
+        }
+
     def release(self, request_id: int) -> None:
-        prefill_index = self._prefill_bound.pop(request_id, None)
+        prefill_index = self._prefill_bound.get(request_id)
         if prefill_index is not None:
             try:
                 self._prefill_serving_rpc(
@@ -762,11 +832,13 @@ class MultiWorkerGenerationBackend:
                 )
             finally:
                 with self._state_lock:
+                    self._prefill_bound.pop(request_id, None)
                     self._route_decisions.pop(request_id, None)
                     self._lost_requests.discard(request_id)
             return
-        worker_id = self.registry.release(request_id)
-        if worker_id is None:
+        try:
+            worker_id = self.registry.worker_for(request_id)
+        except KeyError:
             with self._state_lock:
                 self._lost_requests.discard(request_id)
                 self._route_decisions.pop(request_id, None)
@@ -779,6 +851,7 @@ class MultiWorkerGenerationBackend:
                 request_id,
             )
         finally:
+            self.registry.release(request_id)
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
                 getattr(self, "_host_prefix_tokens", {}).pop(request_id, None)
@@ -1026,6 +1099,7 @@ class MultiWorkerGenerationBackend:
     def _pick_prefill_worker(self) -> int:
         with self._state_lock:
             count = len(self._prefill_processes)
+            claims = getattr(self, "_prefill_dispatch_claims", [0] * count)
             candidates = [
                 index for index in range(count) if self._prefill_healthy[index]
             ]
@@ -1033,9 +1107,41 @@ class MultiWorkerGenerationBackend:
                 return self._prefill_round_robin % count
             # Least-loaded dispatch: the worker with the fewest in-flight
             # commands gets the next long prefill, keeping the nP pool balanced.
-            index = min(candidates, key=lambda i: self._prefill_pending[i])
+            index = min(
+                candidates,
+                key=lambda i: (self._prefill_pending[i] + claims[i], i),
+            )
             self._prefill_round_robin = (index + 1) % count
             return index
+
+    def _claim_prefill_worker(self) -> int:
+        """Atomically select and reserve a P worker for dispatch."""
+
+        with self._state_lock:
+            count = len(self._prefill_processes)
+            if not hasattr(self, "_prefill_dispatch_claims"):
+                self._prefill_dispatch_claims = [0] * count
+            candidates = [
+                index for index in range(count) if self._prefill_healthy[index]
+            ]
+            if not candidates:
+                candidates = list(range(count))
+            index = min(
+                candidates,
+                key=lambda i: (
+                    self._prefill_pending[i] + self._prefill_dispatch_claims[i],
+                    i,
+                ),
+            )
+            self._prefill_dispatch_claims[index] += 1
+            self._prefill_round_robin = (index + 1) % count
+            return index
+
+    def _release_prefill_dispatch_claim(self, index: int) -> None:
+        with self._state_lock:
+            claims = getattr(self, "_prefill_dispatch_claims", None)
+            if claims is not None:
+                claims[index] = max(0, claims[index] - 1)
 
     def _pick_serve_prefill_worker(self) -> int | None:
         """Pick an idle prefill worker for a collocated short request (W4).
@@ -1048,12 +1154,15 @@ class MultiWorkerGenerationBackend:
         with self._state_lock:
             count = len(self._prefill_processes)
             long_inflight = getattr(self, "_prefill_long_inflight", [0] * count)
+            if not hasattr(self, "_prefill_dispatch_claims"):
+                self._prefill_dispatch_claims = [0] * count
             idle = [
                 index
                 for index in range(count)
                 if self._prefill_healthy[index]
                 and self._prefill_pending[index] == 0
                 and long_inflight[index] == 0
+                and self._prefill_dispatch_claims[index] == 0
             ]
             if not idle:
                 return None
@@ -1061,16 +1170,20 @@ class MultiWorkerGenerationBackend:
             # the command queue is shared with PD prefills, so a worker with
             # queued work would stall the short request behind it.
             index = min(idle, key=lambda candidate: self._prefill_pending[candidate])
+            self._prefill_dispatch_claims[index] += 1
             self._prefill_serve_round_robin = (index + 1) % count
             return index
 
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
-        index = self._pick_prefill_worker()
+        index = self._claim_prefill_worker()
         failure = None
         try:
-            result = self._prefill_rpc_call(index, command, long_operation=True)
-        except (TimeoutError, WorkerUnavailableError) as exc:
-            failure = exc
+            try:
+                result = self._prefill_rpc_call(index, command, long_operation=True)
+            except (TimeoutError, WorkerUnavailableError) as exc:
+                failure = exc
+        finally:
+            self._release_prefill_dispatch_claim(index)
         if failure is not None:
             with self._state_lock:
                 if self._prefill_healthy[index]:
@@ -1114,6 +1227,8 @@ class MultiWorkerGenerationBackend:
             self._prefill_rpc_ids = count(1)
         if not hasattr(self, "_prefill_long_inflight"):
             self._prefill_long_inflight = [0 for _ in range(count_workers)]
+        if not hasattr(self, "_prefill_dispatch_claims"):
+            self._prefill_dispatch_claims = [0 for _ in range(count_workers)]
 
     def _prefill_rpc_call(
         self, index: int, command: dict, *, long_operation: bool

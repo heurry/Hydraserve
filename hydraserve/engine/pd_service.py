@@ -1402,6 +1402,8 @@ def _decode_worker(
 class DisaggregatedGenerationBackend:
     """GenerationBackend backed by persistent prefill and decode GPU processes."""
 
+    release_parallelism = 1
+
     def __init__(
         self,
         config: PDWorkerConfig,
@@ -1544,6 +1546,7 @@ class DisaggregatedGenerationBackend:
                     request.route = Route.PD_DISAGGREGATED.value
                     request.route_reason = "fixed_pd"
                     request.worker_id = 0
+                    request.worker_pool = "decode"
                     request.route_decode_load = initial_capacity.decode_load
                 return AdmissionDecision.accept()
             if result.get("retryable"):
@@ -1689,16 +1692,19 @@ class DisaggregatedGenerationBackend:
             return
         with self._decode_lock:
             known = request_id in self._admitted_requests
-            self._admitted_requests.discard(request_id)
-            self._reserved_blocks.pop(request_id, None)
-            self._host_prefix_tokens.pop(request_id, None)
-            self._lost_requests.discard(request_id)
         if not known:
             return
-        result = self._decode_rpc(
-            {"op": "release", "request_id": request_id}, "release", request_id
-        )
-        self._update_capacity(result)
+        try:
+            result = self._decode_rpc(
+                {"op": "release", "request_id": request_id}, "release", request_id
+            )
+            self._update_capacity(result)
+        finally:
+            with self._decode_lock:
+                self._admitted_requests.discard(request_id)
+                self._reserved_blocks.pop(request_id, None)
+                self._host_prefix_tokens.pop(request_id, None)
+                self._lost_requests.discard(request_id)
 
     def capacity(self) -> BackendCapacity:
         with self._decode_lock:
@@ -2096,6 +2102,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
                 request.route = bound.route.value
                 request.route_reason = bound.reason.value
                 request.worker_id = 0
+                request.worker_pool = "decode"
                 request.route_collocated_cost_ms = bound.collocated_cost_ms
                 request.route_pd_cost_ms = bound.pd_cost_ms
                 request.route_estimated_savings_ms = bound.estimated_savings_ms

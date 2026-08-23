@@ -5,7 +5,7 @@ from time import sleep
 import pytest
 
 from hydraserve.benchmark import BenchmarkSample, run_benchmark
-from hydraserve.engine import ContinuousGenerationLoop
+from hydraserve.engine import AdmissionDecision, ContinuousGenerationLoop
 
 
 class Tokenizer:
@@ -102,6 +102,23 @@ def test_benchmark_records_request_error() -> None:
     assert summary.ttft_ms == {}
     assert summary.results[0].error == "cannot prefill"
     assert summary.route_counts == {}
+    assert summary.route_failure_counts == {"collocated": 1}
+
+
+def test_benchmark_keeps_pre_admission_failure_route_unknown() -> None:
+    class RejectingBackend(Backend):
+        def admit(self, request):
+            return AdmissionDecision.reject("request exceeds KV capacity")
+
+    loop = ContinuousGenerationLoop(RejectingBackend())
+    summary = run_benchmark(
+        loop, Tokenizer(), [BenchmarkSample("toy", "rejected", "x")]
+    )
+    loop.close()
+
+    assert summary.failed == 1
+    assert summary.results[0].route is None
+    assert summary.route_failure_counts == {"unknown": 1}
 
 
 def test_tpot_excludes_release_tail_and_records_decode_batch_size() -> None:
