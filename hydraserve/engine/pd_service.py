@@ -547,9 +547,12 @@ def _prefill_worker(
                     pending_short.append(queued)
                 else:
                     pending_long.append(queued)
-            if pending_short and short_budget > 0:
+            if pending_short and (short_budget > 0 or not pending_long):
+                # Short ops always make progress: a drained budget must not
+                # strand queued collocated work while no long op is pending
+                # (that deadlocked the worker on commands.get()).
                 command = pending_short.popleft()
-                short_budget -= 1
+                short_budget = max(0, short_budget - 1)
             elif pending_long:
                 command = pending_long.popleft()
                 short_budget = 64
