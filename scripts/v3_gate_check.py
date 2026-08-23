@@ -78,6 +78,7 @@ def bench(trace: pathlib.Path, out: pathlib.Path, logdir: pathlib.Path, model: p
         "--arrival-pattern", "burst",
         "--kv-quant", "int8", "--prefix-cache-blocks", "0",
         "--cache-tokens", str(cache_tokens),
+        "--block-size", "256",
         "--worker-log-dir", str(logdir),
         "--output", str(out), "--seed", str(seed),
     ]
@@ -279,7 +280,12 @@ def main() -> int:
             return
         print(f"\n=== {name} ===", flush=True)
         try:
-            fn(tmp, model, workers)
+            import inspect
+
+            if len(inspect.signature(fn).parameters) >= 3:
+                fn(tmp, model, workers)
+            else:
+                fn(tmp, model)
         except Exception as exc:
             record(name, False, f"exception: {type(exc).__name__}: {exc}")
 
