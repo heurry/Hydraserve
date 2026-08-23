@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from threading import Event, Lock, RLock, Thread
 from queue import Queue
@@ -97,7 +98,11 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         self.rpc_calls.append(("collocated", worker_id, request.request_id))
         return request.request_id + 100
 
-    def _decode_rpc(self, worker_id, command, expected_op, request_id=None):
+    def _decode_rpc(
+        self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+    ):
+        if dispatched is not None:
+            dispatched.set()
         self.rpc_commands.append((worker_id, dict(command)))
         self.rpc_calls.append(
             (expected_op, worker_id, tuple(command.get("request_ids", ())))
@@ -234,6 +239,56 @@ def test_prefill_rpc_multiplexes_out_of_order_short_response() -> None:
     assert results["long"]["token_id"] == 9
 
 
+def test_pd_prefill_arms_decode_receiver_before_starting_producer() -> None:
+    class ReceiverFirstBackend(FakeMultiWorkerBackend):
+        def __init__(self):
+            super().__init__()
+            self.receiver_armed = Event()
+            self.producer_started = Event()
+            self.operation_timeout = 2.0
+            self._pd_executor = ThreadPoolExecutor(max_workers=1)
+
+        def _decode_rpc(
+            self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+        ):
+            if expected_op != "prepare":
+                return super()._decode_rpc(
+                    worker_id,
+                    command,
+                    expected_op,
+                    request_id,
+                    dispatched=dispatched,
+                )
+            assert not self.producer_started.is_set()
+            self.receiver_armed.set()
+            if dispatched is not None:
+                dispatched.set()
+            return {
+                "op": "prepare",
+                "request_id": request_id,
+                "token_id": 9,
+                "replay_consistent": True,
+            }
+
+        def _prefill_rpc(self, command, request_id):
+            self.producer_started.set()
+            assert self.receiver_armed.is_set()
+            return {
+                "op": "prefill",
+                "request_id": request_id,
+                "worker_index": command["worker_index"],
+                "token_id": 9,
+            }
+
+    backend = ReceiverFirstBackend()
+    try:
+        request = ServingRequest(90, tuple(range(20)), 2)
+        assert backend.prefill(request) == 9
+        assert request.route == "pd_disaggregated"
+    finally:
+        backend._pd_executor.shutdown(wait=True)
+
+
 def test_multi_worker_admission_uses_prefix_affinity_and_binds_route() -> None:
     backend = FakeMultiWorkerBackend(
         prefix_affinity=lambda request, worker_id: (
@@ -272,7 +327,11 @@ def test_multi_worker_reports_physical_decode_batch_widths() -> None:
 
 def test_multi_worker_decode_isolates_failed_worker_group() -> None:
     class OneWorkerFails(FakeMultiWorkerBackend):
-        def _decode_rpc(self, worker_id, command, expected_op, request_id=None):
+        def _decode_rpc(
+            self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+        ):
+            if dispatched is not None:
+                dispatched.set()
             if expected_op == "decode" and worker_id == 1:
                 raise RuntimeError("worker 1 failed")
             return super()._decode_rpc(worker_id, command, expected_op, request_id)

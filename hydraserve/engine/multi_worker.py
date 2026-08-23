@@ -665,9 +665,13 @@ class MultiWorkerGenerationBackend:
         )
         command["host_cache_hit"] = host_cache_hit
         command["host_prefix_tokens"] = host_prefix_tokens
-        prefill_future = self._pd_executor.submit(
-            self._prefill_rpc, command, request.request_id
-        )
+        # Arm the D-side receiver before the P worker can publish streamed KV.
+        # The serving loop already runs this method in a bounded P executor, so
+        # delegating the producer to a second pool only weakens ordering: under
+        # load P can fill the bounded data plane while D still has no prepare
+        # command and therefore no consumer.  Keep only the receiver in the
+        # auxiliary pool and execute the producer in this physical P slot.
+        receiver_dispatched = Event()
         prepare_future = self._pd_executor.submit(
             self._decode_rpc,
             worker_id,
@@ -678,8 +682,13 @@ class MultiWorkerGenerationBackend:
             },
             "prepare",
             request.request_id,
+            dispatched=receiver_dispatched,
         )
-        result = prefill_future.result()
+        if not receiver_dispatched.wait(min(5.0, self.operation_timeout)):
+            if prepare_future.done():
+                prepare_future.result()
+            raise TimeoutError("decode prepare was not dispatched before PD transfer")
+        result = self._prefill_rpc(command, request.request_id)
         prepared = prepare_future.result()
         if result.get("worker_index") != worker_id:
             raise RuntimeError("prefill worker returned a different decode target")
@@ -1081,6 +1090,8 @@ class MultiWorkerGenerationBackend:
         command: dict,
         expected_op: str,
         request_id: int | None = None,
+        *,
+        dispatched: Event | None = None,
     ) -> dict:
         failure = None
         with self._decode_locks[worker_id]:
@@ -1090,6 +1101,8 @@ class MultiWorkerGenerationBackend:
                         f"decode worker {worker_id} is not running"
                     )
                 self._decode_commands[worker_id].put(command)
+                if dispatched is not None:
+                    dispatched.set()
                 result = self._get_decode_response(worker_id, self.operation_timeout)
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc

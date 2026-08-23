@@ -1424,10 +1424,11 @@ P50/P99分别为264/396ms和268/405ms，差异小于2%。这证明8192不再错�
 P0 smoke通过，P2-C（1P+3D）也能结束（70/72，2条short OOM）。该组合不支持“prefill token
 budget死锁”的初步猜测，而指向只在双P并发时出现的数据面问题。
 
-根因是`SharedMemoryRingTransferBackend`错误地把每个D namespace当成SPSC。2P+2D下两个独立P
-进程可能同时观察到同一FREE slot，随后都写WRITING并覆盖header/digest。D端等待请求A时看到请求B
+第一轮静态审计还发现`SharedMemoryRingTransferBackend`错误地把每个D namespace当成SPSC。
+2P+2D下两个独立P进程可能同时观察到同一FREE slot，随后都写WRITING并覆盖header/digest。D端
+等待请求A时看到请求B
 的digest而继续等待，请求B的prepare又可能排在同一D RPC串行路径之后，最终形成GPU全部空闲的
-协议死锁。1P+3D没有同namespace双生产者，3请求smoke则可能因时序未碰撞而通过。
+协议死锁。这是必须修复的MPSC正确性风险，但后续四卡复测证明它不是本次P0挂死的充分解释。
 
 修复为每个slot仅在`FREE -> WRITING`认领期间使用跨进程`flock`；认领后立即释放锁，大payload
 copy和READY发布仍在锁外。新增真实双producer进程、单consumer、16轮槽位复用回归，验证每轮两份
@@ -1437,3 +1438,26 @@ copy和READY发布仍在锁外。新增真实双producer进程、单consumer、1
 P2-C的70/72与44.4 tok/s同样不得进入headline比较。下一步只先复跑P0 W1-128 seed42：必须达到
 72/72、无transfer timeout/长时间0% GPU空转，随后才恢复多seed性能矩阵并重新测量MPSC认领锁的
 实际开销。
+
+## 28. P0 faulthandler 定位：receiver-first 与 one-shot SHM 创建竞态（2026-08-23）
+
+拉取MPSC认领修复后，P0仍在约5分钟后四卡0%且无JSON；把ring slots从3增至8后仍在2分49秒
+复现，因此“总in-flight 4大于3个slot”也不是根因。进程内faulthandler给出了关键等待链：两个P
+worker主线程停在`publish_kv_chunk -> Future.result()`，transfer executor停在
+`shm_ring.send()`等待FREE；D worker没有及时进入对应请求的消费路径。
+
+代码审计确认`MultiWorkerGenerationBackend.prefill()`把P RPC和D prepare都提交到第二层
+`_pd_executor`，而且先提交producer。serving loop本身已经用按P卡数有界的executor承载该方法，
+这次二次委派既没有增加物理并行度，也破坏了数据面协议所需的receiver-first顺序。修复后先提交
+D prepare，并等待其命令确实进入D进程队列；只有收到dispatch event后，当前有界P executor线程才
+直接运行P RPC。即使同一D的prepare继续由现有RPC lock串行，尚未获得D消费槽的第二个P也不会开始
+填ring，因此不会形成“producer等FREE、consumer尚未收到命令”的环。
+
+纯`shm`判别没有挂死，而是在warmup-5快速失败`cannot mmap an empty file`。这不是空KV chunk：
+POSIX `shm_open`会先发布名字，CPython creator随后才`ftruncate`到目标大小；接收方恰好在该窗口
+`create=False`打开时会看到零长度对象。receive现在只对这一特定ValueError按“尚未发布”轮询，
+其他ValueError仍立即抛出。
+
+新增回归分别验证：D prepare dispatch发生在P producer启动之前；one-shot SHM首次打开模拟零长度
+竞态后能够重试并完整还原payload。该修复尚未在四卡机复跑，P0仍必须先做seed42单点正确性门禁，
+通过前不得更新性能结论。

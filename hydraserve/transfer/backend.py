@@ -186,9 +186,18 @@ class SharedMemoryTransferBackend(TransferBackend):
                 memory = shared_memory.SharedMemory(name=name, create=False)
                 break
             except FileNotFoundError:
-                if deadline is not None and monotonic() >= deadline:
-                    raise TimeoutError(f"timed out waiting for transfer {key}")
-                sleep(self._poll_interval)
+                pass
+            except ValueError as exc:
+                # POSIX shm_open publishes the name before CPython's creator
+                # has completed ftruncate().  A racing receiver can therefore
+                # observe a real object whose size is temporarily zero and
+                # SharedMemory reports "cannot mmap an empty file".  Treat only
+                # that transient creation state like a missing mailbox.
+                if "cannot mmap an empty file" not in str(exc).lower():
+                    raise
+            if deadline is not None and monotonic() >= deadline:
+                raise TimeoutError(f"timed out waiting for transfer {key}")
+            sleep(self._poll_interval)
         try:
             while True:
                 magic, metadata_size, payload_size = self._HEADER.unpack(

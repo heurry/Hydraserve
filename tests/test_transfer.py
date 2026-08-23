@@ -6,6 +6,7 @@ import multiprocessing as mp
 import numpy as np
 import pytest
 
+import hydraserve.transfer.backend as transfer_backend_module
 from hydraserve.cache import Int4Tensor, Int8Tensor, LinearState, dequantize_int8
 from hydraserve.transfer import (
     CudaP2PTransferBackend,
@@ -225,6 +226,32 @@ def test_shared_memory_typed_codec_rejects_unsupported_objects() -> None:
     backend = SharedMemoryTransferBackend(namespace="hydraserve-typed-reject")
     with pytest.raises(TypeError, match="unsupported"):
         backend.send("bad", {"value": object()}, 1)
+
+
+def test_shared_memory_receive_retries_zero_size_creation_race(monkeypatch) -> None:
+    backend = SharedMemoryTransferBackend(namespace="hydraserve-empty-race-pytest")
+    backend.send("chunk", np.arange(16, dtype=np.float32), 1)
+    original = transfer_backend_module.shared_memory.SharedMemory
+    raced = False
+
+    def open_after_ftruncate(*args, **kwargs):
+        nonlocal raced
+        if not kwargs.get("create", False) and not raced:
+            raced = True
+            raise ValueError("cannot mmap an empty file")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        transfer_backend_module.shared_memory,
+        "SharedMemory",
+        open_after_ftruncate,
+    )
+    try:
+        restored = backend.receive("chunk", 1, timeout=1)
+    finally:
+        backend.close()
+    assert raced
+    np.testing.assert_array_equal(restored, np.arange(16, dtype=np.float32))
 
 
 def test_persistent_shared_memory_ring_reuses_slots() -> None:

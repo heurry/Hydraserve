@@ -273,9 +273,10 @@ python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
 `MODEL`、`DATASETS`、`SHORT_RATE`、`FROZEN_CHUNK`必须显式替换，禁止原样运行。
 P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数不变。
 
-2026-08-23的首次四卡复核中，修复后的D0在8192与65536下均为72/72且性能收敛，但P0曾触发
-双P并发认领同一SHM slot的协议死锁。该问题已增加MPSC原子认领和多进程回归；恢复矩阵前只用
-上述P0命令复跑seed42。验收条件为72/72、生成结果JSON、无transfer timeout、无持续四卡0%空转。
+2026-08-23的首次四卡复核中，修复后的D0在8192与65536下均为72/72且性能收敛；P0同时暴露了
+MPSC slot认领风险和更直接的producer-first协议顺序。当前实现既原子认领slot，也必须确认D prepare
+命令已经dispatch后才启动P端stream发送；恢复矩阵前只用上述P0命令复跑seed42。验收条件为72/72、
+生成结果JSON、无transfer timeout、无持续四卡0%空转。
 在该单点门禁通过前不要运行P1、多seed或把旧P0挂死记录纳入对比。
 
 若P0在`shm`和`shm-ring`下都表现为持续四卡0%且无结果，不再按数据面slot问题猜测修复。运行
@@ -283,6 +284,10 @@ P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数�
 定期转储全部Python线程栈，不依赖`py-spy`。至少保留第二次转储后的
 `coordinator.log`、`workers/prefill-*.log`和`workers/decode-*.log`；不要只保留控制台`tail`。
 只有栈证据确认互等位置后，才能修改MultiWorker executor/RPC顺序。
+
+receiver-first门禁应使用阻塞数据面：在D prepare dispatch event之前断言P producer尚未进入send；
+event到达后才放行P。`shm`门禁还需注入一次“名字存在但尚未ftruncate”的零长度打开竞态，确认
+receive重试而不是把`cannot mmap an empty file`记为请求失败。
 
 ---
 
