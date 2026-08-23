@@ -1,0 +1,35 @@
+Thread 0x00007fbf8b491640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007fbff1d21640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/shm_ring.py", line 152 in send
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 228 in send_kv_chunk
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 194 in extract_and_send
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007fc56cd85640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Current thread 0x00007fc712713740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/_base.py", line 453 in result
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 212 in publish_kv_chunk
+  File "/root/autodl-tmp/Hydraserve/hydraserve/model/runtime.py", line 408 in prefill
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 221 in process
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 589 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
