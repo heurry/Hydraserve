@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 
 from hydraserve.config import discover_model_configs, load_model_config
+from hydraserve.diagnostics import enable_stall_diagnostics
 
 
 def _collect_benchmark_metadata(args) -> dict:
@@ -133,6 +134,7 @@ def _describe(path: Path, result) -> str:
 
 
 def main() -> int:
+    enable_stall_diagnostics("coordinator")
     parser = argparse.ArgumentParser(prog="python -m hydraserve")
     subparsers = parser.add_subparsers(dest="command", required=True)
     inspect_parser = subparsers.add_parser("inspect-models", help="validate model config files")

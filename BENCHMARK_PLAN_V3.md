@@ -278,6 +278,12 @@ P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数�
 上述P0命令复跑seed42。验收条件为72/72、生成结果JSON、无transfer timeout、无持续四卡0%空转。
 在该单点门禁通过前不要运行P1、多seed或把旧P0挂死记录纳入对比。
 
+若P0在`shm`和`shm-ring`下都表现为持续四卡0%且无结果，不再按数据面slot问题猜测修复。运行
+`scripts/run_v3_p0_diagnose.sh`；它通过`HYDRASERVE_STALL_DUMP_SECONDS`让coordinator及4个worker
+定期转储全部Python线程栈，不依赖`py-spy`。至少保留第二次转储后的
+`coordinator.log`、`workers/prefill-*.log`和`workers/decode-*.log`；不要只保留控制台`tail`。
+只有栈证据确认互等位置后，才能修改MultiWorker executor/RPC顺序。
+
 ---
 
 ## 五、数据集与流量设计

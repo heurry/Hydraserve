@@ -165,6 +165,9 @@ def _prefill_worker(
         import sys
 
         sys.stderr = open(stderr_path, "a", buffering=1)
+    from hydraserve.diagnostics import enable_stall_diagnostics
+
+    enable_stall_diagnostics(f"prefill:{config.prefill_device}")
     responses = _CorrelatedResponseSink(responses)
     backends = []
     try:
@@ -862,6 +865,9 @@ def _decode_worker(
         import sys
 
         sys.stderr = open(stderr_path, "a", buffering=1)
+    from hydraserve.diagnostics import enable_stall_diagnostics
+
+    enable_stall_diagnostics(f"decode:{config.decode_device}")
     backend = None
     prepare_executor = None
     try:
