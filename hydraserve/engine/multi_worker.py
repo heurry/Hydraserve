@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from enum import Enum
 from itertools import count
 import multiprocessing as mp
 import os
@@ -45,6 +46,14 @@ def _normalize_device(device: str) -> str:
     return f"cuda:{value}" if value.isdigit() else value
 
 
+class HybridRole(str, Enum):
+    """Runtime role of a work-conserving prefill worker."""
+
+    DECODE = "decode"
+    PREFILL_PENDING = "prefill_pending"
+    PREFILL_ACTIVE = "prefill_active"
+
+
 @dataclass(frozen=True, slots=True)
 class PDClusterConfig:
     model_dir: str
@@ -74,6 +83,7 @@ class PDClusterConfig:
     conditional_pd_tokens: int = 0
     prefill_short_policy: str = "work-conserving"
     prefill_preempt_max_ops: int = 8
+    hybrid_prefill_reserve_tokens: int = -1
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
@@ -140,6 +150,21 @@ class PDClusterConfig:
             raise ValueError("conditional PD threshold cannot be negative")
         if self.prefill_short_policy not in {"never", "work-conserving"}:
             raise ValueError("prefill_short_policy must be never or work-conserving")
+        if self.hybrid_prefill_reserve_tokens < -1:
+            raise ValueError("hybrid prefill reserve tokens must be -1 or non-negative")
+
+    @property
+    def effective_hybrid_prefill_reserve_tokens(self) -> int:
+        """KV capacity kept available for a temporary long-prefill role.
+
+        ``-1`` selects a conservative automatic reserve: half the worker cache,
+        capped at 32K tokens.  ``0`` preserves the legacy work-conserving
+        behavior without a reserved long-prefill region.
+        """
+
+        if self.hybrid_prefill_reserve_tokens >= 0:
+            return self.hybrid_prefill_reserve_tokens
+        return min(32_768, self.cache_tokens_per_worker // 2)
 
     def worker_config(self, worker_index: int) -> PDWorkerConfig:
         return PDWorkerConfig(
@@ -244,6 +269,25 @@ class MultiWorkerGenerationBackend:
     def prefill_parallelism(self) -> int:
         """Legacy aggregate concurrency for serving-loop compatibility."""
         return len(self.config.prefill_devices) + len(self.config.decode_devices)
+
+    @property
+    def supports_independent_decode(self) -> bool:
+        """Allow physical workers to advance without a cross-worker barrier."""
+
+        return True
+
+    @property
+    def decode_executor_parallelism(self) -> int:
+        return len(self.config.prefill_devices) + len(self.config.decode_devices)
+
+    def decode_executor_group(self, request: ServingRequest) -> tuple[str, int]:
+        """Return the physical worker that owns a request's decode state."""
+
+        with self._state_lock:
+            prefill_index = self._prefill_bound.get(request.request_id)
+        if prefill_index is not None:
+            return ("prefill", prefill_index)
+        return ("decode", self.registry.worker_for(request.request_id))
 
     def prefill_admission_tokens(self, request: ServingRequest) -> int:
         """Charge one runtime chunk while the physical executor owns the RPC."""
@@ -376,6 +420,16 @@ class MultiWorkerGenerationBackend:
             )
         )
         self._reserved_blocks = [dict() for _ in range(worker_count)]
+        self._prefill_reserved_blocks = [dict() for _ in range(prefill_count)]
+        self._prefill_capacities = [
+            BackendCapacity(
+                total_blocks,
+                total_blocks,
+                config.max_state_slots_per_worker,
+                config.max_state_slots_per_worker,
+            )
+            for _ in range(prefill_count)
+        ]
         self._worker_cache_stats: list[dict[str, int | float]] = [
             {} for _ in range(worker_count)
         ]
@@ -407,6 +461,13 @@ class MultiWorkerGenerationBackend:
         self._prefill_round_robin = 0
         self._prefill_serve_round_robin = 0
         self._decode_round_robin = 0
+        self._short_round_robin = 0
+        self._hybrid_roles = [HybridRole.DECODE] * prefill_count
+        # Long requests are bound at admission time so the hybrid worker stops
+        # accepting new short requests before the asynchronous prefill RPC is
+        # actually submitted.  The legacy unbound selector remains below as a
+        # compatibility fallback for old callers and lightweight test doubles.
+        self._long_prefill_bound: dict[int, int] = {}
         # request_id -> prefill worker index for collocated requests served on a
         # prefill worker (W4); decode-worker-bound requests stay in the registry.
         self._prefill_bound: dict[int, int] = {}
@@ -445,6 +506,8 @@ class MultiWorkerGenerationBackend:
             self.model_name = names.pop()
             for worker_id, result in enumerate(decode_ready):
                 self._update_worker_capacity(worker_id, result)
+            for worker_id, result in enumerate(prefill_ready):
+                self._update_prefill_capacity(worker_id, result)
         except Exception:
             self.close(force=True)
             raise
@@ -462,9 +525,24 @@ class MultiWorkerGenerationBackend:
             return AdmissionDecision.accept()
         except KeyError:
             pass
-        # W4: short requests that will be routed collocated can be served on an
-        # idle prefill worker (using its otherwise-idle decode-phase compute)
-        # instead of a decode worker. Long requests always stay on the PD path.
+        required_blocks = self._required_blocks(request)
+        prefix_matches = {
+            worker.worker_id: self._prefix_match(request, worker.worker_id)
+            for worker in self.registry.snapshots()
+        }
+        candidates = list(
+            self.registry.candidates(
+                required_blocks=required_blocks,
+                prompt_tokens=len(request.token_ids),
+                prefix_matches=prefix_matches,
+            )
+        )
+
+        # Dynamic H1+nD: an idle hybrid worker and the permanent decode workers
+        # compete in one load-aware short-request pool.  The old P-first path is
+        # intentionally retained through ``_pick_serve_prefill_worker`` as a
+        # helper/fallback, but it is no longer allowed to pack every short onto
+        # GPU0 before considering the D pool.
         force_pd = int(
             getattr(getattr(self.router, "config", None), "force_pd_tokens", 0) or 0
         )
@@ -476,7 +554,17 @@ class MultiWorkerGenerationBackend:
             and len(request.token_ids) < short_cutoff
             and self._prefill_available()
         ):
-            index = self._pick_serve_prefill_worker()
+            decode_load = min(
+                (candidate.decode_load for candidate in candidates), default=1.0
+            )
+            index = self._pick_serve_prefill_worker(
+                required_blocks=required_blocks,
+                competing_decode_load=decode_load,
+                decode_candidates=len(candidates),
+                preferred_index=(
+                    request.worker_id if request.worker_pool == "prefill" else None
+                ),
+            )
             if index is not None:
                 try:
                     try:
@@ -491,8 +579,9 @@ class MultiWorkerGenerationBackend:
                 finally:
                     self._release_prefill_dispatch_claim(index)
                 if result.get("admitted"):
-                    self._prefill_bound[request.request_id] = index
                     with self._state_lock:
+                        self._prefill_bound[request.request_id] = index
+                        self._record_prefill_reservation(index, request)
                         self._prefill_short_count = (
                             getattr(self, "_prefill_short_count", 0) + 1
                         )
@@ -501,16 +590,6 @@ class MultiWorkerGenerationBackend:
                     request.worker_id = index
                     request.worker_pool = "prefill"
                     return AdmissionDecision.accept()
-        required_blocks = self._required_blocks(request)
-        prefix_matches = {
-            worker.worker_id: self._prefix_match(request, worker.worker_id)
-            for worker in self.registry.snapshots()
-        }
-        candidates = self.registry.candidates(
-            required_blocks=required_blocks,
-            prompt_tokens=len(request.token_ids),
-            prefix_matches=prefix_matches,
-        )
         if not candidates:
             total_blocks = self._total_blocks_per_worker()
             if required_blocks > total_blocks:
@@ -584,6 +663,21 @@ class MultiWorkerGenerationBackend:
                         candidate.decode_load,
                         True,
                     )
+                if decision.route is Route.PD_DISAGGREGATED:
+                    try:
+                        self._bind_long_prefill(request.request_id)
+                    except WorkerUnavailableError:
+                        # Health can change between candidate scoring and the
+                        # role claim. Keep the already-reserved decode state and
+                        # fall back to the legacy collocated path instead of
+                        # leaking the admission or failing the request.
+                        decision = RouteDecision(
+                            Route.COLLOCATED,
+                            RouteReason.PREFILL_UNAVAILABLE,
+                            len(request.token_ids),
+                            candidate.decode_load,
+                            True,
+                        )
                 self._route_decisions[request.request_id] = decision
                 request.route = decision.route.value
                 request.route_reason = decision.reason.value
@@ -847,6 +941,8 @@ class MultiWorkerGenerationBackend:
             finally:
                 with self._state_lock:
                     self._prefill_bound.pop(request_id, None)
+                    self._ensure_hybrid_state()
+                    self._prefill_reserved_blocks[prefill_index].pop(request_id, None)
                     self._route_decisions.pop(request_id, None)
                     self._lost_requests.discard(request_id)
             return
@@ -875,11 +971,15 @@ class MultiWorkerGenerationBackend:
     def abandon(self, request_id: int) -> None:
         """Forget host-side ownership after device-local state is known lost."""
         if request_id in self._prefill_bound:
-            self._prefill_bound.pop(request_id, None)
             with self._state_lock:
+                prefill_index = self._prefill_bound.pop(request_id, None)
+                self._ensure_hybrid_state()
+                if prefill_index is not None:
+                    self._prefill_reserved_blocks[prefill_index].pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
                 self._lost_requests.discard(request_id)
             return
+        self._release_long_prefill_binding(request_id)
         worker_id = self.registry.release(request_id)
         with self._state_lock:
             if worker_id is not None:
@@ -940,13 +1040,31 @@ class MultiWorkerGenerationBackend:
 
     def capacity(self) -> BackendCapacity:
         snapshots = self.registry.snapshots()
+        hybrid = []
+        if (
+            getattr(self.config, "prefill_short_policy", "work-conserving")
+            == "work-conserving"
+        ):
+            with self._state_lock:
+                self._ensure_hybrid_state()
+                reserve_blocks = self._hybrid_reserve_blocks()
+                hybrid = [
+                    BackendCapacity(
+                        max(0, capacity.kv_total_blocks - reserve_blocks),
+                        max(0, capacity.kv_free_blocks - reserve_blocks),
+                        capacity.state_total_slots,
+                        capacity.state_free_slots,
+                    )
+                    for index, capacity in enumerate(self._prefill_capacities)
+                    if self._prefill_healthy[index]
+                    and self._hybrid_roles[index] is HybridRole.DECODE
+                ]
+        capacities = [item.capacity for item in snapshots] + hybrid
         return BackendCapacity(
-            kv_total_blocks=sum(item.capacity.kv_total_blocks for item in snapshots),
-            kv_free_blocks=sum(item.capacity.kv_free_blocks for item in snapshots),
-            state_total_slots=sum(
-                item.capacity.state_total_slots for item in snapshots
-            ),
-            state_free_slots=sum(item.capacity.state_free_slots for item in snapshots),
+            kv_total_blocks=sum(item.kv_total_blocks for item in capacities),
+            kv_free_blocks=sum(item.kv_free_blocks for item in capacities),
+            state_total_slots=sum(item.state_total_slots for item in capacities),
+            state_free_slots=sum(item.state_free_slots for item in capacities),
         )
 
     def cache_stats(self) -> dict[str, int | float]:
@@ -1161,47 +1279,204 @@ class MultiWorkerGenerationBackend:
             if claims is not None:
                 claims[index] = max(0, claims[index] - 1)
 
-    def _pick_serve_prefill_worker(self) -> int | None:
-        """Pick an idle prefill worker for a collocated short request (W4).
+    def _ensure_hybrid_state(self) -> None:
+        """Lazily initialize H-worker state for old test doubles/checkpoints."""
 
-        A prefill worker whose command loop is busy running a long prefill must
-        be skipped for new admission.  A short request already bound to that
-        worker can still make progress through cooperative chunk-boundary
-        preemption. Returns ``None`` when every prefill worker is busy.
+        count_workers = len(self._prefill_processes)
+        total_blocks = self._total_blocks_per_worker()
+        state_slots = int(getattr(self.config, "max_state_slots_per_worker", 1))
+        if not hasattr(self, "_prefill_reserved_blocks"):
+            self._prefill_reserved_blocks = [dict() for _ in range(count_workers)]
+        if not hasattr(self, "_prefill_capacities"):
+            self._prefill_capacities = [
+                BackendCapacity(total_blocks, total_blocks, state_slots, state_slots)
+                for _ in range(count_workers)
+            ]
+        if not hasattr(self, "_hybrid_roles"):
+            self._hybrid_roles = [HybridRole.DECODE] * count_workers
+        if not hasattr(self, "_prefill_long_inflight"):
+            self._prefill_long_inflight = [0] * count_workers
+        if not hasattr(self, "_prefill_dispatch_claims"):
+            self._prefill_dispatch_claims = [0] * count_workers
+        if not hasattr(self, "_long_prefill_bound"):
+            self._long_prefill_bound = {}
+        if not hasattr(self, "_short_round_robin"):
+            self._short_round_robin = 0
+
+    def _hybrid_reserve_blocks(self) -> int:
+        configured = getattr(
+            self.config, "effective_hybrid_prefill_reserve_tokens", None
+        )
+        if configured is None:
+            configured = getattr(self.config, "hybrid_prefill_reserve_tokens", 0)
+        tokens = max(0, int(configured))
+        return (tokens + self.config.block_size - 1) // self.config.block_size
+
+    def _record_prefill_reservation(self, index: int, request: ServingRequest) -> None:
+        self._ensure_hybrid_state()
+        self._prefill_reserved_blocks[index][request.request_id] = (
+            self._required_blocks(request)
+        )
+
+    def _update_prefill_capacity(self, index: int, result: dict) -> None:
+        required = {
+            "kv_total_blocks",
+            "kv_free_blocks",
+            "state_total_slots",
+            "state_free_slots",
+        }
+        if not required.issubset(result):
+            return
+        capacity = BackendCapacity(
+            int(result["kv_total_blocks"]),
+            int(result["kv_free_blocks"]),
+            int(result["state_total_slots"]),
+            int(result["state_free_slots"]),
+        )
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            self._prefill_capacities[index] = capacity
+
+    def _bind_long_prefill(self, request_id: int) -> int:
+        """Move one hybrid worker to PENDING before async prefill dispatch."""
+
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            existing = self._long_prefill_bound.get(request_id)
+            if existing is not None:
+                return existing
+            candidates = [
+                index for index, healthy in enumerate(self._prefill_healthy) if healthy
+            ]
+            if not candidates:
+                raise WorkerUnavailableError("no healthy hybrid prefill worker")
+            index = min(
+                candidates,
+                key=lambda candidate: (
+                    sum(
+                        bound == candidate
+                        for bound in self._long_prefill_bound.values()
+                    ),
+                    self._prefill_pending[candidate],
+                    candidate,
+                ),
+            )
+            self._long_prefill_bound[request_id] = index
+            self._hybrid_roles[index] = HybridRole.PREFILL_PENDING
+            return index
+
+    def _release_long_prefill_binding(self, request_id: int) -> None:
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            index = self._long_prefill_bound.pop(request_id, None)
+            if index is None:
+                return
+            still_bound = any(
+                candidate == index for candidate in self._long_prefill_bound.values()
+            )
+            if not still_bound and self._prefill_long_inflight[index] == 0:
+                self._hybrid_roles[index] = HybridRole.DECODE
+
+    @property
+    def hybrid_role_states(self) -> tuple[str, ...]:
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            return tuple(role.value for role in self._hybrid_roles)
+
+    def _pick_serve_prefill_worker(
+        self,
+        *,
+        required_blocks: int = 1,
+        competing_decode_load: float = 1.0,
+        decode_candidates: int = 0,
+        preferred_index: int | None = None,
+    ) -> int | None:
+        """Pick a decode-role hybrid worker for a collocated short request.
+
+        Hybrid and permanent-D workers are compared by live decode load.  A
+        worker in PENDING/ACTIVE never accepts a new short, while shorts already
+        bound to it continue through cooperative chunk-boundary preemption.
         """
         with self._state_lock:
+            self._ensure_hybrid_state()
             count = len(self._prefill_processes)
             long_inflight = getattr(self, "_prefill_long_inflight", [0] * count)
             if not hasattr(self, "_prefill_dispatch_claims"):
                 self._prefill_dispatch_claims = [0] * count
+            reserve_blocks = self._hybrid_reserve_blocks()
             idle = [
                 index
                 for index in range(count)
                 if self._prefill_healthy[index]
-                and self._prefill_pending[index] == 0
+                and self._hybrid_roles[index] is HybridRole.DECODE
                 and long_inflight[index] == 0
                 and self._prefill_dispatch_claims[index] == 0
+                and self._prefill_capacities[index].state_free_slots > 0
+                and (
+                    self._prefill_capacities[index].kv_free_blocks - reserve_blocks
+                    >= required_blocks
+                )
             ]
             if not idle:
                 return None
-            # Prefer the least-loaded idle worker (fewest in-flight commands);
-            # the command queue is shared with PD prefills, so a worker with
-            # queued work would stall the short request behind it.
-            index = min(idle, key=lambda candidate: self._prefill_pending[candidate])
+            index = (
+                preferred_index
+                if preferred_index in idle
+                else min(
+                    idle,
+                    key=lambda candidate: (
+                        self._prefill_capacities[candidate].decode_load,
+                        candidate,
+                    ),
+                )
+            )
+            pending_load = min(
+                1.0,
+                self._prefill_pending[index]
+                / max(1, self._prefill_capacities[index].state_total_slots),
+            )
+            hybrid_load = max(
+                self._prefill_capacities[index].decode_load, pending_load
+            )
+            total_candidates = max(1, len(idle) + decode_candidates)
+            tie_turn = self._short_round_robin % total_candidates
+            self._short_round_robin += 1
+            if preferred_index not in idle and (
+                hybrid_load > competing_decode_load
+                or (hybrid_load == competing_decode_load and tie_turn >= len(idle))
+            ):
+                return None
             self._prefill_dispatch_claims[index] += 1
             self._prefill_serve_round_robin = (index + 1) % count
             return index
 
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
-        index = self._claim_prefill_worker()
+        self._ensure_hybrid_state()
+        bound_index = self._long_prefill_bound.get(request_id)
+        if bound_index is None:
+            # Compatibility path for callers admitted before dynamic role
+            # binding existed. Keep the legacy least-loaded selector rather
+            # than removing support for those requests.
+            index = self._claim_prefill_worker()
+            release_claim = True
+        else:
+            index = bound_index
+            release_claim = False
         failure = None
         try:
+            with self._state_lock:
+                self._hybrid_roles[index] = HybridRole.PREFILL_ACTIVE
             try:
                 result = self._prefill_rpc_call(index, command, long_operation=True)
             except (TimeoutError, WorkerUnavailableError) as exc:
                 failure = exc
         finally:
-            self._release_prefill_dispatch_claim(index)
+            if release_claim:
+                self._release_prefill_dispatch_claim(index)
+                with self._state_lock:
+                    self._hybrid_roles[index] = HybridRole.DECODE
+            else:
+                self._release_long_prefill_binding(request_id)
         if failure is not None:
             with self._state_lock:
                 if self._prefill_healthy[index]:
@@ -1211,7 +1486,9 @@ class MultiWorkerGenerationBackend:
             raise failure
         self._check(result, "prefill", request_id)
         with self._state_lock:
-            self._prefill_chunk_preemptions += int(result.get("chunk_preemptions", 0))
+            self._prefill_chunk_preemptions = getattr(
+                self, "_prefill_chunk_preemptions", 0
+            ) + int(result.get("chunk_preemptions", 0))
         return result
 
     def _prefill_serving_rpc(
@@ -1231,6 +1508,7 @@ class MultiWorkerGenerationBackend:
             self._schedule_prefill_recovery(index)
             raise failure
         self._check(result, expected_op, request_id)
+        self._update_prefill_capacity(index, result)
         return result
 
     def _ensure_prefill_rpc_state(self) -> None:

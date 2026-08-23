@@ -1489,3 +1489,35 @@ POSIX `shm_open`会先发布名字，CPython creator随后才`ftruncate`到目�
 因此当前可写边界为：receiver-first修复了2P+2D全PD的功能性死锁；但在4×RTX 3090无P2P、
 W1-128 decode-heavy C32上，2P+2D全PD吞吐和短请求延迟均弱于4×DP。下一轮不再重复C32单seed，
 应先分别测D0/P0 short-only容量，再按共同负载档位和5 seeds比较。
+
+## 30. 动态 Hybrid H1+3D 与独立 worker decode（2026-08-24）
+
+固定1P+3D在没有long prefill时仍永久损失一张decode卡；已有work-conserving路径虽然允许P卡服务
+short，但admission先尝试P再考虑D，会把short集中到Hybrid卡，而且父级`decode()`仍等待所有
+物理worker返回。Hybrid卡执行long prefill时，即使另外3张D已经完成当前token，也会被同一个
+全局step barrier拖住，抵消角色复用收益。
+
+本轮把拓扑改成动态H1+3D：Hybrid worker显式维护`decode -> prefill_pending ->
+prefill_active -> decode`状态。无long时H与常驻D按实时KV/state/decode load统一接纳short；long
+在异步prefill提交前即绑定H并切到pending，阻止竞态期间继续灌入新short；传输完成后自动回到D。
+已经绑定H的short不做昂贵状态迁移，继续使用现有chunk边界抢占。
+
+serving loop新增按物理worker分组的独立decode future：D0/D1/D2完成后可立即形成下一批，不再等待
+正在long chunk中的H。取消、deadline、preemption和worker恢复避开in-flight请求，future完成后再
+执行release；旧同步`_decode_once`完整保留，只有声明`supports_independent_decode`的multi-worker
+backend启用新路径。
+
+为避免空闲期short吃完H卡KV而使32K long无法切入，CLI新增
+`--hybrid-prefill-reserve-tokens`：默认`-1`自动预留`min(32768, cache_tokens/2)`，`0`可关闭，
+正整数显式覆盖。P worker的ready/reserve/decode/release响应持续回传容量，路由使用实际free
+blocks/state slots而不是只看RPC pending。固定角色`--prefill-short-policy never`与旧同步decode
+逻辑均保留用于兼容和消融，没有删除。
+
+外部seed42候选结果显示，P2-WC在`cache_tokens=98304`下完成72/72、51.7 output tok/s，short
+TPOT P50/P99为200/286ms，首次低于D0的264/396ms；吞吐仍只有D0的73%，因此当前只支持“PD隔离
++ work-conserving使short TPOT出现正收益”，不能表述为decode容量已经超过4×DP。动态Hybrid修改
+需在四卡机复跑后再更新端到端数字。
+
+本地新增门禁覆盖：H/D short分流、long pending期间H退出short候选、P RPC结束后恢复decode、慢H
+future不阻塞另一D连续完成token、自动/显式KV预留参数。完整CPU测试通过；GPU四卡性能仍按V3
+计划在测试机执行。

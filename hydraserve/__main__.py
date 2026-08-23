@@ -214,6 +214,13 @@ def main() -> int:
         default=8,
         help="maximum queued short decode/release operations served per prefill chunk boundary",
     )
+    serve_parser.add_argument(
+        "--hybrid-prefill-reserve-tokens",
+        type=int,
+        default=-1,
+        help="KV tokens kept free on a decode-role hybrid P worker for a future "
+        "long prefill (-1 reserves min(32K, half the cache); 0 disables)",
+    )
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
@@ -338,6 +345,13 @@ def main() -> int:
         type=int,
         default=8,
         help="maximum queued short decode/release operations served per prefill chunk boundary",
+    )
+    benchmark_parser.add_argument(
+        "--hybrid-prefill-reserve-tokens",
+        type=int,
+        default=-1,
+        help="KV tokens kept free on a decode-role hybrid P worker for a future "
+        "long prefill (-1 reserves min(32K, half the cache); 0 disables)",
     )
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
@@ -504,6 +518,7 @@ def main() -> int:
                     conditional_pd_tokens=args.conditional_pd_tokens,
                     prefill_short_policy=args.prefill_short_policy,
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
+                    hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
                 ),
                 router=router,
             )
@@ -960,6 +975,7 @@ def main() -> int:
                     conditional_pd_tokens=args.conditional_pd_tokens,
                     prefill_short_policy=args.prefill_short_policy,
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
+                    hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
                 ),
                 router=router,
             )

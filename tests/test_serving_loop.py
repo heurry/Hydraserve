@@ -395,6 +395,54 @@ def test_route_aware_prefill_executors_prevent_long_short_host_hol() -> None:
     loop.close()
 
 
+def test_independent_decode_groups_do_not_wait_for_slow_hybrid_worker() -> None:
+    slow_entered = Event()
+    allow_slow = Event()
+    fast_finished_decode = Event()
+
+    class IndependentBackend(FakeBackend):
+        supports_async_prefill = True
+        supports_independent_decode = True
+        prefill_parallelism = 2
+        decode_executor_parallelism = 2
+
+        def __init__(self):
+            super().__init__()
+            self.fast_decode_steps = 0
+
+        @staticmethod
+        def decode_executor_group(request):
+            return request.token_ids[0]
+
+        def decode(self, requests):
+            group = requests[0].token_ids[0]
+            assert all(request.token_ids[0] == group for request in requests)
+            if group == 1:
+                slow_entered.set()
+                assert allow_slow.wait(2)
+            else:
+                self.fast_decode_steps += 1
+                if self.fast_decode_steps >= 2:
+                    fast_finished_decode.set()
+            return super().decode(requests)
+
+    backend = IndependentBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=8)
+    slow = loop.submit([1], max_new_tokens=2)
+    fast = loop.submit([2], max_new_tokens=3)
+
+    assert slow_entered.wait(2)
+    assert fast_finished_decode.wait(2)
+    fast_events = [fast.get(timeout=2) for _ in range(4)]
+    assert [event.token_id for event in fast_events[:-1]] == [3, 4, 5]
+    assert fast_events[-1].finish_reason == "length"
+
+    allow_slow.set()
+    assert list(slow)[-1].finish_reason == "length"
+    loop.close()
+    assert backend.live == set()
+
+
 def test_retryable_admission_waits_for_capacity_instead_of_failing() -> None:
     class CapacityBackend(FakeBackend):
         def __init__(self):

@@ -93,7 +93,10 @@
 完成项：新增 `--prefill-short-policy never|work-conserving`，可在固定 P 角色与空闲复用间做
 同代码消融；新增 `--conditional-pd-tokens`，阈值以下请求确定性留在 D，阈值以上请求走 PD。
 P worker 维护独立 KV/state reservation，只有无长 prefill 在途时接纳新 short；已绑定 short 的
-decode 可在随后到达的长 prefill chunk 边界继续执行。
+decode 可在随后到达的长 prefill chunk 边界继续执行。2026-08-24进一步升级为动态H1+3D：空闲
+Hybrid与常驻D统一负载均衡，long admission先切`prefill_pending`再提交RPC，完成后恢复D；各物理
+worker独立推进decode，H等待chunk边界不再阻塞其他D。新增Hybrid KV预留，旧固定角色/同步路径
+保留作兼容消融。
 
 ### W5 [P1] prefill 队列优先级(可与 W4 合并) ✅
 

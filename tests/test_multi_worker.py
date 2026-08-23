@@ -153,6 +153,89 @@ def test_cluster_config_validates_conditional_and_prefill_short_policies() -> No
     assert config.prefill_config(0).prefill_preempt_max_ops == 4
     with pytest.raises(ValueError, match="prefill_short_policy"):
         PDClusterConfig("model", ("cuda:1",), prefill_short_policy="always")
+    assert config.effective_hybrid_prefill_reserve_tokens == 32_768
+    assert (
+        PDClusterConfig(
+            "model",
+            ("cuda:1",),
+            hybrid_prefill_reserve_tokens=4096,
+        ).effective_hybrid_prefill_reserve_tokens
+        == 4096
+    )
+    with pytest.raises(ValueError, match="hybrid prefill reserve"):
+        PDClusterConfig("model", ("cuda:1",), hybrid_prefill_reserve_tokens=-2)
+
+
+def test_work_conserving_short_admission_balances_hybrid_with_decode_pool() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+    requests = [ServingRequest(100 + index, (1, 2, 3, 4), 2) for index in range(6)]
+
+    assert all(backend.admit(request).admitted for request in requests)
+    pools = [request.worker_pool for request in requests]
+    assert pools.count("prefill") == 2
+    assert pools.count("decode") == 4
+
+
+def test_long_prefill_pending_temporarily_removes_hybrid_from_short_pool() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+
+    assert backend.capacity() == BackendCapacity(30, 30, 12, 12)
+    assert backend._bind_long_prefill(900) == 0
+    assert backend.hybrid_role_states == ("prefill_pending",)
+    assert backend.capacity() == BackendCapacity(20, 20, 8, 8)
+    short = ServingRequest(901, (1, 2, 3, 4), 2)
+    assert backend.admit(short).admitted
+    assert short.worker_pool == "decode"
+    assert not any(call[0] == "prefill_serve" for call in backend.rpc_calls)
+
+    backend._release_long_prefill_binding(900)
+    assert backend.hybrid_role_states == ("decode",)
+    assert backend.capacity() == BackendCapacity(30, 30, 12, 12)
+
+
+def test_long_prefill_role_returns_to_decode_after_rpc() -> None:
+    class RoleBackend(FakeMultiWorkerBackend):
+        def _prefill_rpc_call(self, index, command, *, long_operation):
+            assert long_operation
+            assert self.hybrid_role_states[index] == "prefill_active"
+            return {
+                "op": "prefill",
+                "request_id": command["request_id"],
+                "worker_index": command["worker_index"],
+                "token_id": 7,
+            }
+
+    backend = RoleBackend()
+    backend._bind_long_prefill(902)
+    result = backend._prefill_rpc(
+        {"op": "prefill", "request_id": 902, "worker_index": 0}, 902
+    )
+    assert result["token_id"] == 7
+    assert backend.hybrid_role_states == ("decode",)
 
 
 def test_conditional_route_keeps_short_on_decode_and_sends_long_to_pd() -> None:

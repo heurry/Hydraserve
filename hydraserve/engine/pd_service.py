@@ -310,7 +310,9 @@ def _prefill_worker(
                 "kv_cache_stats": {**cache.stats(), **state_pool.stats()},
             }
 
-        responses.put({"op": "ready", "model_name": runtime.config.name})
+        responses.put(
+            {"op": "ready", "model_name": runtime.config.name, **capacity_payload()}
+        )
         # W5: short-request operations (admission, decode steps, collocated
         # prepare) jump ahead of queued long prefills instead of stalling
         # behind the multi-second GPU work. A short-op budget keeps a
@@ -492,6 +494,7 @@ def _prefill_worker(
                                 "token_ids": token_ids,
                                 "samples": samples,
                                 "chunk_preempted": True,
+                                **capacity_payload(),
                             }
                         )
                     else:  # release
@@ -760,6 +763,7 @@ def _prefill_worker(
                             "request_ids": request_ids,
                             "token_ids": token_ids,
                             "samples": samples,
+                            **capacity_payload(),
                         }
                     )
                 elif operation == "release":

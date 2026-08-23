@@ -279,6 +279,7 @@ class ContinuousGenerationLoop:
         self._stop = Event()
         self._thread: Thread | None = None
         self._decode_scheduler = FairDecodeScheduler()
+        self._decode_inflight_ids: set[int] = set()
 
     def start(self) -> None:
         with self._lifecycle_lock:
@@ -415,6 +416,34 @@ class ContinuousGenerationLoop:
                 for group, limit in executor_limits.items()
             }
             default_executor = next(iter(executors.values()))
+            independent_decode = (
+                bool(getattr(self.backend, "supports_independent_decode", False))
+                and not self.dp_graph_sync
+            )
+            # Keep the original synchronous ``_decode_once`` path below for
+            # simple/legacy backends. Multi-worker Hybrid PD opts into this
+            # executor so a P-side chunk boundary never becomes a barrier for
+            # unrelated permanent-D workers.
+            decode_executor = (
+                stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=max(
+                            1,
+                            int(
+                                getattr(
+                                    self.backend,
+                                    "decode_executor_parallelism",
+                                    self.max_batch_size,
+                                )
+                            ),
+                        ),
+                        thread_name_prefix="hydraserve-decode-worker",
+                    )
+                )
+                if independent_decode
+                else None
+            )
+            pending_decode: dict[object, tuple[tuple[ServingRequest, ...], Future]] = {}
 
             def executor_for(request: ServingRequest) -> ThreadPoolExecutor:
                 if not callable(group_for):
@@ -456,9 +485,7 @@ class ContinuousGenerationLoop:
                         occupied += 1
                 return occupied < limit
 
-            prefill_cost_for = getattr(
-                self.backend, "prefill_admission_tokens", None
-            )
+            prefill_cost_for = getattr(self.backend, "prefill_admission_tokens", None)
 
             def admission_tokens(request: ServingRequest) -> int:
                 if callable(prefill_cost_for):
@@ -494,7 +521,18 @@ class ContinuousGenerationLoop:
                     or did_work
                 )
                 self._publish_scheduler_depth(len(active), len(pending))
-                if active or self.dp_graph_sync:
+                if independent_decode:
+                    did_work = (
+                        self._collect_independent_decode(active, pending_decode)
+                        or did_work
+                    )
+                    did_work = (
+                        self._submit_independent_decode(
+                            active, pending_decode, decode_executor
+                        )
+                        or did_work
+                    )
+                elif active or self.dp_graph_sync:
                     self._decode_once(active)
                     did_work = True
                 # Resolve CPU futures after launching the active decode step;
@@ -506,6 +544,8 @@ class ContinuousGenerationLoop:
                 if not did_work:
                     self._wake.wait(self.idle_wait_s)
                     self._wake.clear()
+            while pending_decode:
+                self._collect_independent_decode(active, pending_decode, wait=True)
             for request, _ in pending.values():
                 request.cancelled.set()
             while pending:
@@ -853,6 +893,7 @@ class ContinuousGenerationLoop:
         victims = [
             request
             for request in active.values()
+            if request.request_id not in self._decode_inflight_ids
             if request.preemption_count < self.max_preemptions_per_request
             and self._strictly_more_urgent(candidate, request)
         ]
@@ -962,6 +1003,130 @@ class ContinuousGenerationLoop:
         with self._stats_lock:
             self._preempted_count = len(self._preempted)
         return did_work
+
+    def _submit_independent_decode(
+        self,
+        active: OrderedDict[int, ServingRequest],
+        pending: dict[object, tuple[tuple[ServingRequest, ...], Future]],
+        executor: ThreadPoolExecutor,
+    ) -> bool:
+        """Launch one decode batch per ready physical worker.
+
+        The legacy backend-wide ``decode`` call is still used inside each
+        future, but requests are grouped before submission. This deliberately
+        removes only the cross-worker completion barrier; device-local batching,
+        error recovery, and the old synchronous path remain intact.
+        """
+
+        group_for = getattr(self.backend, "decode_executor_group", None)
+        if not callable(group_for) or not active:
+            return False
+        eligible = []
+        groups_by_request = {}
+        group_failures = []
+        for request in tuple(active.values()):
+            if request.request_id in self._decode_inflight_ids:
+                continue
+            try:
+                group = group_for(request)
+            except Exception as exc:
+                group_failures.append((request, exc))
+                continue
+            if group in pending:
+                continue
+            eligible.append(request)
+            groups_by_request[request.request_id] = group
+        for request, exc in group_failures:
+            self._fail(request, exc, active=active, release=True)
+        if not eligible:
+            return bool(group_failures)
+        selected = self._decode_scheduler.select(
+            eligible, min(self.max_batch_size, self.max_step_tokens)
+        )
+        grouped: OrderedDict[object, list[ServingRequest]] = OrderedDict()
+        for request in selected:
+            grouped.setdefault(groups_by_request[request.request_id], []).append(
+                request
+            )
+        submitted = False
+        for group, requests in grouped.items():
+            if group in pending:
+                continue
+            batch = tuple(requests)
+            future = executor.submit(self.backend.decode, batch)
+            future.add_done_callback(lambda _future: self._wake.set())
+            pending[group] = (batch, future)
+            self._decode_inflight_ids.update(request.request_id for request in batch)
+            submitted = True
+        return submitted or bool(group_failures)
+
+    def _collect_independent_decode(
+        self,
+        active: OrderedDict[int, ServingRequest],
+        pending: dict[object, tuple[tuple[ServingRequest, ...], Future]],
+        *,
+        wait: bool = False,
+    ) -> bool:
+        completed = []
+        for group, (_, future) in pending.items():
+            if wait or future.done():
+                completed.append(group)
+                if wait:
+                    break
+        for group in completed:
+            batch, future = pending.pop(group)
+            for request in batch:
+                self._decode_inflight_ids.discard(request.request_id)
+            try:
+                values = future.result()
+                if len(values) != len(batch):
+                    raise RuntimeError("decode output count does not match the batch")
+            except PartialDecodeError as exc:
+                expected = {request.request_id for request in batch}
+                actual = set(exc.token_ids) | set(exc.errors)
+                if actual != expected:
+                    malformed = RuntimeError(
+                        "partial decode outcome does not cover the scheduled batch"
+                    )
+                    for request in batch:
+                        self._fail(request, malformed, active=active, release=True)
+                    continue
+                for request in batch:
+                    if request.cancelled.is_set() or self._stop.is_set():
+                        self._finish(request, "cancelled", active=active, release=True)
+                        continue
+                    error = exc.errors.get(request.request_id)
+                    if error is not None:
+                        if not self._suspend_recoverable_failure(
+                            request, error, active
+                        ):
+                            self._fail(request, error, active=active, release=True)
+                    else:
+                        self._accept_decode_sample(
+                            request,
+                            exc.samples[request.request_id],
+                            active,
+                            decode_batch_size=len(batch),
+                        )
+                continue
+            except Exception as exc:
+                for request in batch:
+                    if request.cancelled.is_set() or self._stop.is_set():
+                        self._finish(request, "cancelled", active=active, release=True)
+                    elif not self._suspend_recoverable_failure(request, exc, active):
+                        self._fail(request, exc, active=active, release=True)
+                continue
+            for request, value in zip(batch, values, strict=True):
+                if request.cancelled.is_set() or self._stop.is_set():
+                    self._finish(request, "cancelled", active=active, release=True)
+                    continue
+                self._accept_decode_sample(
+                    request,
+                    value,
+                    active,
+                    decode_batch_size=len(batch),
+                )
+        return bool(completed)
 
     def _decode_once(self, active: OrderedDict[int, ServingRequest]) -> None:
         batch = self._decode_scheduler.select(
@@ -1094,12 +1259,18 @@ class ContinuousGenerationLoop:
         self, active: OrderedDict[int, ServingRequest]
     ) -> bool:
         cancelled = [
-            request for request in active.values() if request.cancelled.is_set()
+            request
+            for request in active.values()
+            if request.request_id not in self._decode_inflight_ids
+            and request.cancelled.is_set()
         ]
         for request in cancelled:
             self._finish(request, "cancelled", active=active, release=True)
         expired = [
-            request for request in active.values() if self._deadline_expired(request)
+            request
+            for request in active.values()
+            if request.request_id not in self._decode_inflight_ids
+            and self._deadline_expired(request)
         ]
         for request in expired:
             self._fail(

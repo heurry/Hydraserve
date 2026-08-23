@@ -442,10 +442,26 @@ prefill_preempt_max_ops = 8
 
 ### P2-WC：1P+3D conditional + P work-conserving
 
-与 P2-C 唯一差异为 `--prefill-short-policy work-conserving`。P 空闲时可接 short；long 到达后，
-已绑定 short 的后续 decode 在 long prefill chunk 边界插入，每个边界最多执行 8 个短操作。
+与 P2-C 唯一差异为 `--prefill-short-policy work-conserving`。该模式现在是动态H1+3D而不是
+永久1P+3D：无long prefill时，Hybrid卡与3张D卡统一按KV/state/decode load接收short，等价4D；
+long在admission时把Hybrid状态切到`prefill_pending`，该卡停止接收新short，执行时进入
+`prefill_active`；KV发送完成后自动回到`decode`。已绑定short不迁移，其后续decode在long
+prefill chunk边界插入，每个边界最多执行8个短操作。各物理worker的decode future独立完成，
+Hybrid等待chunk边界不会再形成阻塞另外3张D卡的全局step barrier。旧同步decode路径和
+`--prefill-short-policy never`固定角色路径保留用于兼容/消融。
+
+Hybrid卡默认用`--hybrid-prefill-reserve-tokens -1`为未来long保留
+`min(32768, cache_tokens/2)`个KV token；`0`关闭预留，正整数显式指定。四卡W1的当前候选命令应
+使用`--cache-tokens 98304 --hybrid-prefill-reserve-tokens 32768`，避免131072 cache workspace
+挤占长prefill显存，同时防止空闲期short把Hybrid KV吃满。
+
 报告 `hydraserve_prefill_short_collocated_total` 和
 `hydraserve_prefill_chunk_preemptions_total`，用于证明收益确实来自 P 复用/抢占。
+
+2026-08-24 seed42单点初测（C32、W1-128）中，P2-WC在`cache_tokens=98304`下完成72/72，
+output吞吐51.7 tok/s，short TPOT P50/P99为200/286ms；对应D0为70.4 tok/s、264/396ms。
+这是首个short TPOT两项都优于D0的PD结果，但吞吐仍为D0的73%，且short SLO仍为0/64；在完成
+动态Hybrid修改后的正式复跑前只记为候选正面结果，不外推到多seed或共同offered load。
 
 ### P3：2P+2D adaptive（生产策略）
 
