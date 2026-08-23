@@ -72,7 +72,8 @@ PD 分离真正发挥价值的场景是大规模部署(prefill 节点占比 <5% 
 - 传输后端抽象:进程内、POSIX shared memory、CUDA P2P(带硬件能力检测与
   自动回退);层级流水线协议(协议与单测,未实卡验证);
 - 1P+ND 拓扑:一个 prefill worker + N 个各自持有 KV/GDN 容量的 decode worker,
-  并行 RPC、按原请求顺序归并结果。
+  并行 RPC、按原请求顺序归并结果；支持按 prompt 阈值执行 conditional PD，
+  short 在 D 本地 prefill+decode、long 才迁移状态。
 
 ### 调度与容错
 
@@ -80,6 +81,9 @@ PD 分离真正发挥价值的场景是大规模部署(prefill 节点占比 <5% 
 - N-1 truncation 与首 token 一致性校验;跨 GPU 浮点 argmax 漂移不错误终止请求;
 - 事务式 KV 长度推进与 GDN 状态检查点:整批失败先回滚,再二分重试隔离单请求;
 - 优先级加权公平调度、等待老化防饿死、deadline urgency;
+- prefill RPC 以关联 ID 多路复用；长 prefill 在 chunk 边界有界让出 GPU，处理
+  P 卡上的 short admission/prefill/decode/release，避免串行 RPC 锁把 short TPOT
+  阻塞到整段长 prefill 之后；可用 `--prefill-short-policy never` 做固定角色消融;
 - 抢占与精确 replay(`prompt + generated[:-1]`),保留已输出 token 与采样状态;
   `--max-preemptions-per-request` 限制反复抢占;
 - decode/prefill worker 监督:故障自动重建进程与 IPC,模型名/容量握手后重新

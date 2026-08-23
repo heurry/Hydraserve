@@ -186,10 +186,21 @@ repetitions              = 5
 
 ```bash
 python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
-  --trace-out traces/w1_seed42.jsonl \
+  --trace-out traces/w1_128_seed42.jsonl \
   --num-long 8 --long-tokens 32768 --long-new-tokens 16 \
   --long-arrival-offsets-ms 5000,20000,35000,50000,65000,80000,95000,110000 \
   --num-short 64 --short-tokens 2048 --short-new-tokens 128 \
+  --short-trace-request-rate SHORT_RATE --seed 42
+```
+
+32-token 版本使用完全相同的参数，仅替换输出文件和 short 输出长度：
+
+```bash
+python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
+  --trace-out traces/w1_32_seed42.jsonl \
+  --num-long 8 --long-tokens 32768 --long-new-tokens 16 \
+  --long-arrival-offsets-ms 5000,20000,35000,50000,65000,80000,95000,110000 \
+  --num-short 64 --short-tokens 2048 --short-new-tokens 32 \
   --short-trace-request-rate SHORT_RATE --seed 42
 ```
 
@@ -201,7 +212,7 @@ D0 首轮使用进程内 engine-only 4×DP，避免 HTTP/proxy 成为 baseline �
 
 ```bash
 python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
-  --trace traces/w1_seed42.jsonl --dp-devices 0 1 2 3 \
+  --trace traces/w1_128_seed42.jsonl --dp-devices 0 1 2 3 \
   --concurrency 72 --warmup 8 --arrival-pattern burst \
   --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
   --prefill-chunk-size FROZEN_CHUNK --max-step-tokens FROZEN_STEP \
@@ -213,7 +224,8 @@ P0 首轮使用同一进程内 benchmark coordinator 和 2P+2D worker，不经�
 
 ```bash
 python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
-  --trace traces/w1_seed42.jsonl --adaptive --force-pd-tokens 1 \
+  --trace traces/w1_128_seed42.jsonl --adaptive --force-pd-tokens 1 \
+  --prefill-short-policy never \
   --prefill-devices 0 1 --decode-devices 2 3 --pd-schedule kv-aware \
   --concurrency 72 --warmup 8 --arrival-pattern burst \
   --kv-quant int8 --prefix-cache-blocks 0 --cache-tokens 131072 \
@@ -241,16 +253,20 @@ P1 仅在 P0 正确性通过后增加 `--pd-transfer-quant int8`，其他参数�
 
 作用：得到没有长 prefill 干扰时的 TTFT/TPOT 和最大容量，作为 inflation 分母。
 
-### W1：交互式 prefill 干扰（主负载）
+### W1：交互式 prefill 干扰（主负载，双输出长度）
 
 - 8 个 distinct 32K 长 prompt，严格输出 16 token；
-- 64 个 distinct 2K 短 prompt，严格输出 128 token；
+- 64 个 distinct 2K 短 prompt，分别冻结严格输出 **32 token** 与 **128 token** 的两份 trace；
 - 短请求按 Poisson 到达；长请求在 trace 的 5/20/35/50/65/80/95/110 秒注入；
 - 测 `0.6/0.8/0.95 × W0 lambda_max` 三档短请求负载；
 - prefix cache 关闭。
 
 设计原因：长请求负责制造 prefill 干扰，但只短暂参与 decode，避免 8×32K KV 长时间占据
 decode batch，把“prefill 隔离”与“长 KV scan”混成一个瓶颈。
+
+32-token 组用于放大 prefill-interference 与路由/迁移固定开销，128-token 组用于保留历史的
+decode-heavy 边界。两组使用相同 prompt、到达时刻和 seed，仅 `max_new_tokens` 不同，均完整报告，
+不允许只保留胜出的一组。
 
 ### W2：V2 可比 burst
 
@@ -340,7 +356,34 @@ worker_log_dir          = enabled
 ### P2：1P+3D（极致流式 SLO 点）
 
 P 卡 0，D 卡 1/2/3，其余与 P0 相同。预期 TPOT 最低、TTFT 和总吞吐较差，用于画帕累托边界，
-不作为默认推荐配置。
+不作为默认推荐配置。固定角色消融必须增加：
+
+```text
+conditional_pd_tokens   = 0
+force_pd_tokens         = 1
+prefill_short_policy    = never
+```
+
+### P2-C：1P+3D conditional（long PD、short D-collocated）
+
+```text
+prefill_devices         = 0
+decode_devices          = 1,2,3
+conditional_pd_tokens   = 8192
+force_pd_tokens         = 0
+prefill_short_policy    = never
+prefill_preempt_max_ops = 8
+```
+
+该组是确定性路由，不读取在线成本模型：2K short 必须留在 D，32K long 必须走 P→D。正式结果审计
+`conditional_short_collocated` / `conditional_long_pd` route reason，任何其他 reason 都视为配置错误。
+
+### P2-WC：1P+3D conditional + P work-conserving
+
+与 P2-C 唯一差异为 `--prefill-short-policy work-conserving`。P 空闲时可接 short；long 到达后，
+已绑定 short 的后续 decode 在 long prefill chunk 边界插入，每个边界最多执行 8 个短操作。
+报告 `hydraserve_prefill_short_collocated_total` 和
+`hydraserve_prefill_chunk_preemptions_total`，用于证明收益确实来自 P 复用/抢占。
 
 ### P3：2P+2D adaptive（生产策略）
 
@@ -362,9 +405,11 @@ PD 执行收益混为一谈。
 | 4 | W1 | P0 | lossless PD 隔离主结果 |
 | 5 | W1 | P1 | INT8 wire 最优 PD |
 | 6 | W1 | P2 | 1P+3D 极致 SLO |
-| 7 | W1 | P3 | adaptive 生产策略 |
-| 8 | W3 | D0/P0 | balanced 边界 |
-| 9 | W4 | D0/P0 | decode-bound 反例 |
+| 7 | W1-32/W1-128 | P2-C | 确定性 long-PD / short-D |
+| 8 | W1-32/W1-128 | P2-WC | P 卡 work-conserving + chunk 抢占 |
+| 9 | W1 | P3 | adaptive 生产策略 |
+| 10 | W3 | D0/P0 | balanced 边界 |
+| 11 | W4 | D0/P0 | decode-bound 反例 |
 
 W1 的三档到达率均运行 5 个 seed。主图横轴为总 output tok/s，纵轴为 short TPOT P99；第二张图
 横轴为 offered request rate，纵轴为 short SLO goodput。

@@ -145,6 +145,28 @@ def test_chunked_prefill_streams_and_installs_kv(tiny_model) -> None:
     torch.testing.assert_close(target_key, source_key, atol=0.15, rtol=0.15)
 
 
+def test_prefill_yields_at_each_runtime_chunk_boundary(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    pipeline = TransferPipeline(
+        InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER)
+    )
+    request = CentralScheduler().submit([2, 4, 6, 8, 10], max_new_tokens=2)
+    yields = []
+
+    result = PrefillWorker(runtime, pipeline).process(
+        request,
+        chunk_size=2,
+        chunk_yield_callback=lambda: yields.append(len(yields)) or 1,
+    )
+
+    # n-1 prefill produces two chunks, then the final prompt token is replayed.
+    assert len(yields) == 3
+    assert result.chunk_preemptions == 3
+
+
 def test_hicache_restores_repeated_prefix_without_second_kv_transfer(tiny_model) -> None:
     weights = make_weights(tiny_model)
     prefill_runtime = QwenTextRuntime(

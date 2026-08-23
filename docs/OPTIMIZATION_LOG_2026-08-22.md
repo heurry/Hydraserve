@@ -1300,3 +1300,21 @@ CLI：`--pd-transfer-quant int8`。它与 `--kv-quant int8` 含义不同：前�
 
 按用户要求，本节修改没有执行单元测试、GPU 测试或性能压测。新增测试用例只作为下一次验证入口；
 当前状态是“代码和实验前置已准备，尚未验证”，禁止据此产生或更新性能数字。
+
+## 23. Conditional PD、RPC 解耦与 P 卡 work-conserving（2026-08-23）
+
+在拉取 `d13bfe1` 后完成五项组合优化；本轮只做实现和单元验证，未运行四卡性能压测：
+
+1. `PDClusterConfig`/CLI 增加 `prefill_short_policy=never|work-conserving`，固定 1P+3D
+   基线可明确禁止 P 卡服务 short；
+2. 增加 `conditional_pd_tokens` 确定性路由，阈值以下 short 在 D collocated，阈值以上
+   long 走 P→D；P 不健康时 fail closed 到 D；
+3. V3 W1 固化 32-token 与 128-token 两份输出负载，分别观察 prefill-interference 和
+   decode-heavy 边界；
+4. prefill RPC 增加关联 ID 和并发 waiter，不再持 worker-wide lock 等待 long response；
+5. `PrefillWorker.process` 在 runtime chunk callback 暴露一致性边界，P worker 每个边界有界
+   执行 short reserve/prepare/decode/release；新增 P short 复用与 chunk 抢占 Prometheus 计数器。
+
+正确性约束：只在完整 chunk 完成、KV page table 与 recurrent/conv state 一致后让出；单次最多
+处理 8 个短操作，防止连续 short 流量饿死 long。新增单测覆盖确定性路由、固定 P 开关、乱序
+RPC 响应分发与 chunk yield 计数；相关 CPU/模型小配置测试通过，真实 4×3090 数据待 V3 执行。

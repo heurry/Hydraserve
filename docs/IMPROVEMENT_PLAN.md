@@ -12,7 +12,7 @@
 | prefix cache 递归遍历修复 + prefix_cache_stats 上报 | ✅ 已实现 |
 | Bug A:第 2 个 prefill worker 启动崩溃(2P+2D 退化 1P+2D) | ⚠️ 待修 |
 | Bug B:prefix cache hit_rate=0(publish 疑似截断) | ⚠️ 待修 |
-| P 卡服务短请求 + prefill-load 感知路由 | ❌ 阶段 2 未做 |
+| P 卡服务短请求 + prefill-load 感知路由 | ✅ 已实现并补齐 chunk 边界抢占（2026-08-23） |
 | B2 / B3 / extract_kv-BF16 等性能欠账 | ❌ 未做 |
 
 ## 2. 工作项(按依赖排序)
@@ -84,16 +84,26 @@
   其 128K 混合负载数据已作为参照点存在);
 - 产出:(吞吐, TPOT p99) 散点 + 短请求 TTFT 分位数。
 
-### W4 [P1] 阶段 2:P 卡服务短请求 + prefill-load 感知路由
+### W4 [P1] 阶段 2:P 卡服务短请求 + prefill-load 感知路由 ✅
 
 - P worker 增加 collocated 执行路径(复用 decode worker 的 admission/state 语义);
 - router 增加 `prefill_load` 输入(registry 已收集容量,需暴露 in-flight 长 prefill 数与预计排队);
 - 路由规则:短请求避开"正在跑长 prefill"的卡;长请求保持 nP round-robin(或改最短队列)。
 
-### W5 [P1] prefill 队列优先级(可与 W4 合并)
+完成项：新增 `--prefill-short-policy never|work-conserving`，可在固定 P 角色与空闲复用间做
+同代码消融；新增 `--conditional-pd-tokens`，阈值以下请求确定性留在 D，阈值以上请求走 PD。
+P worker 维护独立 KV/state reservation，只有无长 prefill 在途时接纳新 short；已绑定 short 的
+decode 可在随后到达的长 prefill chunk 边界继续执行。
+
+### W5 [P1] prefill 队列优先级(可与 W4 合并) ✅
 
 被 force 到 PD 的短请求在 prefill worker 内**永远优先于长 prompt**(当前是 FIFO)。
 与 W4 互为补充:W4 让短请求绕开 P 卡,W5 兜底它们被迫上 P 卡时的体验。
+
+完成项：prefill 命令/响应增加 `rpc_id`，父进程不再持有单一 `_prefill_locks` 等待整段 long
+prefill；并发调用者共同 drain response queue，再按关联 ID 唤醒对应 waiter。运行时在每个
+prefill chunk callback 中最多处理 `--prefill-preempt-max-ops` 个 short
+reserve/collocated-prepare/decode/release 操作，随后恢复 long，兼顾 short TPOT 与 long 防饿死。
 
 ### W6 [P2] B2:continuation chunk KV-tile 复用(优先级上调)
 

@@ -21,6 +21,8 @@ class RouteReason(str, Enum):
     PREFILL_SATURATED = "prefill_saturated"
     NO_DECODE_SLOT = "no_decode_slot"
     PREFILL_UNAVAILABLE = "prefill_unavailable"
+    CONDITIONAL_SHORT_COLLOCATED = "conditional_short_collocated"
+    CONDITIONAL_LONG_PD = "conditional_long_pd"
     COST_MODEL_COLLOCATED = "cost_model_collocated"
     COST_MODEL_PD = "cost_model_pd"
     COST_MODEL_CONSERVATIVE = "cost_model_conservative"

@@ -50,6 +50,7 @@ class PDWorkerConfig:
     shm_ring_slots: int = 3
     shm_ring_slot_bytes: int = 64 << 20
     worker_log_dir: str = ""
+    prefill_preempt_max_ops: int = 8
 
 
 def _make_pd_transfer_backend(config: PDWorkerConfig, namespace: str, model=None):
@@ -90,6 +91,24 @@ class TransferValidationStats:
 
 class PDWorkerUnavailableError(RuntimeError):
     """A fixed-PD worker exited or timed out during an RPC."""
+
+
+class _CorrelatedResponseSink:
+    """Attach the active command id to worker responses.
+
+    A prefill worker may emit a short-decode response while a long-prefill
+    command is still running.  Tagging every response lets the parent process
+    multiplex those in-flight RPCs without relying on FIFO response order.
+    """
+
+    def __init__(self, queue) -> None:
+        self.queue = queue
+        self.rpc_id: int | None = None
+
+    def put(self, payload: dict) -> None:
+        if self.rpc_id is not None and "rpc_id" not in payload:
+            payload = {**payload, "rpc_id": self.rpc_id}
+        self.queue.put(payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +165,7 @@ def _prefill_worker(
         import sys
 
         sys.stderr = open(stderr_path, "a", buffering=1)
+    responses = _CorrelatedResponseSink(responses)
     backends = []
     try:
         import torch
@@ -295,10 +315,225 @@ def _prefill_worker(
         from collections import deque
         from queue import Empty
 
-        SHORT_OPS = {"decode", "reserve", "release", "collocated_prepare"}
+        SHORT_OPS = {
+            "decode",
+            "reserve",
+            "release",
+            "collocated_prepare",
+            "recover",
+        }
+        PREEMPTIBLE_OPS = {
+            "decode",
+            "reserve",
+            "release",
+            "collocated_prepare",
+        }
         pending_short = deque()
         pending_long = deque()
         short_budget = 64
+
+        def service_preemptible_short_ops() -> int:
+            """Run bounded short decode work at a long-prefill chunk boundary."""
+
+            serviced = 0
+            deferred = []
+            while serviced < config.prefill_preempt_max_ops:
+                try:
+                    queued = commands.get_nowait()
+                except Empty:
+                    break
+                operation = queued.get("op")
+                if operation not in PREEMPTIBLE_OPS:
+                    deferred.append(queued)
+                    continue
+                previous_rpc_id = responses.rpc_id
+                responses.rpc_id = queued.get("rpc_id")
+                try:
+                    if operation == "reserve":
+                        request_id = queued["request_id"]
+                        total_tokens = len(queued["token_ids"]) + max(
+                            0, queued["max_new_tokens"] - 1
+                        )
+                        required = cache.block_manager.blocks_required(total_tokens)
+                        with state_lock:
+                            live_requests = set(states) | reservations
+                        response = {
+                            "op": "admission",
+                            "request_id": request_id,
+                            "admitted": False,
+                        }
+                        if required > cache.block_manager.num_blocks:
+                            response.update(
+                                retryable=False,
+                                reason=(
+                                    f"request needs {required} KV blocks, worker capacity "
+                                    f"is {cache.block_manager.num_blocks}"
+                                ),
+                            )
+                        elif request_id in live_requests:
+                            response["admitted"] = True
+                        elif len(live_requests) >= state_capacity:
+                            response.update(
+                                retryable=True,
+                                reason="recurrent-state slots are exhausted",
+                            )
+                        else:
+                            try:
+                                cache.allocate(
+                                    request_id,
+                                    len(queued["token_ids"]),
+                                    reserve_tokens=total_tokens,
+                                    token_ids=queued["token_ids"],
+                                )
+                            except MemoryError:
+                                response.update(
+                                    retryable=True,
+                                    reason="prefill worker KV capacity is exhausted",
+                                )
+                            else:
+                                with state_lock:
+                                    reservations.add(request_id)
+                                response["admitted"] = True
+                        responses.put({**response, **capacity_payload()})
+                    elif operation == "collocated_prepare":
+                        request_id = queued["request_id"]
+                        if request_id not in reservations:
+                            raise RuntimeError(
+                                "collocated prefill requires a KV reservation"
+                            )
+                        request = _request(
+                            request_id,
+                            queued["token_ids"],
+                            queued["max_new_tokens"],
+                            transferred=False,
+                            route=Route.COLLOCATED,
+                            sampling_params=queued.get("sampling_params"),
+                        )
+                        request.transition(RequestState.PREFILL_RUNNING)
+                        input_ids = torch.tensor(
+                            [request.token_ids],
+                            device=runtime.input_device,
+                            dtype=torch.long,
+                        )
+                        with torch.inference_mode():
+                            logits, state = runtime.prefill(
+                                input_ids,
+                                chunk_size=config.prefill_chunk_size,
+                                paged_cache=cache,
+                                request_id=request_id,
+                            )
+                        cache.publish_prefix(request_id, request.token_ids)
+                        sample = sample_logits(
+                            logits[:, -1],
+                            (request.token_ids,),
+                            (request.sampling_params,),
+                            steps=(0,),
+                        )[0]
+                        token_id = sample.token_id
+                        request.generated_token_ids.append(token_id)
+                        with state_lock:
+                            requests[request_id] = request
+                            states[request_id] = state_pool.install(request_id, state)
+                        responses.put(
+                            {
+                                "op": "collocated_prepare",
+                                "request_id": request_id,
+                                "token_id": token_id,
+                                "sample": sample,
+                                "chunk_preempted": True,
+                            }
+                        )
+                    elif operation == "decode":
+                        request_ids = tuple(queued["request_ids"])
+                        cache.block_manager.grow_many(
+                            request_ids, additional_tokens=1
+                        )
+                        input_ids = torch.tensor(
+                            [
+                                requests[request_id].generated_token_ids[-1]
+                                for request_id in request_ids
+                            ],
+                            device=runtime.input_device,
+                            dtype=torch.long,
+                        ).unsqueeze(1)
+                        batch_states = [states[request_id] for request_id in request_ids]
+                        with torch.inference_mode():
+                            logits, _ = runtime.decode_batch(
+                                input_ids, batch_states, cache, request_ids
+                            )
+                        samples = sample_logits(
+                            logits[:, -1],
+                            (
+                                requests[request_id].token_ids
+                                + tuple(requests[request_id].generated_token_ids)
+                                for request_id in request_ids
+                            ),
+                            (
+                                requests[request_id].sampling_params
+                                for request_id in request_ids
+                            ),
+                            steps=(
+                                len(requests[request_id].generated_token_ids)
+                                for request_id in request_ids
+                            ),
+                        )
+                        token_ids = tuple(sample.token_id for sample in samples)
+                        for request_id, token_id in zip(
+                            request_ids, token_ids, strict=True
+                        ):
+                            requests[request_id].generated_token_ids.append(token_id)
+                        responses.put(
+                            {
+                                "op": "decode",
+                                "request_ids": request_ids,
+                                "token_ids": token_ids,
+                                "samples": samples,
+                                "chunk_preempted": True,
+                            }
+                        )
+                    else:  # release
+                        request_id = queued["request_id"]
+                        with state_lock:
+                            reservations.discard(request_id)
+                            states.pop(request_id, None)
+                            state_pool.free(request_id)
+                            requests.pop(request_id, None)
+                        cache.free(request_id)
+                        responses.put(
+                            {
+                                "op": "release",
+                                "request_id": request_id,
+                                "chunk_preempted": True,
+                                **capacity_payload(),
+                            }
+                        )
+                    serviced += 1
+                except Exception as exc:
+                    if operation == "collocated_prepare":
+                        request_id = queued.get("request_id")
+                        reservations.discard(request_id)
+                        state_pool.free(request_id)
+                        states.pop(request_id, None)
+                        requests.pop(request_id, None)
+                        cache.free(request_id)
+                    responses.put(
+                        {
+                            "op": "error",
+                            "request_id": queued.get("request_id"),
+                            "request_ids": queued.get("request_ids"),
+                            "message": repr(exc),
+                        }
+                    )
+                    serviced += 1
+                finally:
+                    responses.rpc_id = previous_rpc_id
+            for queued in deferred:
+                if queued.get("op") in SHORT_OPS:
+                    pending_short.append(queued)
+                else:
+                    pending_long.append(queued)
+            return serviced
+
         while True:
             while True:
                 try:
@@ -322,6 +557,7 @@ def _prefill_worker(
                 else:
                     short_budget = 64
             operation = command["op"]
+            responses.rpc_id = command.get("rpc_id")
             if operation == "shutdown":
                 with state_lock:
                     live_ids = tuple(set(states) | reservations)
@@ -354,6 +590,7 @@ def _prefill_worker(
                             host_prefix_tokens=int(command.get("host_prefix_tokens", 0)),
                             transfer_target_bytes=config.transfer_target_bytes,
                             max_inflight_chunks=config.max_inflight_transfer_chunks,
+                            chunk_yield_callback=service_preemptible_short_ops,
                         )
                     finally:
                         cache.free(request_id)
@@ -364,6 +601,7 @@ def _prefill_worker(
                             "worker_index": worker_index,
                             "token_id": result.first_token_id,
                             "sample": result.sample,
+                            "chunk_preemptions": result.chunk_preemptions,
                         }
                     )
                 elif operation == "reserve":
@@ -1186,6 +1424,7 @@ class DisaggregatedGenerationBackend:
             config.max_inflight_transfer_chunks,
             config.shm_ring_slots,
             config.shm_ring_slot_bytes,
+            config.prefill_preempt_max_ops,
         ) <= 0:
             raise ValueError("cache limits must be positive")
         if config.prefix_cache_blocks < 0:
@@ -1791,6 +2030,8 @@ class RoutingStats:
     pd_disaggregated: int
     pd_failures: int
     prefill_healthy: bool
+    prefill_short_collocated: int = 0
+    prefill_chunk_preemptions: int = 0
 
 
 class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):

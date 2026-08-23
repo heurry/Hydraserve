@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from threading import Event, Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from queue import Queue
 
 import pytest
@@ -128,6 +128,91 @@ def test_cluster_config_propagates_decode_workspace_capacity() -> None:
     assert worker.max_decode_batch_size == 5
 
 
+def test_cluster_config_validates_conditional_and_prefill_short_policies() -> None:
+    config = PDClusterConfig(
+        "model",
+        ("cuda:1", "cuda:2", "cuda:3"),
+        conditional_pd_tokens=8192,
+        prefill_short_policy="never",
+        prefill_preempt_max_ops=4,
+    )
+    assert config.conditional_pd_tokens == 8192
+    assert config.prefill_config(0).prefill_preempt_max_ops == 4
+    with pytest.raises(ValueError, match="prefill_short_policy"):
+        PDClusterConfig("model", ("cuda:1",), prefill_short_policy="always")
+
+
+def test_conditional_route_keeps_short_on_decode_and_sends_long_to_pd() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+
+    short = ServingRequest(40, tuple(range(4)), 2)
+    long = ServingRequest(41, tuple(range(8)), 2)
+    assert backend.admit(short).admitted
+    assert backend.admit(long).admitted
+    assert short.route == "collocated"
+    assert short.route_reason == "conditional_short_collocated"
+    assert long.route == "pd_disaggregated"
+    assert long.route_reason == "conditional_long_pd"
+    assert not any(call[0] == "prefill_serve" for call in backend.rpc_calls)
+
+
+def test_prefill_rpc_multiplexes_out_of_order_short_response() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.operation_timeout = 2.0
+    results = {}
+
+    long_thread = Thread(
+        target=lambda: results.setdefault(
+            "long",
+            backend._prefill_rpc_call(
+                0, {"op": "prefill", "request_id": 1}, long_operation=True
+            ),
+        )
+    )
+    long_thread.start()
+    long_command = backend._prefill_commands[0].get(timeout=1)
+
+    short_thread = Thread(
+        target=lambda: results.setdefault(
+            "short",
+            backend._prefill_rpc_call(
+                0,
+                {"op": "decode", "request_ids": (2,)},
+                long_operation=False,
+            ),
+        )
+    )
+    short_thread.start()
+    short_command = backend._prefill_commands[0].get(timeout=1)
+
+    backend._prefill_responses[0].put(
+        {
+            "rpc_id": short_command["rpc_id"],
+            "op": "decode",
+            "request_ids": (2,),
+            "token_ids": (7,),
+        }
+    )
+    short_thread.join(1)
+    assert not short_thread.is_alive()
+    assert long_thread.is_alive()
+
+    backend._prefill_responses[0].put(
+        {
+            "rpc_id": long_command["rpc_id"],
+            "op": "prefill",
+            "request_id": 1,
+            "token_id": 9,
+        }
+    )
+    long_thread.join(1)
+    assert not long_thread.is_alive()
+    assert results["short"]["token_ids"] == (7,)
+    assert results["long"]["token_id"] == 9
+
+
 def test_multi_worker_admission_uses_prefix_affinity_and_binds_route() -> None:
     backend = FakeMultiWorkerBackend(
         prefix_affinity=lambda request, worker_id: len(request.token_ids)
@@ -204,6 +289,36 @@ def test_multi_worker_preemption_rebinds_and_sends_exact_recovery_replay() -> No
     assert recovery[0]["generated_token_ids"] == (10, 11, 12)
     assert recovery[0]["replay_token_ids"] == (1, 2, 3, 10, 11)
     backend.release(request.request_id)
+
+
+def test_prefill_bound_short_recovery_stays_on_prefill_worker() -> None:
+    class PrefillServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(
+            self, index, command, expected_op, request_id=None
+        ):
+            self.rpc_commands.append((f"prefill-{index}", dict(command)))
+            if expected_op == "admission":
+                return {
+                    "op": "admission",
+                    "request_id": request_id,
+                    "admitted": True,
+                }
+            return {"op": expected_op, "request_id": request_id}
+
+    backend = PrefillServingBackend()
+    request = ServingRequest(12, (1, 2, 3), 5, generated_token_ids=[7, 8])
+    assert backend.admit(request).admitted
+    assert request.request_id in backend._prefill_bound
+
+    backend.preempt(request.request_id)
+    assert backend.recover(request).admitted
+    recovery = [
+        command
+        for worker, command in backend.rpc_commands
+        if str(worker).startswith("prefill-") and command.get("op") == "recover"
+    ]
+    assert len(recovery) == 1
+    assert recovery[0]["replay_token_ids"] == (1, 2, 3, 7)
 
 
 def test_dead_decode_worker_is_removed_and_recovery_is_scheduled() -> None:

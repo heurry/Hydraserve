@@ -17,6 +17,7 @@ class PrefillResult:
     state: RuntimeState
     state_token_count: int
     sample: TokenSample | None = None
+    chunk_preemptions: int = 0
 
 
 @dataclass(slots=True)
@@ -83,6 +84,7 @@ class PrefillWorker:
         host_prefix_tokens: int = 0,
         transfer_target_bytes: int = 8 << 20,
         max_inflight_chunks: int = 2,
+        chunk_yield_callback=None,
     ) -> PrefillResult:
         import torch
 
@@ -158,6 +160,7 @@ class PrefillWorker:
         transfer_executor = None
         transfer_stream = None
         pending_transfers = []
+        cooperative_ops = 0
         if stream_kv and self.paged_cache.device.type == "cuda":
             if self._transfer_executor is None:
                 self._transfer_executor = ThreadPoolExecutor(max_workers=1)
@@ -191,21 +194,27 @@ class PrefillWorker:
             self.pipeline.send_kv_chunk(request.request_id, start, end, payload)
 
         def publish_kv_chunk(start, end, _state) -> None:
-            if not stream_kv:
-                return
-            start = max(start, host_prefix_tokens)
-            if end <= start:
-                return
-            if transfer_executor is None:
-                extract_and_send(start, end)
-                return
-            ready = torch.cuda.Event()
-            ready.record(torch.cuda.current_stream(self.paged_cache.device))
-            pending_transfers.append(
-                transfer_executor.submit(extract_and_send, start, end, ready)
-            )
-            if len(pending_transfers) >= max_inflight_chunks:
-                pending_transfers.pop(0).result()
+            nonlocal cooperative_ops
+            if stream_kv:
+                transfer_start = max(start, host_prefix_tokens)
+                if end > transfer_start:
+                    if transfer_executor is None:
+                        extract_and_send(transfer_start, end)
+                    else:
+                        ready = torch.cuda.Event()
+                        ready.record(torch.cuda.current_stream(self.paged_cache.device))
+                        pending_transfers.append(
+                            transfer_executor.submit(
+                                extract_and_send, transfer_start, end, ready
+                            )
+                        )
+                        if len(pending_transfers) >= max_inflight_chunks:
+                            pending_transfers.pop(0).result()
+            # The model state and page table are consistent at every runtime
+            # chunk boundary.  Let the process run bounded short decode work
+            # before the next long-prefill chunk is launched.
+            if chunk_yield_callback is not None:
+                cooperative_ops += int(chunk_yield_callback() or 0)
 
         try:
             with torch.inference_mode():
@@ -266,7 +275,9 @@ class PrefillWorker:
             host_cache_hit=host_prefix_tokens == len(request.token_ids),
             host_prefix_tokens=host_prefix_tokens,
         )
-        return PrefillResult(first_token, state, split, sample)
+        return PrefillResult(
+            first_token, state, split, sample, cooperative_ops
+        )
 
 
 class DecodeWorker:

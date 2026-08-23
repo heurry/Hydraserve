@@ -685,6 +685,12 @@ class _Handler(BaseHTTPRequestHandler):
                     f"hydraserve_pd_failures_total {stats.pd_failures}",
                     "# TYPE hydraserve_prefill_worker_healthy gauge",
                     f"hydraserve_prefill_worker_healthy {1 if stats.prefill_healthy else 0}",
+                    "# TYPE hydraserve_prefill_short_collocated_total counter",
+                    "hydraserve_prefill_short_collocated_total "
+                    f"{getattr(stats, 'prefill_short_collocated', 0)}",
+                    "# TYPE hydraserve_prefill_chunk_preemptions_total counter",
+                    "hydraserve_prefill_chunk_preemptions_total "
+                    f"{getattr(stats, 'prefill_chunk_preemptions', 0)}",
                 ]
             )
         routing_cost_stats = getattr(backend, "routing_cost_stats", None)

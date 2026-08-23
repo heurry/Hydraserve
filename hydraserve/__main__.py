@@ -193,6 +193,25 @@ def main() -> int:
         help="force PD disaggregated routing when prompt token count reaches "
         "this threshold (0 disables)",
     )
+    serve_parser.add_argument(
+        "--conditional-pd-tokens",
+        type=int,
+        default=0,
+        help="deterministically run prompts at or above this length through PD; "
+        "shorter prompts stay collocated on decode workers (0 disables)",
+    )
+    serve_parser.add_argument(
+        "--prefill-short-policy",
+        choices=("never", "work-conserving"),
+        default="work-conserving",
+        help="whether an otherwise-idle prefill GPU may serve collocated short requests",
+    )
+    serve_parser.add_argument(
+        "--prefill-preempt-max-ops",
+        type=int,
+        default=8,
+        help="maximum queued short decode/release operations served per prefill chunk boundary",
+    )
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
@@ -299,6 +318,25 @@ def main() -> int:
         help="force PD disaggregated routing when prompt token count reaches "
         "this threshold (0 disables)",
     )
+    benchmark_parser.add_argument(
+        "--conditional-pd-tokens",
+        type=int,
+        default=0,
+        help="deterministically run prompts at or above this length through PD; "
+        "shorter prompts stay collocated on decode workers (0 disables)",
+    )
+    benchmark_parser.add_argument(
+        "--prefill-short-policy",
+        choices=("never", "work-conserving"),
+        default="work-conserving",
+        help="whether an otherwise-idle prefill GPU may serve collocated short requests",
+    )
+    benchmark_parser.add_argument(
+        "--prefill-preempt-max-ops",
+        type=int,
+        default=8,
+        help="maximum queued short decode/release operations served per prefill chunk boundary",
+    )
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
@@ -388,6 +426,7 @@ def main() -> int:
             args.pd_transfer_inflight,
             args.shm_ring_slots,
             args.shm_ring_slot_mb,
+            args.prefill_preempt_max_ops,
         ) <= 0:
             parser.error("cache, batch, and queue limits must be positive")
         max_active_requests = args.max_active_requests or args.max_batch_size
@@ -409,6 +448,14 @@ def main() -> int:
             parser.error("--router-profile requires --adaptive")
         if args.force_pd_tokens and not args.adaptive:
             parser.error("--force-pd-tokens requires --adaptive")
+        if args.conditional_pd_tokens and not (args.adaptive and args.decode_devices):
+            parser.error("--conditional-pd-tokens requires multi-worker --adaptive")
+        if args.conditional_pd_tokens < 0:
+            parser.error("--conditional-pd-tokens cannot be negative")
+        if args.conditional_pd_tokens and args.force_pd_tokens:
+            parser.error(
+                "--conditional-pd-tokens and --force-pd-tokens are mutually exclusive"
+            )
         try:
             router = (
                 CostAwareRouter.from_json(args.router_profile)
@@ -452,6 +499,9 @@ def main() -> int:
                     shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
+                    conditional_pd_tokens=args.conditional_pd_tokens,
+                    prefill_short_policy=args.prefill_short_policy,
+                    prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                 ),
                 router=router,
             )
@@ -627,6 +677,7 @@ def main() -> int:
             args.pd_transfer_inflight,
             args.shm_ring_slots,
             args.shm_ring_slot_mb,
+            args.prefill_preempt_max_ops,
         ) <= 0:
             parser.error("cache limits must be positive")
         if args.prefix_cache_blocks < 0:
@@ -835,6 +886,14 @@ def main() -> int:
             parser.error("--router-profile requires --adaptive")
         if args.force_pd_tokens and not args.adaptive:
             parser.error("--force-pd-tokens requires --adaptive")
+        if args.conditional_pd_tokens and not (args.adaptive and args.decode_devices):
+            parser.error("--conditional-pd-tokens requires multi-worker --adaptive")
+        if args.conditional_pd_tokens < 0:
+            parser.error("--conditional-pd-tokens cannot be negative")
+        if args.conditional_pd_tokens and args.force_pd_tokens:
+            parser.error(
+                "--conditional-pd-tokens and --force-pd-tokens are mutually exclusive"
+            )
         try:
             router = (
                 CostAwareRouter.from_json(args.router_profile)
@@ -896,6 +955,9 @@ def main() -> int:
                     shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
                     pd_schedule=args.pd_schedule,
+                    conditional_pd_tokens=args.conditional_pd_tokens,
+                    prefill_short_policy=args.prefill_short_policy,
+                    prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                 ),
                 router=router,
             )
