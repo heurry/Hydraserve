@@ -25,6 +25,16 @@ class RequestMetrics:
     latency_ms: float
     finish_reason: str
     error: str | None = None
+    # ``ttft_ms`` starts when the client worker actually submits to the engine.
+    # ``e2e_ttft_ms`` starts at the trace's intended arrival time and therefore
+    # includes any client-side executor queueing.
+    e2e_ttft_ms: float | None = None
+    client_queue_ms: float = 0.0
+    # Time between the last visible token and the terminal event.  Keep this
+    # separate from TPOT because engine cleanup/release may be synchronous.
+    release_tail_ms: float | None = None
+    itl_ms: tuple[float, ...] = ()
+    decode_batch_sizes: tuple[int, ...] = ()
     route: str | None = None
     route_reason: str | None = None
     worker_id: int | None = None
@@ -66,6 +76,13 @@ class BenchmarkSummary:
     by_class: dict[str, dict[str, int | float]] = field(default_factory=dict)
     slo: dict[str, int | float] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
+    e2e_ttft_ms: dict[str, float] = field(default_factory=dict)
+    itl_ms: dict[str, float] = field(default_factory=dict)
+    release_tail_ms: dict[str, float] = field(default_factory=dict)
+    client_queue_ms: dict[str, float] = field(default_factory=dict)
+    route_counts_all: dict[str, int] = field(default_factory=dict)
+    route_failure_counts: dict[str, int] = field(default_factory=dict)
+    throughput_valid: bool = True
 
     def to_dict(self) -> dict:
         return {
@@ -87,6 +104,13 @@ class BenchmarkSummary:
             "by_class": self.by_class,
             "slo": self.slo,
             "metadata": self.metadata,
+            "e2e_ttft_ms": self.e2e_ttft_ms,
+            "itl_ms": self.itl_ms,
+            "release_tail_ms": self.release_tail_ms,
+            "client_queue_ms": self.client_queue_ms,
+            "route_counts_all": self.route_counts_all,
+            "route_failure_counts": self.route_failure_counts,
+            "throughput_valid": self.throughput_valid,
             "results": [asdict(result) for result in self.results],
         }
 
@@ -107,7 +131,18 @@ def _percentiles(values: Iterable[float]) -> dict[str, float]:
         fraction = position - lower
         return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
-    return {name: value(percentile) for name, percentile in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))}
+    return {
+        name: value(percentile)
+        for name, percentile in (("p50", 0.5), ("p95", 0.95), ("p99", 0.99))
+    }
+
+
+def _count_routes(results: Iterable[RequestMetrics]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        route = result.route or "unknown"
+        counts[route] = counts.get(route, 0) + 1
+    return counts
 
 
 def _prefix_cache_stats(generation_loop) -> dict[str, int | float]:
@@ -134,7 +169,9 @@ def _prefix_cache_stats(generation_loop) -> dict[str, int | float]:
     }
 
 
-def _per_worker_stats(results: Iterable[RequestMetrics]) -> dict[str, dict[str, int | float]]:
+def _per_worker_stats(
+    results: Iterable[RequestMetrics],
+) -> dict[str, dict[str, int | float]]:
     """Aggregate per-worker distribution across succeeded and failed requests."""
     workers: dict[int, dict[str, int | float]] = {}
     for result in results:
@@ -152,7 +189,9 @@ def _per_worker_stats(results: Iterable[RequestMetrics]) -> dict[str, dict[str, 
         )
         bucket["requests"] = int(bucket["requests"]) + 1
         bucket["prompt_tokens"] = int(bucket["prompt_tokens"]) + result.prompt_tokens
-        bucket["output_tokens"] = int(bucket["output_tokens"]) + result.completion_tokens
+        bucket["output_tokens"] = (
+            int(bucket["output_tokens"]) + result.completion_tokens
+        )
         if result.tpot_ms is not None:
             bucket["max_tpot_ms"] = max(float(bucket["max_tpot_ms"]), result.tpot_ms)
         if result.ttft_ms is not None:
@@ -179,6 +218,7 @@ def _by_class_stats(
             "requests": len(rs),
             "succeeded": len(succeeded),
             "failed": len(rs) - len(succeeded),
+            "throughput_valid": len(succeeded) == len(rs),
             "output_tokens": sum(r.completion_tokens for r in succeeded),
             "request_throughput": round(len(succeeded) / divisor, 4),
             "output_token_throughput": round(
@@ -187,9 +227,17 @@ def _by_class_stats(
             "ttft_ms": _percentiles(
                 r.ttft_ms for r in succeeded if r.ttft_ms is not None
             ),
+            "e2e_ttft_ms": _percentiles(
+                r.e2e_ttft_ms for r in succeeded if r.e2e_ttft_ms is not None
+            ),
             "tpot_ms": _percentiles(
                 r.tpot_ms for r in succeeded if r.tpot_ms is not None
             ),
+            "itl_ms": _percentiles(value for r in succeeded for value in r.itl_ms),
+            "release_tail_ms": _percentiles(
+                r.release_tail_ms for r in succeeded if r.release_tail_ms is not None
+            ),
+            "client_queue_ms": _percentiles(r.client_queue_ms for r in rs),
             "latency_ms": _percentiles(r.latency_ms for r in succeeded),
             "error_reasons": _count_errors(rs),
         }
@@ -227,7 +275,10 @@ def _slo_stats(
             ok = False
         else:
             no_error += 1
-        if result.ttft_ms is not None and result.ttft_ms <= SLO_SHORT_TTFT_MS:
+        slo_ttft_ms = (
+            result.e2e_ttft_ms if result.e2e_ttft_ms is not None else result.ttft_ms
+        )
+        if slo_ttft_ms is not None and slo_ttft_ms <= SLO_SHORT_TTFT_MS:
             ttft_ok += 1
         else:
             ok = False
@@ -296,7 +347,9 @@ def run_benchmark(
     warmups = warmup_pool[:warmup_requests]
     if len(warmups) != warmup_requests:
         raise ValueError("not enough independent warmup samples")
-    measured_samples = all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    measured_samples = (
+        all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    )
     indexed = tuple(enumerate(measured_samples))
 
     def encode(sample: BenchmarkSample):
@@ -326,12 +379,16 @@ def run_benchmark(
         if reset_calibration is not None:
             reset_calibration()
 
-    def run_one(item) -> tuple[int, RequestMetrics]:
+    def run_one(item, scheduled_at: float) -> tuple[int, RequestMetrics]:
         index, sample = item
         token_ids = encode(sample)
         per_sample_max = sample.max_new_tokens or max_new_tokens
         started = perf_counter()
+        client_queue_ms = max(0.0, (started - scheduled_at) * 1000)
         first_token_at = None
+        last_token_at = None
+        itl_ms: list[float] = []
+        decode_batch_sizes: list[int] = []
         completion_tokens = 0
         finish_reason = "error"
         error = None
@@ -346,6 +403,12 @@ def run_benchmark(
                     completion_tokens += 1
                     if first_token_at is None:
                         first_token_at = now
+                    if last_token_at is not None:
+                        itl_ms.append((now - last_token_at) * 1000)
+                    last_token_at = now
+                    batch_size = getattr(event, "decode_batch_size", None)
+                    if batch_size is not None:
+                        decode_batch_sizes.append(int(batch_size))
                 if event.finished:
                     finish_reason = event.finish_reason or "unknown"
                     error = event.error
@@ -354,21 +417,27 @@ def run_benchmark(
         ended = perf_counter()
         latency_ms = (ended - started) * 1000
         ttft_ms = None if first_token_at is None else (first_token_at - started) * 1000
-        tpot_ms = None
-        if first_token_at is not None and completion_tokens > 1:
-            tpot_ms = (ended - first_token_at) * 1000 / (completion_tokens - 1)
-        admission_wait_ms = (
-            None if handle is None else handle.request.admission_wait_ms
-        )
-        observed_service_ms = (
+        e2e_ttft_ms = (
             None
-            if handle is None
-            else handle.request.route_observed_prefill_service_ms
+            if first_token_at is None
+            else max(0.0, (first_token_at - scheduled_at) * 1000)
+        )
+        tpot_ms = None
+        if (
+            first_token_at is not None
+            and last_token_at is not None
+            and completion_tokens > 1
+        ):
+            tpot_ms = (last_token_at - first_token_at) * 1000 / (completion_tokens - 1)
+        release_tail_ms = (
+            None if last_token_at is None else max(0.0, (ended - last_token_at) * 1000)
+        )
+        admission_wait_ms = None if handle is None else handle.request.admission_wait_ms
+        observed_service_ms = (
+            None if handle is None else handle.request.route_observed_prefill_service_ms
         )
         observed_queue_ms = (
-            None
-            if handle is None
-            else handle.request.observed_prefill_queue_wait_ms
+            None if handle is None else handle.request.observed_prefill_queue_wait_ms
         )
         return index, RequestMetrics(
             sample_id=sample.sample_id,
@@ -380,6 +449,11 @@ def run_benchmark(
             latency_ms=latency_ms,
             finish_reason=finish_reason,
             error=error,
+            e2e_ttft_ms=e2e_ttft_ms,
+            client_queue_ms=client_queue_ms,
+            release_tail_ms=release_tail_ms,
+            itl_ms=tuple(itl_ms),
+            decode_batch_sizes=tuple(decode_batch_sizes),
             route=None if handle is None else (handle.request.route or "collocated"),
             route_reason=None if handle is None else handle.request.route_reason,
             worker_id=None if handle is None else handle.request.worker_id,
@@ -390,9 +464,7 @@ def run_benchmark(
                 None if handle is None else handle.request.route_pd_cost_ms
             ),
             route_estimated_savings_ms=(
-                None
-                if handle is None
-                else handle.request.route_estimated_savings_ms
+                None if handle is None else handle.request.route_estimated_savings_ms
             ),
             route_cost_confidence=(
                 None if handle is None else handle.request.route_cost_confidence
@@ -401,12 +473,12 @@ def run_benchmark(
                 None if handle is None else handle.request.route_decode_load
             ),
             route_prefill_load=(
-                None if handle is None else getattr(handle.request, "route_prefill_load", None)
+                None
+                if handle is None
+                else getattr(handle.request, "route_prefill_load", None)
             ),
             route_prefill_queue_ahead_ms=(
-                0.0
-                if handle is None
-                else handle.request.route_prefill_queue_ahead_ms
+                0.0 if handle is None else handle.request.route_prefill_queue_ahead_ms
             ),
             route_observed_prefill_service_ms=observed_service_ms,
             admission_wait_ms=admission_wait_ms,
@@ -443,7 +515,8 @@ def run_benchmark(
             delay = wall_started + offset + trace_offset - perf_counter()
             if delay > 0:
                 sleep(delay)
-            futures.append(executor.submit(run_one, item))
+            scheduled_at = wall_started + offset + trace_offset
+            futures.append(executor.submit(run_one, item, scheduled_at))
         for future in as_completed(futures):
             index, result = future.result()
             ordered_results[index] = result
@@ -451,17 +524,16 @@ def run_benchmark(
     results = tuple(result for result in ordered_results if result is not None)
     succeeded = tuple(result for result in results if result.error is None)
     divisor = wall_time if wall_time > 0 else float("inf")
-    route_counts: dict[str, int] = {}
-    for result in succeeded:
-        route = result.route or "unknown"
-        route_counts[route] = route_counts.get(route, 0) + 1
+    route_counts = _count_routes(succeeded)
+    failed_results = tuple(result for result in results if result.error is not None)
     return BenchmarkSummary(
         requests=len(results),
         succeeded=len(succeeded),
         failed=len(results) - len(succeeded),
         wall_time_s=wall_time,
         request_throughput=len(succeeded) / divisor,
-        output_token_throughput=sum(result.completion_tokens for result in succeeded) / divisor,
+        output_token_throughput=sum(result.completion_tokens for result in succeeded)
+        / divisor,
         warmup_requests=len(warmups),
         offered_request_rate=request_rate,
         arrival_pattern=arrival_pattern,
@@ -472,6 +544,19 @@ def run_benchmark(
             result.tpot_ms for result in succeeded if result.tpot_ms is not None
         ),
         latency_ms=_percentiles(result.latency_ms for result in succeeded),
+        e2e_ttft_ms=_percentiles(
+            result.e2e_ttft_ms for result in succeeded if result.e2e_ttft_ms is not None
+        ),
+        itl_ms=_percentiles(value for result in succeeded for value in result.itl_ms),
+        release_tail_ms=_percentiles(
+            result.release_tail_ms
+            for result in succeeded
+            if result.release_tail_ms is not None
+        ),
+        client_queue_ms=_percentiles(result.client_queue_ms for result in results),
+        route_counts_all=_count_routes(results),
+        route_failure_counts=_count_routes(failed_results),
+        throughput_valid=not failed_results,
         route_counts=route_counts,
         prefix_cache_stats=_prefix_cache_stats(generation_loop),
         per_worker=_per_worker_stats(results),
@@ -579,7 +664,9 @@ def run_http_benchmark(
     warmups = warmup_pool[:warmup_requests]
     if len(warmups) != warmup_requests:
         raise ValueError("not enough independent warmup samples")
-    measured_samples = all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    measured_samples = (
+        all_samples if warmup_samples is not None else all_samples[warmup_requests:]
+    )
     indexed = tuple(enumerate(measured_samples))
 
     for sample in warmups:
@@ -593,13 +680,16 @@ def run_http_benchmark(
             if kind == "error":
                 raise RuntimeError(f"warmup request {sample.sample_id} failed: {value}")
 
-    def run_one(item) -> tuple[int, RequestMetrics]:
+    def run_one(item, scheduled_at: float) -> tuple[int, RequestMetrics]:
         index, sample = item
         per_sample_max = sample.max_new_tokens or max_new_tokens
         prompt = truncate_prompt(sample)
         prompt_tokens = len(tokenizer.encode(prompt))
         started = perf_counter()
+        client_queue_ms = max(0.0, (started - scheduled_at) * 1000)
         first_token_at = None
+        last_token_at = None
+        itl_ms: list[float] = []
         completion_tokens = 0
         finish_reason = "error"
         error = None
@@ -616,6 +706,9 @@ def run_http_benchmark(
                     completion_tokens += 1
                     if first_token_at is None:
                         first_token_at = now
+                    if last_token_at is not None:
+                        itl_ms.append((now - last_token_at) * 1000)
+                    last_token_at = now
                 elif kind == "finish":
                     finish_reason = value or "stop"
                 elif kind == "error":
@@ -625,9 +718,21 @@ def run_http_benchmark(
         ended = perf_counter()
         latency_ms = (ended - started) * 1000
         ttft_ms = None if first_token_at is None else (first_token_at - started) * 1000
+        e2e_ttft_ms = (
+            None
+            if first_token_at is None
+            else max(0.0, (first_token_at - scheduled_at) * 1000)
+        )
         tpot_ms = None
-        if first_token_at is not None and completion_tokens > 1:
-            tpot_ms = (ended - first_token_at) * 1000 / (completion_tokens - 1)
+        if (
+            first_token_at is not None
+            and last_token_at is not None
+            and completion_tokens > 1
+        ):
+            tpot_ms = (last_token_at - first_token_at) * 1000 / (completion_tokens - 1)
+        release_tail_ms = (
+            None if last_token_at is None else max(0.0, (ended - last_token_at) * 1000)
+        )
         return index, RequestMetrics(
             sample_id=sample.sample_id,
             request_id=None,
@@ -638,6 +743,10 @@ def run_http_benchmark(
             latency_ms=latency_ms,
             finish_reason=finish_reason,
             error=error,
+            e2e_ttft_ms=e2e_ttft_ms,
+            client_queue_ms=client_queue_ms,
+            release_tail_ms=release_tail_ms,
+            itl_ms=tuple(itl_ms),
             route=None,
             route_reason=None,
             worker_id=None,
@@ -673,7 +782,8 @@ def run_http_benchmark(
             delay = wall_started + offset + trace_offset - perf_counter()
             if delay > 0:
                 sleep(delay)
-            futures.append(executor.submit(run_one, item))
+            scheduled_at = wall_started + offset + trace_offset
+            futures.append(executor.submit(run_one, item, scheduled_at))
         for future in as_completed(futures):
             index, result = future.result()
             ordered_results[index] = result
@@ -681,17 +791,16 @@ def run_http_benchmark(
     results = tuple(result for result in ordered_results if result is not None)
     succeeded = tuple(result for result in results if result.error is None)
     divisor = wall_time if wall_time > 0 else float("inf")
-    route_counts: dict[str, int] = {}
-    for result in succeeded:
-        route = result.route or "unknown"
-        route_counts[route] = route_counts.get(route, 0) + 1
+    route_counts = _count_routes(succeeded)
+    failed_results = tuple(result for result in results if result.error is not None)
     return BenchmarkSummary(
         requests=len(results),
         succeeded=len(succeeded),
         failed=len(results) - len(succeeded),
         wall_time_s=wall_time,
         request_throughput=len(succeeded) / divisor,
-        output_token_throughput=sum(result.completion_tokens for result in succeeded) / divisor,
+        output_token_throughput=sum(result.completion_tokens for result in succeeded)
+        / divisor,
         warmup_requests=len(warmups),
         offered_request_rate=request_rate,
         arrival_pattern=arrival_pattern,
@@ -702,6 +811,19 @@ def run_http_benchmark(
             result.tpot_ms for result in succeeded if result.tpot_ms is not None
         ),
         latency_ms=_percentiles(result.latency_ms for result in succeeded),
+        e2e_ttft_ms=_percentiles(
+            result.e2e_ttft_ms for result in succeeded if result.e2e_ttft_ms is not None
+        ),
+        itl_ms=_percentiles(value for result in succeeded for value in result.itl_ms),
+        release_tail_ms=_percentiles(
+            result.release_tail_ms
+            for result in succeeded
+            if result.release_tail_ms is not None
+        ),
+        client_queue_ms=_percentiles(result.client_queue_ms for result in results),
+        route_counts_all=_count_routes(results),
+        route_failure_counts=_count_routes(failed_results),
+        throughput_valid=not failed_results,
         route_counts=route_counts,
         prefix_cache_stats={},
         per_worker={},

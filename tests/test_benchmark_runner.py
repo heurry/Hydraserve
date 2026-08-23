@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from time import sleep
+
+import pytest
+
 from hydraserve.benchmark import BenchmarkSample, run_benchmark
 from hydraserve.engine import ContinuousGenerationLoop
 
@@ -91,15 +95,66 @@ def test_benchmark_records_request_error() -> None:
             return
 
     loop = ContinuousGenerationLoop(FailingBackend())
-    summary = run_benchmark(
-        loop, Tokenizer(), [BenchmarkSample("toy", "bad", "x")]
-    )
+    summary = run_benchmark(loop, Tokenizer(), [BenchmarkSample("toy", "bad", "x")])
     loop.close()
     assert summary.succeeded == 0
     assert summary.failed == 1
     assert summary.ttft_ms == {}
     assert summary.results[0].error == "cannot prefill"
     assert summary.route_counts == {}
+
+
+def test_tpot_excludes_release_tail_and_records_decode_batch_size() -> None:
+    class SlowReleaseBackend(Backend):
+        def release(self, request_id):
+            sleep(0.03)
+            super().release(request_id)
+
+    loop = ContinuousGenerationLoop(SlowReleaseBackend(), max_batch_size=4)
+    summary = run_benchmark(
+        loop,
+        Tokenizer(),
+        [BenchmarkSample("toy", "timing", "x")],
+        max_new_tokens=3,
+    )
+    loop.close()
+
+    result = summary.results[0]
+    assert len(result.itl_ms) == 2
+    assert result.decode_batch_sizes == (1, 1)
+    assert result.tpot_ms == pytest.approx(sum(result.itl_ms) / 2)
+    assert result.release_tail_ms is not None
+    assert result.release_tail_ms >= 20
+    assert summary.release_tail_ms["p50"] == result.release_tail_ms
+    assert summary.itl_ms
+
+
+def test_benchmark_reports_client_queue_and_arrival_based_ttft() -> None:
+    class SlowPrefillBackend(Backend):
+        def prefill(self, request):
+            sleep(0.03)
+            return super().prefill(request)
+
+    loop = ContinuousGenerationLoop(SlowPrefillBackend())
+    summary = run_benchmark(
+        loop,
+        Tokenizer(),
+        [
+            BenchmarkSample("toy", "first", "x"),
+            BenchmarkSample("toy", "second", "y"),
+        ],
+        max_new_tokens=1,
+        concurrency=1,
+        arrival_pattern="burst",
+    )
+    loop.close()
+
+    second = summary.results[1]
+    assert second.client_queue_ms >= 20
+    assert second.e2e_ttft_ms is not None
+    assert second.ttft_ms is not None
+    assert second.e2e_ttft_ms > second.ttft_ms
+    assert summary.client_queue_ms["p99"] >= second.client_queue_ms * 0.9
 
 
 def test_fixed_and_seeded_poisson_arrival_configuration() -> None:
@@ -123,8 +178,6 @@ def test_fixed_and_seeded_poisson_arrival_configuration() -> None:
 
 
 def test_arrival_configuration_validation() -> None:
-    import pytest
-
     loop = ContinuousGenerationLoop(Backend())
     with pytest.raises(ValueError, match="require request_rate"):
         run_benchmark(

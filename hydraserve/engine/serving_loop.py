@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections import OrderedDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from itertools import count
 from queue import Empty, Queue
@@ -35,11 +36,17 @@ class PartialDecodeError(RuntimeError):
     ) -> None:
         overlap = set(token_ids) & set(errors)
         if overlap:
-            raise ValueError(f"partial decode outcomes overlap for requests {sorted(overlap)}")
+            raise ValueError(
+                f"partial decode outcomes overlap for requests {sorted(overlap)}"
+            )
         if not errors:
-            raise ValueError("partial decode error requires at least one failed request")
+            raise ValueError(
+                "partial decode error requires at least one failed request"
+            )
         self.samples = {
-            int(key): value if isinstance(value, TokenSample) else TokenSample(int(value))
+            int(key): (
+                value if isinstance(value, TokenSample) else TokenSample(int(value))
+            )
             for key, value in token_ids.items()
         }
         self.token_ids = {key: sample.token_id for key, sample in self.samples.items()}
@@ -75,12 +82,15 @@ class BackendCapacity:
     state_free_slots: int
 
     def __post_init__(self) -> None:
-        if min(
-            self.kv_total_blocks,
-            self.kv_free_blocks,
-            self.state_total_slots,
-            self.state_free_slots,
-        ) < 0:
+        if (
+            min(
+                self.kv_total_blocks,
+                self.kv_free_blocks,
+                self.state_total_slots,
+                self.state_free_slots,
+            )
+            < 0
+        ):
             raise ValueError("capacity values cannot be negative")
         if self.kv_free_blocks > self.kv_total_blocks:
             raise ValueError("free KV blocks exceed total blocks")
@@ -147,6 +157,9 @@ class GenerationEvent:
     error: str | None = None
     logprob: float | None = None
     top_logprobs: tuple[tuple[int, float], ...] = ()
+    # Present for decode tokens so benchmarks can distinguish sparse-batch
+    # latency from transport/release overhead. Prefill seed tokens use ``None``.
+    decode_batch_size: int | None = None
 
 
 class GenerationBackend(Protocol):
@@ -207,7 +220,9 @@ class ContinuousGenerationLoop:
         dp_graph_sync: bool = False,
         dp_process_group=None,
     ) -> None:
-        active_limit = max_batch_size if max_active_requests is None else max_active_requests
+        active_limit = (
+            max_batch_size if max_active_requests is None else max_active_requests
+        )
         if (
             min(max_batch_size, active_limit, max_queue_size, max_queue_tokens) <= 0
             or idle_wait_s <= 0
@@ -259,7 +274,9 @@ class ContinuousGenerationLoop:
                 return
             if self._stop.is_set():
                 raise RuntimeError("a stopped serving loop cannot be restarted")
-            self._thread = Thread(target=self._run, name="hydraserve-generation", daemon=True)
+            self._thread = Thread(
+                target=self._run, name="hydraserve-generation", daemon=True
+            )
             self._thread.start()
 
     def submit(
@@ -356,26 +373,49 @@ class ContinuousGenerationLoop:
                 self._finish(request, "cancelled", active=active, release=True)
             self._publish_scheduler_depth(0, 0)
 
-    def _run_disaggregated(
-        self, active: OrderedDict[int, ServingRequest]
-    ) -> None:
+    def _run_disaggregated(self, active: OrderedDict[int, ServingRequest]) -> None:
         pending: OrderedDict[int, tuple[ServingRequest, Future]] = OrderedDict()
         recovering: set[int] = set()
-        prefill_workers = max(1, int(getattr(self.backend, "prefill_parallelism", 1)))
-        with ThreadPoolExecutor(
-            max_workers=prefill_workers, thread_name_prefix="hydraserve-prefill"
-        ) as executor:
+        raw_limits = getattr(self.backend, "prefill_executor_limits", None)
+        if raw_limits is None:
+            raw_limits = {
+                "default": max(1, int(getattr(self.backend, "prefill_parallelism", 1)))
+            }
+        executor_limits = {
+            str(group): max(1, int(limit)) for group, limit in dict(raw_limits).items()
+        }
+        if not executor_limits:
+            executor_limits = {"default": 1}
+        group_for = getattr(self.backend, "prefill_executor_group", None)
+
+        with ExitStack() as stack:
+            executors = {
+                group: stack.enter_context(
+                    ThreadPoolExecutor(
+                        max_workers=limit,
+                        thread_name_prefix=f"hydraserve-prefill-{group}",
+                    )
+                )
+                for group, limit in executor_limits.items()
+            }
+            default_executor = next(iter(executors.values()))
+
+            def executor_for(request: ServingRequest) -> ThreadPoolExecutor:
+                if not callable(group_for):
+                    return default_executor
+                return executors.get(str(group_for(request)), default_executor)
+
             while not self._stop.is_set():
                 # Decode consumes one token per active sequence. Prefill
                 # admission shares the remaining per-step token budget.
                 prefill_budget = max(0, self.max_step_tokens - len(active))
                 did_work = self._submit_async_prefill(
-                    active, pending, executor, token_budget=prefill_budget
+                    active, pending, executor_for, token_budget=prefill_budget
                 )
                 did_work = self._remove_cancelled_or_expired(active) or did_work
                 did_work = (
                     self._submit_async_recovery(
-                        active, pending, recovering, executor
+                        active, pending, recovering, executor_for
                     )
                     or did_work
                 )
@@ -400,7 +440,7 @@ class ContinuousGenerationLoop:
                 )
 
     def _submit_async_prefill(
-        self, active, pending, executor, *, token_budget: int | None = None
+        self, active, pending, executor_for, *, token_budget: int | None = None
     ) -> bool:
         did_work = False
         available_slots = self.max_active_requests - len(active) - len(pending)
@@ -416,10 +456,13 @@ class ContinuousGenerationLoop:
             demand = len(request.token_ids)
             if token_budget is not None and demand > token_budget:
                 # Avoid starvation when a single prompt exceeds a complete
-                # step budget and there is otherwise no GPU work.
+                # step budget and there is otherwise no GPU work. Otherwise
+                # defer only this request and keep scanning: a queued long
+                # prompt must not head-of-line block short prompts that fit.
                 if active or pending or token_budget != self.max_step_tokens:
-                    self._defer_remaining(candidates[index:])
-                    break
+                    request.admission_age += 1
+                    self._deferred.append((request, handle))
+                    continue
             if token_budget is not None:
                 token_budget = max(0, token_budget - demand)
             if request.cancelled.is_set():
@@ -437,9 +480,7 @@ class ContinuousGenerationLoop:
                 )
                 did_work = True
                 continue
-            request.route_prefill_queue_ahead_ms = self._prefill_queue_ahead_ms(
-                pending
-            )
+            request.route_prefill_queue_ahead_ms = self._prefill_queue_ahead_ms(pending)
             decision = self._admission_decision(request)
             if not decision.admitted:
                 if decision.retryable and self._try_preempt_for(request, active):
@@ -462,14 +503,14 @@ class ContinuousGenerationLoop:
             self._pending_done(request)
             pending[request.request_id] = (
                 request,
-                executor.submit(self._execute_prefill, request),
+                executor_for(request).submit(self._execute_prefill, request),
             )
             available_slots -= 1
             did_work = True
         return did_work
 
     def _submit_async_recovery(
-        self, active, pending, recovering: set[int], executor
+        self, active, pending, recovering: set[int], executor_for
     ) -> bool:
         recover = getattr(self.backend, "recover", None)
         if not callable(recover) or not self._preempted:
@@ -500,7 +541,7 @@ class ContinuousGenerationLoop:
                 continue
             pending[request.request_id] = (
                 request,
-                executor.submit(recover, request),
+                executor_for(request).submit(recover, request),
             )
             recovering.add(request.request_id)
             did_work = True
@@ -621,7 +662,10 @@ class ContinuousGenerationLoop:
         return bool(completed)
 
     def _admit(
-        self, active: OrderedDict[int, ServingRequest], *, token_budget: int | None = None
+        self,
+        active: OrderedDict[int, ServingRequest],
+        *,
+        token_budget: int | None = None,
     ) -> bool:
         did_work = False
         available_slots = self.max_active_requests - len(active)
@@ -658,10 +702,7 @@ class ContinuousGenerationLoop:
                 continue
             decision = self._admission_decision(request)
             if not decision.admitted:
-                if (
-                    decision.retryable
-                    and self._try_preempt_for(request, active)
-                ):
+                if decision.retryable and self._try_preempt_for(request, active):
                     available_slots += 1
                     decision = self._admission_decision(request)
                 if decision.retryable:
@@ -775,9 +816,7 @@ class ContinuousGenerationLoop:
             request.request_id,
         )
 
-    def _recover_preempted(
-        self, active: OrderedDict[int, ServingRequest]
-    ) -> bool:
+    def _recover_preempted(self, active: OrderedDict[int, ServingRequest]) -> bool:
         recover = getattr(self.backend, "recover", None)
         if not callable(recover) or not self._preempted:
             return False
@@ -871,13 +910,14 @@ class ContinuousGenerationLoop:
             for request in batch:
                 error = exc.errors.get(request.request_id)
                 if error is not None:
-                    if not self._suspend_recoverable_failure(
-                        request, error, active
-                    ):
+                    if not self._suspend_recoverable_failure(request, error, active):
                         self._fail(request, error, active=active, release=True)
                 else:
                     self._accept_decode_sample(
-                        request, exc.samples[request.request_id], active
+                        request,
+                        exc.samples[request.request_id],
+                        active,
+                        decode_batch_size=len(batch),
                     )
             return
         except Exception as exc:
@@ -886,7 +926,9 @@ class ContinuousGenerationLoop:
                     self._fail(request, exc, active=active, release=True)
             return
         for request, token_id in zip(batch, token_ids, strict=True):
-            self._accept_decode_sample(request, token_id, active)
+            self._accept_decode_sample(
+                request, token_id, active, decode_batch_size=len(batch)
+            )
 
     def _suspend_recoverable_failure(
         self,
@@ -921,6 +963,8 @@ class ContinuousGenerationLoop:
         request: ServingRequest,
         value: int | TokenSample,
         active: OrderedDict[int, ServingRequest],
+        *,
+        decode_batch_size: int,
     ) -> None:
         if self._deadline_expired(request):
             self._fail(
@@ -932,7 +976,7 @@ class ContinuousGenerationLoop:
             return
         sample = self._normalize_sample(value)
         request.generated_token_ids.append(sample.token_id)
-        self._emit(request, sample)
+        self._emit(request, sample, decode_batch_size=decode_batch_size)
         reason = self._finish_reason(request, sample.token_id)
         if reason is not None:
             self._finish(request, reason, active=active, release=True)
@@ -940,13 +984,13 @@ class ContinuousGenerationLoop:
     def _remove_cancelled_or_expired(
         self, active: OrderedDict[int, ServingRequest]
     ) -> bool:
-        cancelled = [request for request in active.values() if request.cancelled.is_set()]
+        cancelled = [
+            request for request in active.values() if request.cancelled.is_set()
+        ]
         for request in cancelled:
             self._finish(request, "cancelled", active=active, release=True)
         expired = [
-            request
-            for request in active.values()
-            if self._deadline_expired(request)
+            request for request in active.values() if self._deadline_expired(request)
         ]
         for request in expired:
             self._fail(
@@ -979,13 +1023,20 @@ class ContinuousGenerationLoop:
             return "length"
         return None
 
-    def _emit(self, request: ServingRequest, sample: TokenSample) -> None:
+    def _emit(
+        self,
+        request: ServingRequest,
+        sample: TokenSample,
+        *,
+        decode_batch_size: int | None = None,
+    ) -> None:
         self._handle(request.request_id)._put(
             GenerationEvent(
                 request.request_id,
                 token_id=sample.token_id,
                 logprob=sample.logprob,
                 top_logprobs=sample.top_logprobs,
+                decode_batch_size=decode_batch_size,
             )
         )
 
@@ -1076,9 +1127,7 @@ class ContinuousGenerationLoop:
         candidates.sort(
             key=lambda item: (
                 -(item[0].priority * 8 + item[0].admission_age),
-                float("inf")
-                if item[0].deadline_at is None
-                else item[0].deadline_at,
+                float("inf") if item[0].deadline_at is None else item[0].deadline_at,
                 item[0].request_id,
             )
         )
@@ -1192,9 +1241,7 @@ class RuntimeGenerationBackend:
         max_decode_batch_size: int | None = None,
     ) -> None:
         max_decode_batch_size = (
-            max_state_slots
-            if max_decode_batch_size is None
-            else max_decode_batch_size
+            max_state_slots if max_decode_batch_size is None else max_decode_batch_size
         )
         if min(prefill_chunk_size, max_state_slots, max_decode_batch_size) <= 0:
             raise ValueError("prefill chunk size and state slots must be positive")
@@ -1394,7 +1441,10 @@ class RuntimeGenerationBackend:
                 # Pooled recurrent states are committed atomically at the end of
                 # the transaction, so a failed decode leaves them untouched; the
                 # state-pool identity check requires the object be preserved.
-                if state is not None and getattr(state, "_state_pool_ref", None) is None:
+                if (
+                    state is not None
+                    and getattr(state, "_state_pool_ref", None) is None
+                ):
                     self.states[request_id] = self._checkpoint_state(
                         checkpoints[request_id]
                     )

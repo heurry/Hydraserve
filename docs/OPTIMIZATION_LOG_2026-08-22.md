@@ -1318,3 +1318,28 @@ CLI：`--pd-transfer-quant int8`。它与 `--kv-quant int8` 含义不同：前�
 正确性约束：只在完整 chunk 完成、KV page table 与 recurrent/conv state 一致后让出；单次最多
 处理 8 个短操作，防止连续 short 流量饿死 long。新增单测覆盖确定性路由、固定 P 开关、乱序
 RPC 响应分发与 chunk yield 计数；相关 CPU/模型小配置测试通过，真实 4×3090 数据待 V3 执行。
+
+## 24. W1 short-32 口径修复与 P/D prefill 执行槽解耦（2026-08-23）
+
+四卡W1试跑暴露出两个会直接污染结论的问题：short-32的TPOT把最后token之后的同步KV release、
+worker RPC和清理时间一起除以31；1P+3D conditional虽然把short路由到D collocated，上层
+`ContinuousGenerationLoop`却仍按P卡数量创建prefill线程池，导致1P拓扑只有一个host执行槽，
+long-PD可以把short-D prefill一起串行化。
+
+本轮修改：
+
+- benchmark逐请求记录`last_token_at`，TPOT只覆盖首末token；新增`itl_ms`、
+  `release_tail_ms`、`client_queue_ms`和`e2e_ttft_ms`；
+- engine-only token event携带实际decode batch size，使“batch稀疏”可以由数据验证，不再作为
+  未测量的默认解释；
+- SLO的TTFT门禁改用包含客户端排队的`e2e_ttft_ms`；历史engine TTFT继续保留用于归因；
+- 增加`route_counts_all`、`route_failure_counts`与`throughput_valid`。出现OOM/超时的run仍保存
+  原始数据，但吞吐不得进入headline比较；
+- serving loop支持backend声明多个独立prefill executor；multi-worker backend将P-prefill和
+  D-collocated划为独立池，并分别按P/D设备数设置并行度；
+- token budget遇到暂时放不下的long时只defer该请求，继续扫描后续可执行short，消除host侧
+  head-of-line blocking，同时保留admission aging；
+- 新增同步release隔离、客户端排队、decode batch审计、P/D executor并发和conditional分组测试。
+
+相关CPU回归通过；本轮没有运行四卡性能压测。旧W1 short-32表中的TPOT/SLO仍采用历史污染口径，
+只能作为问题定位材料，修复后结果必须使用新JSON字段并重新生成，禁止覆盖或混用旧数值。

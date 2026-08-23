@@ -67,9 +67,7 @@ def test_streams_prefill_seed_then_continuous_decode() -> None:
 
 def test_unified_step_token_budget_limits_prefill_and_decode_width() -> None:
     backend = FakeBackend()
-    loop = ContinuousGenerationLoop(
-        backend, max_batch_size=8, max_step_tokens=1
-    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=8, max_step_tokens=1)
     first = loop.submit([1], max_new_tokens=3)
     second = loop.submit([10], max_new_tokens=3)
     list(first)
@@ -254,6 +252,45 @@ def test_disaggregated_prefill_overlaps_active_decode() -> None:
     assert [event.token_id for event in second_events[:-1]] == [21, 22]
 
 
+def test_route_aware_prefill_executors_prevent_long_short_host_hol() -> None:
+    long_prefill_entered = Event()
+    allow_long_prefill = Event()
+
+    class SplitExecutorBackend(FakeBackend):
+        supports_async_prefill = True
+        prefill_executor_limits = {"prefill": 1, "decode": 1}
+
+        def admit(self, request):
+            request.route = (
+                "pd_disaggregated" if request.token_ids == (20,) else "collocated"
+            )
+            return AdmissionDecision.accept()
+
+        @staticmethod
+        def prefill_executor_group(request):
+            return "prefill" if request.route == "pd_disaggregated" else "decode"
+
+        def prefill(self, request):
+            if request.route == "pd_disaggregated":
+                long_prefill_entered.set()
+                assert allow_long_prefill.wait(2)
+            return super().prefill(request)
+
+    backend = SplitExecutorBackend()
+    loop = ContinuousGenerationLoop(backend, max_batch_size=4)
+    long_handle = loop.submit([20], max_new_tokens=1)
+    assert long_prefill_entered.wait(2)
+
+    short_handle = loop.submit([1], max_new_tokens=1)
+    short_first = short_handle.get(timeout=1)
+    assert short_first.token_id == 2
+    assert list(short_handle)[-1].finish_reason == "length"
+
+    allow_long_prefill.set()
+    assert list(long_handle)[-1].finish_reason == "length"
+    loop.close()
+
+
 def test_retryable_admission_waits_for_capacity_instead_of_failing() -> None:
     class CapacityBackend(FakeBackend):
         def __init__(self):
@@ -348,7 +385,9 @@ def test_runtime_admission_reserves_kv_and_recurrent_state_together() -> None:
         def __init__(self):
             self.block_manager = KVBlockManager(8, block_size=4)
 
-        def allocate(self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None):
+        def allocate(
+            self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None
+        ):
             return self.block_manager.allocate(
                 request_id, num_tokens, reserve_tokens=reserve_tokens
             )
@@ -438,7 +477,9 @@ def test_runtime_backend_recovery_replays_only_model_consumed_tokens() -> None:
         def __init__(self):
             self.block_manager = KVBlockManager(8, block_size=4)
 
-        def allocate(self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None):
+        def allocate(
+            self, request_id, num_tokens, *, reserve_tokens=None, token_ids=None
+        ):
             return self.block_manager.allocate(
                 request_id, num_tokens, reserve_tokens=reserve_tokens
             )
@@ -572,9 +613,7 @@ def test_active_limit_can_exceed_decode_batch_and_is_observable() -> None:
     )
     handles = [loop.submit([1], max_new_tokens=3)]
     assert first_prefill_entered.wait(1)
-    handles.extend(
-        loop.submit([index + 1], max_new_tokens=3) for index in range(1, 4)
-    )
+    handles.extend(loop.submit([index + 1], max_new_tokens=3) for index in range(1, 4))
     release_first_prefill.set()
     assert decode_entered.wait(1)
     assert loop.active_count == 4
@@ -613,9 +652,7 @@ def test_higher_priority_request_preempts_and_exactly_recovers_active_request() 
             return AdmissionDecision.accept()
 
     backend = PreemptibleBackend()
-    loop = ContinuousGenerationLoop(
-        backend, max_batch_size=1, max_active_requests=1
-    )
+    loop = ContinuousGenerationLoop(backend, max_batch_size=1, max_active_requests=1)
     background = loop.submit([1], max_new_tokens=4, priority=0)
     assert background.get(timeout=2).token_id == 2
     assert decode_entered.wait(2)

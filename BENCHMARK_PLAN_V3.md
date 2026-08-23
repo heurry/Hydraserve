@@ -110,6 +110,18 @@ JSON 除总体指标外，增加 `by_class.short/long/...`：
 - 成功数、超时数、OOM、preemption/replay；
 - SLO 达标请求数与 goodput。
 
+计时口径固定如下，禁止再用 terminal event 代替最后一个 token：
+
+- `ttft_ms`：客户端线程实际开始提交到首 token，只反映 engine path；
+- `client_queue_ms`：trace 计划到达时刻到客户端线程真正开始的排队；
+- `e2e_ttft_ms`：trace 计划到达时刻到首 token，正式 SLO 使用此项；
+- `tpot_ms`：`(last_token_at - first_token_at) / (completion_tokens - 1)`；
+- `release_tail_ms`：最后 token 到 terminal event，单独暴露 KV release/RPC/清理尾部；
+- `itl_ms`：逐 token 间隔分布；engine-only 额外保存对应的 `decode_batch_sizes`。
+
+`route_counts`继续表示成功请求以兼容历史结果，同时必须报告`route_counts_all`和
+`route_failure_counts`。任一请求失败时`throughput_valid=false`，该轮output tok/s不得进入主表。
+
 主 SLO 固定为：
 
 - short TTFT ≤ 5 s；
@@ -145,8 +157,14 @@ GPU 型号/时钟/温度/topology、P2P 状态、模型与 trace hash。每轮�
 8. 检查每卡显存余量、KV free blocks、state slots、ring slots 和进程存活。W1 从
    `--cache-tokens 131072` 起步，不使用默认 65536；若 memory planner 下调，记录实际值；
 9. 同一 seed 的 D0/P0/P1 必须读取同一个 trace 文件，结果 metadata 中 trace SHA256 必须完全一致；
-10. 当前机器没有可用 NVIDIA 驱动且本次未执行测试，因此以下命令只是四卡机的开跑模板，不是
-    已验证结果。第一次四卡 gate 通过后再批量跑 5 seeds。
+10. 用带30ms同步`release()`的假backend验证`release_tail_ms`增长而TPOT不变；32-token与
+    128-token跨负载解释必须同时报告ITL、decode batch size和release tail；
+11. 用阻塞long-PD和可立即完成short-D的并发测试验证两者使用独立executor；1P+3D下short不能
+    因单个long占用P worker而等待同一个host prefill线程；
+12. open-loop正式结果要求`client_queue_ms p99`接近0。若使用线程客户端，concurrency必须覆盖
+    最大在途请求；否则改用异步提交，不能把线程池排队隐藏在TTFT之外；
+13. 当前机器没有可用 NVIDIA 驱动且本次未执行四卡性能测试，因此以下命令只是四卡机的开跑模板，
+    不是已验证结果。第一次四卡gate通过后再批量跑5 seeds。
 
 ---
 
@@ -501,10 +519,13 @@ HydraServe 的主张应表述为：相对成熟 4×DP 引擎，绝对吞吐可�
 2. 每个正式点 5 个 seed，实验顺序随机化，组间清理进程并确认显存释放；
 3. 报告 5 次 run-level 中位数、范围和 bootstrap 95% CI；
 4. P99 必须同时报告样本数，长请求只有 8 条时以 max/P95 为主，不夸大 P99；
-5. 总吞吐按相同完整输出 token 数比较；任何 EOS、失败、超时单列；
+5. 总吞吐只在相同完整输出 token 数且`throughput_valid=true`时比较；不同32/128-token负载不得
+   直接横比output tok/s，任何EOS、失败、超时都使该轮headline吞吐无效；
 6. 冷启动、稳态、cache cold、cache warm 分开；
 7. 不跨机器比较绝对值；vLLM/SGLang 与 HydraServe 必须同机交错运行；
 8. 原始 JSON、trace、环境 manifest、worker log 和绘图脚本全部归档。
+9. 主SLO使用`e2e_ttft_ms`和不含release的`tpot_ms`；`ttft_ms`、`client_queue_ms`、
+   `release_tail_ms`作为归因项同时报告。
 
 ---
 

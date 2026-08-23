@@ -83,7 +83,9 @@ class PDClusterConfig:
             "decode_devices",
             tuple(_normalize_device(device) for device in self.decode_devices),
         )
-        object.__setattr__(self, "prefill_device", _normalize_device(self.prefill_device))
+        object.__setattr__(
+            self, "prefill_device", _normalize_device(self.prefill_device)
+        )
         if self.prefill_devices:
             object.__setattr__(
                 self,
@@ -98,19 +100,22 @@ class PDClusterConfig:
             raise ValueError("prefill devices must be unique")
         if set(self.prefill_devices) & set(self.decode_devices):
             raise ValueError("prefill and decode devices must be distinct")
-        if min(
-            self.cache_tokens_per_worker,
-            self.block_size,
-            self.max_state_slots_per_worker,
-            self.max_decode_batch_size_per_worker,
-            self.prefill_chunk_size,
-            self.prefix_cache_min_frequency,
-            self.transfer_target_bytes,
-            self.max_inflight_transfer_chunks,
-            self.shm_ring_slots,
-            self.shm_ring_slot_bytes,
-            self.prefill_preempt_max_ops,
-        ) <= 0:
+        if (
+            min(
+                self.cache_tokens_per_worker,
+                self.block_size,
+                self.max_state_slots_per_worker,
+                self.max_decode_batch_size_per_worker,
+                self.prefill_chunk_size,
+                self.prefix_cache_min_frequency,
+                self.transfer_target_bytes,
+                self.max_inflight_transfer_chunks,
+                self.shm_ring_slots,
+                self.shm_ring_slot_bytes,
+                self.prefill_preempt_max_ops,
+            )
+            <= 0
+        ):
             raise ValueError("cluster resource limits must be positive")
         if self.prefix_cache_blocks < 0:
             raise ValueError("prefix cache blocks cannot be negative")
@@ -134,9 +139,7 @@ class PDClusterConfig:
         if self.conditional_pd_tokens < 0:
             raise ValueError("conditional PD threshold cannot be negative")
         if self.prefill_short_policy not in {"never", "work-conserving"}:
-            raise ValueError(
-                "prefill_short_policy must be never or work-conserving"
-            )
+            raise ValueError("prefill_short_policy must be never or work-conserving")
 
     def worker_config(self, worker_index: int) -> PDWorkerConfig:
         return PDWorkerConfig(
@@ -235,8 +238,29 @@ class MultiWorkerGenerationBackend:
 
     @property
     def prefill_parallelism(self) -> int:
-        """Concurrent prefill slots the serving loop may drive in parallel."""
-        return len(self.config.prefill_devices)
+        """Legacy aggregate concurrency for serving-loop compatibility."""
+        return len(self.config.prefill_devices) + len(self.config.decode_devices)
+
+    @property
+    def prefill_executor_limits(self) -> dict[str, int]:
+        """Independent host slots for P-prefill and D-collocated prefill.
+
+        A 1P+3D conditional deployment must not collapse all prefill calls into
+        one host executor merely because it owns one dedicated P worker.
+        Worker-local RPC locks remain the physical-GPU serialization boundary.
+        """
+        return {
+            "prefill": len(self.config.prefill_devices),
+            "decode": len(self.config.decode_devices),
+        }
+
+    def prefill_executor_group(self, request: ServingRequest) -> str:
+        """Return the physical worker pool used by an admitted request."""
+        if request.request_id in self._prefill_bound:
+            return "prefill"
+        if request.route == Route.PD_DISAGGREGATED.value:
+            return "prefill"
+        return "decode"
 
     def __init__(
         self,
@@ -288,12 +312,10 @@ class MultiWorkerGenerationBackend:
         self._decode_responses = [self._context.Queue() for _ in range(worker_count)]
         self._decode_locks = [Lock() for _ in range(worker_count)]
         self._decode_processes = [
-            self._new_decode_process(index)
-            for index in range(worker_count)
+            self._new_decode_process(index) for index in range(worker_count)
         ]
         self._prefill_processes = [
-            self._new_prefill_process(index)
-            for index in range(prefill_count)
+            self._new_prefill_process(index) for index in range(prefill_count)
         ]
         total_blocks = (
             config.cache_tokens_per_worker + config.block_size - 1
@@ -400,12 +422,9 @@ class MultiWorkerGenerationBackend:
         # idle prefill worker (using its otherwise-idle decode-phase compute)
         # instead of a decode worker. Long requests always stay on the PD path.
         force_pd = int(
-            getattr(getattr(self.router, "config", None), "force_pd_tokens", 0)
-            or 0
+            getattr(getattr(self.router, "config", None), "force_pd_tokens", 0) or 0
         )
-        short_cutoff = int(
-            getattr(self.config, "conditional_pd_tokens", 0) or force_pd
-        )
+        short_cutoff = int(getattr(self.config, "conditional_pd_tokens", 0) or force_pd)
         if (
             getattr(self.config, "prefill_short_policy", "work-conserving")
             == "work-conserving"
@@ -469,9 +488,7 @@ class MultiWorkerGenerationBackend:
             self.registry.bind(request.request_id, candidate.worker_id)
             request.worker_id = candidate.worker_id
             with self._state_lock:
-                conditional_pd_tokens = getattr(
-                    self.config, "conditional_pd_tokens", 0
-                )
+                conditional_pd_tokens = getattr(self.config, "conditional_pd_tokens", 0)
                 if conditional_pd_tokens and not prefill_available:
                     decision = RouteDecision(
                         Route.COLLOCATED,
@@ -527,9 +544,7 @@ class MultiWorkerGenerationBackend:
                 request.route_cost_confidence = decision.cost_model_confidence
                 request.route_decode_load = decision.decode_load
                 request.route_prefill_load = decision.prefill_load
-                request.route_prefill_queue_ahead_ms = (
-                    decision.prefill_queue_ahead_ms
-                )
+                request.route_prefill_queue_ahead_ms = decision.prefill_queue_ahead_ms
             return AdmissionDecision.accept()
         return AdmissionDecision.defer(
             last_retryable or "all decode workers rejected the reservation"
@@ -578,7 +593,9 @@ class MultiWorkerGenerationBackend:
             with self._state_lock:
                 self._collocated_count += 1
             sample = result.get("sample")
-            return sample if isinstance(sample, TokenSample) else int(result["token_id"])
+            return (
+                sample if isinstance(sample, TokenSample) else int(result["token_id"])
+            )
         worker_id = self.registry.worker_for(request.request_id)
         decision = self.route_for(request.request_id)
         if decision.route is Route.COLLOCATED:
@@ -789,7 +806,9 @@ class MultiWorkerGenerationBackend:
     def is_recoverable_decode_error(
         self, request_id: int, error: BaseException
     ) -> bool:
-        if isinstance(error, (TimeoutError, WorkerUnavailableError, WorkerStateLostError)):
+        if isinstance(
+            error, (TimeoutError, WorkerUnavailableError, WorkerStateLostError)
+        ):
             return True
         with self._state_lock:
             return request_id in self._lost_requests
@@ -837,15 +856,15 @@ class MultiWorkerGenerationBackend:
         return BackendCapacity(
             kv_total_blocks=sum(item.capacity.kv_total_blocks for item in snapshots),
             kv_free_blocks=sum(item.capacity.kv_free_blocks for item in snapshots),
-            state_total_slots=sum(item.capacity.state_total_slots for item in snapshots),
+            state_total_slots=sum(
+                item.capacity.state_total_slots for item in snapshots
+            ),
             state_free_slots=sum(item.capacity.state_free_slots for item in snapshots),
         )
 
     def cache_stats(self) -> dict[str, int | float]:
         with self._state_lock:
-            keys = {
-                key for worker in self._worker_cache_stats for key in worker
-            }
+            keys = {key for worker in self._worker_cache_stats for key in worker}
             return {
                 key: sum(
                     float(worker.get(key, 0)) for worker in self._worker_cache_stats
@@ -942,9 +961,7 @@ class MultiWorkerGenerationBackend:
             self._bootstrap_server = None
         self._pd_executor.shutdown(wait=not force, cancel_futures=force)
 
-    def _reserve_on(
-        self, worker_id: int, request: ServingRequest
-    ) -> AdmissionDecision:
+    def _reserve_on(self, worker_id: int, request: ServingRequest) -> AdmissionDecision:
         result = self._decode_rpc(
             worker_id,
             self._request_command("reserve", request),
@@ -953,8 +970,8 @@ class MultiWorkerGenerationBackend:
         )
         if result.get("admitted"):
             with self._state_lock:
-                self._reserved_blocks[worker_id][request.request_id] = self._required_blocks(
-                    request
+                self._reserved_blocks[worker_id][request.request_id] = (
+                    self._required_blocks(request)
                 )
                 getattr(self, "_host_prefix_tokens", {})[request.request_id] = int(
                     result.get("host_prefix_tokens", 0)
@@ -1030,9 +1047,7 @@ class MultiWorkerGenerationBackend:
         """
         with self._state_lock:
             count = len(self._prefill_processes)
-            long_inflight = getattr(
-                self, "_prefill_long_inflight", [0] * count
-            )
+            long_inflight = getattr(self, "_prefill_long_inflight", [0] * count)
             idle = [
                 index
                 for index in range(count)
@@ -1053,9 +1068,7 @@ class MultiWorkerGenerationBackend:
         index = self._pick_prefill_worker()
         failure = None
         try:
-            result = self._prefill_rpc_call(
-                index, command, long_operation=True
-            )
+            result = self._prefill_rpc_call(index, command, long_operation=True)
         except (TimeoutError, WorkerUnavailableError) as exc:
             failure = exc
         if failure is not None:
@@ -1067,9 +1080,7 @@ class MultiWorkerGenerationBackend:
             raise failure
         self._check(result, "prefill", request_id)
         with self._state_lock:
-            self._prefill_chunk_preemptions += int(
-                result.get("chunk_preemptions", 0)
-            )
+            self._prefill_chunk_preemptions += int(result.get("chunk_preemptions", 0))
         return result
 
     def _prefill_serving_rpc(
@@ -1078,9 +1089,7 @@ class MultiWorkerGenerationBackend:
         """RPC for a prefill worker's collocated-serving operations (W4)."""
         failure = None
         try:
-            result = self._prefill_rpc_call(
-                index, command, long_operation=False
-            )
+            result = self._prefill_rpc_call(index, command, long_operation=False)
         except (TimeoutError, WorkerUnavailableError) as exc:
             failure = exc
         if failure is not None:
@@ -1125,9 +1134,7 @@ class MultiWorkerGenerationBackend:
         # response, so unrelated short RPCs remain concurrent.
         with self._prefill_locks[index]:
             if not self._prefill_processes[index].is_alive():
-                raise WorkerUnavailableError(
-                    f"prefill worker {index} is not running"
-                )
+                raise WorkerUnavailableError(f"prefill worker {index} is not running")
             with self._state_lock:
                 self._prefill_waiters[index][rpc_id] = waiter
                 self._prefill_pending[index] += 1
@@ -1177,7 +1184,10 @@ class MultiWorkerGenerationBackend:
                         target = self._prefill_waiters[index].get(response_id)
                         # Compatibility for unit-test queues and old workers:
                         # an untagged response is safe only with one waiter.
-                        if response_id is None and len(self._prefill_waiters[index]) == 1:
+                        if (
+                            response_id is None
+                            and len(self._prefill_waiters[index]) == 1
+                        ):
                             target = waiter
                     if target is not None:
                         target.put_nowait(response)
@@ -1186,9 +1196,7 @@ class MultiWorkerGenerationBackend:
         finally:
             with self._state_lock:
                 self._prefill_waiters[index].pop(rpc_id, None)
-                self._prefill_pending[index] = max(
-                    0, self._prefill_pending[index] - 1
-                )
+                self._prefill_pending[index] = max(0, self._prefill_pending[index] - 1)
                 if long_operation:
                     self._prefill_long_inflight[index] = max(
                         0, self._prefill_long_inflight[index] - 1
