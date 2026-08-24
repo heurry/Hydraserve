@@ -934,15 +934,22 @@ class QwenTextRuntime:
             logical_positions=logical_positions,
         )
         key_pages, value_pages = paged_cache.layer_cache(layer_index)
-        # FlashDecoding-style split-K decode attention is the default; set
-        # HYDRASERVE_PAGED_ATTENTION=reference to fall back to the original
-        # sequential kernel for A/B comparisons.
+        # Decode attention kernel selection:
+        #   HYDRASERVE_PAGED_ATTENTION=flash     -> flash_attn_with_kvcache
+        #   HYDRASERVE_PAGED_ATTENTION=reference -> original sequential scan
+        #   default                              -> FlashDecoding-style split-K
         import os
 
-        if (
-            os.environ.get("HYDRASERVE_PAGED_ATTENTION") == "reference"
-            or config.head_dim < 16
-        ):
+        paged_attn_mode = os.environ.get("HYDRASERVE_PAGED_ATTENTION", "splitk")
+        if paged_attn_mode == "flash" and self.use_flash_attention:
+            from hydraserve.kernels.flash_prefill import paged_flash_prefill
+
+            # query is [batch, 1, heads, head_dim]; kernel keeps the T axis.
+            attn = paged_flash_prefill(
+                query, key_pages, value_pages, table, lengths, causal=False
+            )  # [batch, 1, heads, head_dim]
+            attention = attn[:, 0]  # [batch, heads, head_dim]
+        elif paged_attn_mode == "reference" or config.head_dim < 16:
             attention = paged_attention(query[:, 0], key_pages, value_pages, table, lengths)
         else:
             attention = paged_attention_splitk(query[:, 0], key_pages, value_pages, table, lengths)
