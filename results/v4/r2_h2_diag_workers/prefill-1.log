@@ -1,0 +1,158 @@
+[hydraserve] stall diagnostics enabled: role=prefill:cuda:1 pid=39852 interval=90s
+Timeout (0:01:30)!
+Thread 0x00007f2660ccc640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f2661eff640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f26c2dde640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f286916d740 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/kernels/flash_prefill.py", line 82 in paged_flash_prefill
+  File "/root/autodl-tmp/Hydraserve/hydraserve/model/runtime.py", line 1152 in _full_attention
+  File "/root/autodl-tmp/Hydraserve/hydraserve/model/runtime.py", line 356 in _forward_transaction
+  File "/root/autodl-tmp/Hydraserve/hydraserve/model/runtime.py", line 317 in forward
+  File "/root/autodl-tmp/Hydraserve/hydraserve/model/runtime.py", line 399 in prefill
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 221 in process
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 591 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f2660ccc640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f2661eff640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f26c2dde640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f286916d740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 563 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f2660ccc640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f2661eff640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f26c2dde640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f286916d740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 563 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f2660ccc640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f2661eff640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f26c2dde640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f286916d740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 563 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f2660ccc640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f2661eff640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 81 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f26c2dde640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f286916d740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 563 in _prefill_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>

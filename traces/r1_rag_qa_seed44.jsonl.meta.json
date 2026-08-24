@@ -1,0 +1,7 @@
+{
+  "entries": 64,
+  "generation_seed": 44,
+  "path": "traces/r1_rag_qa_seed44.jsonl",
+  "tokenizer_revision": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "trace_sha256": "523d13156668ffd8d173c007a684ba28bb27799fa826a51ae9a9e945ebd0dd60"
+}

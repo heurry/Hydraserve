@@ -1,0 +1,157 @@
+[hydraserve] stall diagnostics enabled: role=decode:cuda:2 pid=39849 interval=90s
+Timeout (0:01:30)!
+Thread 0x00007f753feff640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/backend.py", line 316 in visit
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/backend.py", line 330 in _decode
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/shm_ring.py", line 183 in receive
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 242 in receive_kv_chunk
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 369 in receive_and_prepare
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1174 in prepare_in_background
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f75a4e34640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f7747122740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1039 in _decode_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f753feff640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 135 in _call
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 157 in consume
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 210 in begin_chunked_receive
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 365 in receive_and_prepare
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1174 in prepare_in_background
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f75a4e34640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f7747122740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1039 in _decode_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f753feff640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 135 in _call
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 157 in consume
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 210 in begin_chunked_receive
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 365 in receive_and_prepare
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1174 in prepare_in_background
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f75a4e34640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f7747122740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1039 in _decode_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f753feff640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 135 in _call
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 157 in consume
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 210 in begin_chunked_receive
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 365 in receive_and_prepare
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1174 in prepare_in_background
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f75a4e34640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f7747122740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1039 in _decode_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>
+Timeout (0:01:30)!
+Thread 0x00007f753feff640 (most recent call first):
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 135 in _call
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/bootstrap.py", line 157 in consume
+  File "/root/autodl-tmp/Hydraserve/hydraserve/transfer/pipeline.py", line 210 in begin_chunked_receive
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_worker.py", line 365 in receive_and_prepare
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1174 in prepare_in_background
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 58 in run
+  File "/root/miniconda3/lib/python3.10/concurrent/futures/thread.py", line 83 in _worker
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f75a4e34640 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/threading.py", line 320 in wait
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 231 in _feed
+  File "/root/miniconda3/lib/python3.10/threading.py", line 953 in run
+  File "/root/miniconda3/lib/python3.10/threading.py", line 1016 in _bootstrap_inner
+  File "/root/miniconda3/lib/python3.10/threading.py", line 973 in _bootstrap
+
+Thread 0x00007f7747122740 (most recent call first):
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 384 in _recv
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 419 in _recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/connection.py", line 221 in recv_bytes
+  File "/root/miniconda3/lib/python3.10/multiprocessing/queues.py", line 103 in get
+  File "/root/autodl-tmp/Hydraserve/hydraserve/engine/pd_service.py", line 1039 in _decode_worker
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 108 in run
+  File "/root/miniconda3/lib/python3.10/multiprocessing/process.py", line 314 in _bootstrap
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 129 in _main
+  File "/root/miniconda3/lib/python3.10/multiprocessing/spawn.py", line 116 in spawn_main
+  File "<string>", line 1 in <module>

@@ -1,0 +1,7 @@
+{
+  "entries": 60,
+  "generation_seed": 42,
+  "path": "traces/r2_doc_summary_seed42.jsonl",
+  "tokenizer_revision": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "trace_sha256": "804934ffcb080c9d3b8d0d560200d189be1129c295bf0e0af931eaed5e8fb3e8"
+}
