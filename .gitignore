@@ -9,3 +9,4 @@ dist/
 build/
 worker_logs/
 .claude/
+benchmark_output/v5/
