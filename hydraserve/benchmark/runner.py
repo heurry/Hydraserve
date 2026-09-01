@@ -75,7 +75,7 @@ class BenchmarkSummary:
     results: tuple[RequestMetrics, ...]
     # P0 additions (V3 plan): per-class metrics, SLO goodput, reproducibility.
     by_class: dict[str, dict[str, int | float]] = field(default_factory=dict)
-    slo: dict[str, int | float] = field(default_factory=dict)
+    slo: dict[str, Any] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     e2e_ttft_ms: dict[str, float] = field(default_factory=dict)
     itl_ms: dict[str, float] = field(default_factory=dict)
@@ -205,8 +205,23 @@ def _per_worker_stats(
     return dict(sorted(workers.items()))
 
 
-SLO_SHORT_TTFT_MS = 5000.0
-SLO_SHORT_TPOT_MS = 200.0
+@dataclass(frozen=True, slots=True)
+class SLOConfig:
+    """Service-level-objective thresholds (V5 plan section 4).
+
+    Defaults are the V5 service targets and are not meant to be tuned to a
+    particular run. TTFT thresholds are applied end-to-end: they compare
+    against ``e2e_ttft_ms`` (measured from the trace's intended arrival time,
+    including client executor queueing) when it is available.
+    """
+
+    short_ttft_ms: float = 1000.0
+    short_tpot_ms: float = 100.0
+    long_ttft_ms: float = 10_000.0
+    long_tpot_ms: float = 150.0
+    long_max_admission_wait_ms: float = 30_000.0
+    # A request whose admission wait exceeds this is reported as starved.
+    starvation_admission_wait_ms: float = 30_000.0
 
 
 def _by_class_stats(
@@ -258,44 +273,66 @@ def _count_errors(results: Iterable[RequestMetrics]) -> dict[str, int]:
     return counts
 
 
-def _slo_stats(
-    results: Iterable[RequestMetrics], wall_time: float
-) -> dict[str, int | float]:
-    """Short-request SLO goodput (P0.3, V3 plan).
+def _full_output_ok(result: RequestMetrics, target: int | None) -> bool:
+    """Whether a request produced its full intended output (V5 plan gate 5).
 
-    A short request meets SLO when: TTFT <= 5s, TPOT <= 200ms, it produced its
-    full target output token count, and it did not error. Goodput is the met
-    requests (and their output tokens) per wall-clock second.
+    V5 real mode runs ``ignore_eos=false``, so a legitimate early EOS must
+    count as a complete success instead of failing the ``completion_tokens >=
+    target`` check. Reaching ``target`` or hitting a normal ``stop`` both
+    qualify; only truncation/error paths are penalised.
     """
+    if result.error:
+        return False
+    if result.finish_reason == "stop":
+        return True
+    if target is None:
+        return True
+    return result.completion_tokens >= target
+
+
+def _class_slo_stats(
+    results: list[RequestMetrics],
+    klass: str,
+    *,
+    ttft_threshold_ms: float,
+    tpot_threshold_ms: float,
+    max_admission_wait_ms: float | None,
+    wall_time: float,
+) -> dict[str, int | float]:
+    """SLO goodput for one request class (V5 plan section 4/7).
+
+    A request meets SLO when it did not error, its end-to-end TTFT and TPOT are
+    within threshold, it produced its full output (target reached or normal
+    EOS), and -- when the class defines one -- its admission wait is bounded.
+    """
+    members = [result for result in results if result.klass == klass]
     met = 0
     met_tokens = 0
-    total_short = 0
-    ttft_ok = tpot_ok = full_ok = no_error = 0
-    for result in results:
-        if result.klass != "short":
-            continue
-        total_short += 1
+    ttft_ok = tpot_ok = full_ok = admission_ok = no_error = 0
+    for result in members:
         ok = True
         if result.error:
-            no_error += 0
             ok = False
         else:
             no_error += 1
         slo_ttft_ms = (
             result.e2e_ttft_ms if result.e2e_ttft_ms is not None else result.ttft_ms
         )
-        if slo_ttft_ms is not None and slo_ttft_ms <= SLO_SHORT_TTFT_MS:
+        if slo_ttft_ms is not None and slo_ttft_ms <= ttft_threshold_ms:
             ttft_ok += 1
         else:
             ok = False
-        if result.tpot_ms is not None and result.tpot_ms <= SLO_SHORT_TPOT_MS:
+        if result.tpot_ms is not None and result.tpot_ms <= tpot_threshold_ms:
             tpot_ok += 1
         else:
             ok = False
-        target = result.target_new_tokens
-        if target is not None and result.completion_tokens >= target:
-            full_ok += 1
-        elif target is None:
+        if max_admission_wait_ms is not None:
+            admission_ms = result.admission_wait_ms or 0.0
+            if admission_ms <= max_admission_wait_ms:
+                admission_ok += 1
+            else:
+                ok = False
+        if _full_output_ok(result, result.target_new_tokens):
             full_ok += 1
         else:
             ok = False
@@ -304,18 +341,121 @@ def _slo_stats(
             met_tokens += result.completion_tokens
     divisor = wall_time if wall_time > 0 else float("inf")
     return {
-        "short_requests": total_short,
+        "requests": len(members),
         "met_requests": met,
-        "met_rate": round(met / total_short, 4) if total_short else 0.0,
+        "met_rate": round(met / len(members), 4) if members else 0.0,
         "goodput_requests_s": round(met / divisor, 4),
         "goodput_tokens_s": round(met_tokens / divisor, 4),
         "ttft_ok": ttft_ok,
         "tpot_ok": tpot_ok,
         "full_output_ok": full_ok,
+        "admission_ok": admission_ok,
         "no_error": no_error,
-        "ttft_threshold_ms": SLO_SHORT_TTFT_MS,
-        "tpot_threshold_ms": SLO_SHORT_TPOT_MS,
+    }
+
+
+def _route_reason_counts(results: Iterable[RequestMetrics]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        reason = result.route_reason or "unknown"
+        counts[reason] = counts.get(reason, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def _admission_wait_percentiles(
+    results: Iterable[RequestMetrics],
+) -> dict[str, float]:
+    values = [
+        result.admission_wait_ms
+        for result in results
+        if result.admission_wait_ms is not None
+    ]
+    if not values:
+        return {}
+    percentiles = _percentiles(values)
+    percentiles["max"] = max(values)
+    return percentiles
+
+
+def _slo_stats(
+    results: Iterable[RequestMetrics],
+    wall_time: float,
+    slo: SLOConfig | None = None,
+) -> dict[str, int | float]:
+    """Per-class SLO goodput and V5 fairness/observability stats.
+
+    ``slo`` defaults to the V5 service targets. Short keys mirror the V3 flat
+    layout for backward compatibility; Long and fairness keys are V5 additions.
+    """
+    slo = slo or SLOConfig()
+    members = list(results)
+    short = _class_slo_stats(
+        members,
+        "short",
+        ttft_threshold_ms=slo.short_ttft_ms,
+        tpot_threshold_ms=slo.short_tpot_ms,
+        max_admission_wait_ms=None,
+        wall_time=wall_time,
+    )
+    long = _class_slo_stats(
+        members,
+        "long",
+        ttft_threshold_ms=slo.long_ttft_ms,
+        tpot_threshold_ms=slo.long_tpot_ms,
+        max_admission_wait_ms=slo.long_max_admission_wait_ms,
+        wall_time=wall_time,
+    )
+    reason_counts = _route_reason_counts(members)
+    # "Fallback" = a Long request that would have used the Hybrid prefill slot
+    # but was admitted to a D-bound worker instead because the Hybrid was
+    # saturated (queue overflow) or unavailable.
+    long_fallbacks = sum(
+        1
+        for result in members
+        if result.klass == "long"
+        and result.route_reason in {"hybrid_queue_overflow", "prefill_unavailable"}
+    )
+    starved = sum(
+        1
+        for result in members
+        if result.admission_wait_ms is not None
+        and result.admission_wait_ms > slo.starvation_admission_wait_ms
+    )
+    return {
+        # short (V3 flat layout, kept for backward compatibility).
+        "short_requests": short["requests"],
+        "met_requests": short["met_requests"],
+        "met_rate": short["met_rate"],
+        "goodput_requests_s": short["goodput_requests_s"],
+        "goodput_tokens_s": short["goodput_tokens_s"],
+        "ttft_ok": short["ttft_ok"],
+        "tpot_ok": short["tpot_ok"],
+        "full_output_ok": short["full_output_ok"],
+        "no_error": short["no_error"],
+        "ttft_threshold_ms": slo.short_ttft_ms,
+        "tpot_threshold_ms": slo.short_tpot_ms,
         "require_full_output": True,
+        # long (V5).
+        "long_requests": long["requests"],
+        "long_met_requests": long["met_requests"],
+        "long_met_rate": long["met_rate"],
+        "long_goodput_requests_s": long["goodput_requests_s"],
+        "long_goodput_tokens_s": long["goodput_tokens_s"],
+        "long_ttft_ok": long["ttft_ok"],
+        "long_tpot_ok": long["tpot_ok"],
+        "long_full_output_ok": long["full_output_ok"],
+        "long_admission_ok": long["admission_ok"],
+        "long_no_error": long["no_error"],
+        "long_ttft_threshold_ms": slo.long_ttft_ms,
+        "long_tpot_threshold_ms": slo.long_tpot_ms,
+        "long_max_admission_wait_ms": slo.long_max_admission_wait_ms,
+        # fairness / observability (V5).
+        "admission_wait_ms": _admission_wait_percentiles(members),
+        "route_reason_counts": reason_counts,
+        "overflow_count": reason_counts.get("hybrid_queue_overflow", 0),
+        "long_fallback_count": long_fallbacks,
+        "starved_requests": starved,
+        "starvation_admission_wait_ms": slo.starvation_admission_wait_ms,
     }
 
 
@@ -332,6 +472,7 @@ def run_benchmark(
     request_rate: float | None = None,
     arrival_pattern: str = "burst",
     seed: int = 0,
+    slo: SLOConfig | None = None,
 ) -> BenchmarkSummary:
     if max_new_tokens <= 0 or concurrency <= 0:
         raise ValueError("max_new_tokens and concurrency must be positive")
@@ -569,7 +710,7 @@ def run_benchmark(
         per_worker=_per_worker_stats(results),
         results=results,
         by_class=_by_class_stats(results, wall_time),
-        slo=_slo_stats(results, wall_time),
+        slo=_slo_stats(results, wall_time, slo=slo),
     )
 
 
@@ -646,6 +787,7 @@ def run_http_benchmark(
     arrival_pattern: str = "burst",
     seed: int = 0,
     timeout_s: float = 600.0,
+    slo: SLOConfig | None = None,
 ) -> BenchmarkSummary:
     """Benchmark a remote HydraServe endpoint (e.g. a load-aware DP proxy).
 
@@ -846,5 +988,5 @@ def run_http_benchmark(
         per_worker={},
         results=results,
         by_class=_by_class_stats(results, wall_time),
-        slo=_slo_stats(results, wall_time),
+        slo=_slo_stats(results, wall_time, slo=slo),
     )

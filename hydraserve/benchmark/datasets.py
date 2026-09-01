@@ -611,9 +611,13 @@ def write_trace(
     trace_path.parent.mkdir(parents=True, exist_ok=True)
     hasher = hashlib.sha256()
     written = 0
+    class_counts: dict[str, int] = {}
+    arrival_offsets: list[float] = []
     with trace_path.open("w", encoding="utf-8") as stream:
         for entry in entries:
             spec = entry if isinstance(entry, TraceSpec) else _parse_trace_record(entry, written)
+            class_counts[spec.klass] = class_counts.get(spec.klass, 0) + 1
+            arrival_offsets.append(spec.arrival_offset_ms)
             prompt = spec.prompt
             if prompt is None:
                 prompt = _random_prompt(
@@ -659,6 +663,10 @@ def write_trace(
             getattr(tokenizer, "revision", getattr(tokenizer, "model_max_length", ""))
         ),
         "generation_seed": seed,
+        "class_counts": class_counts,
+        "arrival_window_ms": (
+            [min(arrival_offsets), max(arrival_offsets)] if arrival_offsets else []
+        ),
     }
     meta_path = trace_path.with_suffix(trace_path.suffix + ".meta.json")
     meta_path.write_text(

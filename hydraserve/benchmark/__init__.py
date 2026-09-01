@@ -14,6 +14,7 @@ from hydraserve.benchmark.datasets import (
 from hydraserve.benchmark.runner import (
     BenchmarkSummary,
     RequestMetrics,
+    SLOConfig,
     run_benchmark,
     run_http_benchmark,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "write_trace",
     "BenchmarkSummary",
     "RequestMetrics",
+    "SLOConfig",
     "run_benchmark",
     "run_http_benchmark",
 ]

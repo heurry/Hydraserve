@@ -307,6 +307,30 @@ def main() -> int:
         "--arrival-pattern", choices=("burst", "fixed", "poisson"), default="burst"
     )
     benchmark_parser.add_argument("--seed", type=int, default=0)
+    benchmark_parser.add_argument(
+        "--slo-short-ttft-ms", type=float, default=1000.0, help="short e2e TTFT SLO (V5 default 1000ms)"
+    )
+    benchmark_parser.add_argument(
+        "--slo-short-tpot-ms", type=float, default=100.0, help="short TPOT SLO (V5 default 100ms)"
+    )
+    benchmark_parser.add_argument(
+        "--slo-long-ttft-ms", type=float, default=10000.0, help="long e2e TTFT SLO (V5 default 10s)"
+    )
+    benchmark_parser.add_argument(
+        "--slo-long-tpot-ms", type=float, default=150.0, help="long TPOT SLO (V5 default 150ms)"
+    )
+    benchmark_parser.add_argument(
+        "--slo-long-admission-wait-ms",
+        type=float,
+        default=30000.0,
+        help="long max admission wait SLO (V5 default 30s)",
+    )
+    benchmark_parser.add_argument(
+        "--slo-starvation-wait-ms",
+        type=float,
+        default=30000.0,
+        help="admission wait above which a request is reported as starved",
+    )
     benchmark_parser.add_argument("--device", default="cuda:0")
     benchmark_parser.add_argument("--decode-device", default="cuda:1")
     benchmark_parser.add_argument("--decode-devices", nargs="+")
@@ -679,6 +703,7 @@ def main() -> int:
         import json
 
         from hydraserve.benchmark import (
+            SLOConfig,
             SyntheticSpec,
             TraceSpec,
             iter_dataset,
@@ -722,6 +747,14 @@ def main() -> int:
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
         tokenizer = QwenTokenizer(args.model)
+        slo_config = SLOConfig(
+            short_ttft_ms=args.slo_short_ttft_ms,
+            short_tpot_ms=args.slo_short_tpot_ms,
+            long_ttft_ms=args.slo_long_ttft_ms,
+            long_tpot_ms=args.slo_long_tpot_ms,
+            long_max_admission_wait_ms=args.slo_long_admission_wait_ms,
+            starvation_admission_wait_ms=args.slo_starvation_wait_ms,
+        )
 
         if args.trace_out:
             if args.dataset.lower() != "synthetic":
@@ -901,6 +934,7 @@ def main() -> int:
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,
+                slo=slo_config,
             )
             summary = replace(summary, metadata=_collect_benchmark_metadata(args))
             output = json.dumps(summary.to_dict(), ensure_ascii=False, indent=2)
@@ -1119,6 +1153,7 @@ def main() -> int:
                 request_rate=args.request_rate,
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,
+                slo=slo_config,
             )
         finally:
             loop.close()
