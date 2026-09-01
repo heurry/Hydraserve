@@ -1,0 +1,15 @@
+{
+  "arrival_window_ms": [
+    0,
+    10000
+  ],
+  "class_counts": {
+    "long": 2,
+    "short": 2
+  },
+  "entries": 4,
+  "generation_seed": 42,
+  "path": "traces/v5/tiny_seed42.jsonl",
+  "tokenizer_revision": "5f9e4d4901a92b997e463c1f46055088b6cca5ca61a6522d1b9f64c4bb81cb42",
+  "trace_sha256": "b90b1a7959788fa8e779d9974c10254c8359fb32e6be9ae56923c8bee41f1203"
+}
