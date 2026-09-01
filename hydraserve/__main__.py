@@ -221,6 +221,13 @@ def main() -> int:
         help="KV tokens kept free on a decode-role hybrid P worker for a future "
         "long prefill (-1 reserves min(32K, half the cache); 0 disables)",
     )
+    serve_parser.add_argument(
+        "--hybrid-long-overflow-ms",
+        type=float,
+        default=5000.0,
+        help="wait this long for a busy Hybrid prefill slot before a Long request "
+        "falls back to collocated execution on a D-bound worker",
+    )
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
@@ -352,6 +359,13 @@ def main() -> int:
         default=-1,
         help="KV tokens kept free on a decode-role hybrid P worker for a future "
         "long prefill (-1 reserves min(32K, half the cache); 0 disables)",
+    )
+    benchmark_parser.add_argument(
+        "--hybrid-long-overflow-ms",
+        type=float,
+        default=5000.0,
+        help="wait this long for a busy Hybrid prefill slot before a Long request "
+        "falls back to collocated execution on a D-bound worker",
     )
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
@@ -519,6 +533,7 @@ def main() -> int:
                     prefill_short_policy=args.prefill_short_policy,
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                     hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
+                    hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
                 ),
                 router=router,
             )
@@ -976,6 +991,7 @@ def main() -> int:
                     prefill_short_policy=args.prefill_short_policy,
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                     hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
+                    hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
                 ),
                 router=router,
             )

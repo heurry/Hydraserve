@@ -148,8 +148,10 @@ def test_cluster_config_validates_conditional_and_prefill_short_policies() -> No
         conditional_pd_tokens=8192,
         prefill_short_policy="never",
         prefill_preempt_max_ops=4,
+        hybrid_long_overflow_ms=250.0,
     )
     assert config.conditional_pd_tokens == 8192
+    assert config.hybrid_long_overflow_ms == 250.0
     assert config.prefill_config(0).prefill_preempt_max_ops == 4
     with pytest.raises(ValueError, match="prefill_short_policy"):
         PDClusterConfig("model", ("cuda:1",), prefill_short_policy="always")
@@ -210,11 +212,52 @@ def test_long_prefill_pending_temporarily_removes_hybrid_from_short_pool() -> No
     short = ServingRequest(901, (1, 2, 3, 4), 2)
     assert backend.admit(short).admitted
     assert short.worker_pool == "decode"
+    assert short.route_reason == "conditional_short_collocated"
     assert not any(call[0] == "prefill_serve" for call in backend.rpc_calls)
 
     backend._release_long_prefill_binding(900)
     assert backend.hybrid_role_states == ("decode",)
     assert backend.capacity() == BackendCapacity(30, 30, 12, 12)
+
+
+def test_second_conditional_long_falls_back_when_hybrid_slot_is_busy() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    backend.config.hybrid_long_overflow_ms = 0
+    backend._bind_long_prefill(900)
+    request = ServingRequest(902, tuple(range(8)), 2)
+
+    assert backend.prefill_executor_group_hint(request) == "decode"
+    assert backend.admit(request).admitted
+    assert request.route == "collocated"
+    assert request.route_reason == "hybrid_queue_overflow"
+    assert request.worker_pool == "decode"
+
+
+def test_busy_hybrid_keeps_long_in_prefill_queue_until_overflow_grace_expires() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    backend.config.hybrid_long_overflow_ms = 500
+    backend._bind_long_prefill(900)
+    for worker_id in range(2):
+        backend.registry.update_capacity(worker_id, BackendCapacity(10, 9, 4, 3))
+    request = ServingRequest(903, tuple(range(8)), 2)
+
+    assert backend.prefill_executor_group_hint(request) == "prefill"
+    request.submitted_at -= 1.0
+    assert backend.prefill_executor_group_hint(request) == "decode"
+
+
+def test_busy_hybrid_immediately_overflows_to_an_idle_decode_worker() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.hybrid_long_overflow_ms = 5000
+    backend._bind_long_prefill(900)
+    request = ServingRequest(904, tuple(range(8)), 2)
+
+    assert backend.prefill_executor_group_hint(request) == "decode"
 
 
 def test_long_prefill_role_returns_to_decode_after_rpc() -> None:
@@ -320,6 +363,75 @@ def test_prefill_rpc_multiplexes_out_of_order_short_response() -> None:
     assert not long_thread.is_alive()
     assert results["short"]["token_ids"] == (7,)
     assert results["long"]["token_id"] == 9
+
+
+def test_decode_rpc_does_not_hold_worker_lock_while_prepare_is_inflight() -> None:
+    class AliveProcess:
+        @staticmethod
+        def is_alive():
+            return True
+
+    backend = FakeMultiWorkerBackend()
+    backend.operation_timeout = 2.0
+    backend._decode_processes = [AliveProcess(), AliveProcess()]
+    backend._decode_locks = [Lock(), Lock()]
+    backend._decode_commands = [Queue(), Queue()]
+    backend._decode_responses = [Queue(), Queue()]
+    results = {}
+
+    prepare_thread = Thread(
+        target=lambda: results.setdefault(
+            "prepare",
+            MultiWorkerGenerationBackend._decode_rpc(
+                backend,
+                0,
+                {"op": "prepare", "request_id": 1},
+                "prepare",
+                1,
+            ),
+        )
+    )
+    prepare_thread.start()
+    prepare_command = backend._decode_commands[0].get(timeout=1)
+
+    decode_thread = Thread(
+        target=lambda: results.setdefault(
+            "decode",
+            MultiWorkerGenerationBackend._decode_rpc(
+                backend,
+                0,
+                {"op": "decode", "request_ids": (2,)},
+                "decode",
+            ),
+        )
+    )
+    decode_thread.start()
+    decode_command = backend._decode_commands[0].get(timeout=1)
+
+    backend._decode_responses[0].put(
+        {
+            "rpc_id": decode_command["rpc_id"],
+            "op": "decode",
+            "request_ids": (2,),
+            "token_ids": (7,),
+        }
+    )
+    decode_thread.join(1)
+    assert not decode_thread.is_alive()
+    assert prepare_thread.is_alive()
+
+    backend._decode_responses[0].put(
+        {
+            "rpc_id": prepare_command["rpc_id"],
+            "op": "prepare",
+            "request_id": 1,
+            "token_id": 9,
+        }
+    )
+    prepare_thread.join(1)
+    assert not prepare_thread.is_alive()
+    assert results["decode"]["token_ids"] == (7,)
+    assert results["prepare"]["token_id"] == 9
 
 
 def test_pd_prefill_arms_decode_receiver_before_starting_producer() -> None:

@@ -8,7 +8,7 @@ import multiprocessing as mp
 import os
 from pathlib import Path
 from queue import Empty
-from threading import Event, Lock, RLock, Thread
+from threading import Event, Lock, RLock, Thread, local
 from time import monotonic
 from uuid import uuid4
 
@@ -103,9 +103,24 @@ class _CorrelatedResponseSink:
 
     def __init__(self, queue) -> None:
         self.queue = queue
-        self.rpc_id: int | None = None
+        self._context = local()
+        self._sequence_lock = Lock()
+        self.response_sequence = 0
+
+    @property
+    def rpc_id(self) -> int | None:
+        return getattr(self._context, "rpc_id", None)
+
+    @rpc_id.setter
+    def rpc_id(self, value: int | None) -> None:
+        self._context.rpc_id = value
 
     def put(self, payload: dict) -> None:
+        with self._sequence_lock:
+            self.response_sequence += 1
+            response_sequence = self.response_sequence
+        if "response_sequence" not in payload:
+            payload = {**payload, "response_sequence": response_sequence}
         if self.rpc_id is not None and "rpc_id" not in payload:
             payload = {**payload, "rpc_id": self.rpc_id}
         self.queue.put(payload)
@@ -349,6 +364,16 @@ def _prefill_worker(
                     break
                 operation = queued.get("op")
                 if operation not in PREEMPTIBLE_OPS:
+                    deferred.append(queued)
+                    continue
+                if (
+                    operation == "collocated_prepare"
+                    and len(queued.get("token_ids", ())) > config.prefill_chunk_size
+                ):
+                    # Only genuinely short prepares may interrupt a long
+                    # prefill.  Running another multi-chunk prompt recursively
+                    # would merely invert the queue and could starve the outer
+                    # request while consuming an additional state/KV reserve.
                     deferred.append(queued)
                     continue
                 previous_rpc_id = responses.rpc_id
@@ -707,6 +732,9 @@ def _prefill_worker(
                             chunk_size=config.prefill_chunk_size,
                             paged_cache=cache,
                             request_id=request_id,
+                            chunk_callback=lambda _start, _end, _state: (
+                                service_preemptible_short_ops()
+                            ),
                         )
                     cache.publish_prefix(request_id, request.token_ids)
                     sample = sample_logits(
@@ -875,6 +903,7 @@ def _decode_worker(
     from hydraserve.diagnostics import enable_stall_diagnostics
 
     enable_stall_diagnostics(f"decode:{config.decode_device}")
+    responses = _CorrelatedResponseSink(responses)
     backend = None
     prepare_executor = None
     try:
@@ -1035,9 +1064,96 @@ def _decode_worker(
         responses.put(
             {"op": "ready", "model_name": runtime.config.name, **capacity_payload()}
         )
+        # A D-bound worker may run a collocated short/overflow prefill while it
+        # already owns active decode requests.  Correlated parent RPCs can put
+        # those decode commands into this queue concurrently; service a bounded
+        # number at chunk boundaries so local prefill does not become a TPOT
+        # blackout.  Non-decode commands retain FIFO order after the prefill.
+        from collections import deque
+        from queue import Empty
+
+        deferred_commands = deque()
+
+        def execute_decode(queued: dict, *, chunk_preempted: bool = False) -> None:
+            request_ids = tuple(queued["request_ids"])
+            cache.block_manager.grow_many(request_ids, additional_tokens=1)
+            input_ids = torch.tensor(
+                [
+                    requests[request_id].generated_token_ids[-1]
+                    for request_id in request_ids
+                ],
+                device=runtime.input_device,
+                dtype=torch.long,
+            ).unsqueeze(1)
+            batch_states = [states[request_id] for request_id in request_ids]
+            with torch.inference_mode():
+                logits, _ = runtime.decode_batch(
+                    input_ids, batch_states, cache, request_ids
+                )
+            samples = sample_logits(
+                logits[:, -1],
+                (
+                    requests[request_id].token_ids
+                    + tuple(requests[request_id].generated_token_ids)
+                    for request_id in request_ids
+                ),
+                (requests[request_id].sampling_params for request_id in request_ids),
+                steps=(
+                    len(requests[request_id].generated_token_ids)
+                    for request_id in request_ids
+                ),
+            )
+            token_ids = tuple(sample.token_id for sample in samples)
+            for request_id, token_id in zip(request_ids, token_ids, strict=True):
+                requests[request_id].generated_token_ids.append(token_id)
+            responses.put(
+                {
+                    "op": "decode",
+                    "request_ids": request_ids,
+                    "token_ids": token_ids,
+                    "samples": samples,
+                    "chunk_preempted": chunk_preempted,
+                    **capacity_payload(),
+                }
+            )
+
+        def service_pending_decode() -> int:
+            serviced = 0
+            deferred = []
+            while serviced < config.prefill_preempt_max_ops:
+                try:
+                    queued = commands.get_nowait()
+                except Empty:
+                    break
+                if queued.get("op") != "decode":
+                    deferred.append(queued)
+                    continue
+                previous_rpc_id = responses.rpc_id
+                responses.rpc_id = queued.get("rpc_id")
+                try:
+                    execute_decode(queued, chunk_preempted=True)
+                except Exception as exc:
+                    responses.put(
+                        {
+                            "op": "error",
+                            "request_ids": queued.get("request_ids"),
+                            "message": repr(exc),
+                        }
+                    )
+                finally:
+                    responses.rpc_id = previous_rpc_id
+                serviced += 1
+            deferred_commands.extend(deferred)
+            return serviced
+
         while True:
-            command = commands.get()
+            command = (
+                deferred_commands.popleft()
+                if deferred_commands
+                else commands.get()
+            )
             operation = command["op"]
+            responses.rpc_id = command.get("rpc_id")
             if operation == "shutdown":
                 with state_lock:
                     live_ids = tuple(set(states) | reservations)
@@ -1169,7 +1285,9 @@ def _decode_worker(
                         request_id=request_id,
                         command=command,
                         host_lease=host_lease,
+                        rpc_id=command.get("rpc_id"),
                     ):
+                        responses.rpc_id = rpc_id
                         try:
                             prepared = worker.receive_and_prepare(
                                 request,
@@ -1211,6 +1329,7 @@ def _decode_worker(
                             lease = host_reservations.pop(request_id, None)
                             if lease is not None and host_cache is not None:
                                 host_cache.unpin(lease)
+                            responses.rpc_id = None
 
                     with state_lock:
                         preparing.add(request_id)
@@ -1245,6 +1364,9 @@ def _decode_worker(
                             chunk_size=config.prefill_chunk_size,
                             paged_cache=cache,
                             request_id=request_id,
+                            chunk_callback=lambda _start, _end, _state: (
+                                service_pending_decode()
+                            ),
                         )
                     cache.publish_prefix(request_id, request.token_ids)
                     sample = sample_logits(
@@ -1300,6 +1422,9 @@ def _decode_worker(
                             chunk_size=config.prefill_chunk_size,
                             paged_cache=cache,
                             request_id=request_id,
+                            chunk_callback=lambda _start, _end, _state: (
+                                service_pending_decode()
+                            ),
                         )
                     request = _request(
                         request_id,
@@ -1317,42 +1442,7 @@ def _decode_worker(
                         {"op": "recover", "request_id": request_id, **capacity_payload()}
                     )
                 elif operation == "decode":
-                    request_ids = tuple(command["request_ids"])
-                    cache.block_manager.grow_many(request_ids, additional_tokens=1)
-                    input_ids = torch.tensor(
-                        [requests[request_id].generated_token_ids[-1] for request_id in request_ids],
-                        device=runtime.input_device,
-                        dtype=torch.long,
-                    ).unsqueeze(1)
-                    batch_states = [states[request_id] for request_id in request_ids]
-                    with torch.inference_mode():
-                        logits, _ = runtime.decode_batch(
-                            input_ids, batch_states, cache, request_ids
-                        )
-                    samples = sample_logits(
-                        logits[:, -1],
-                        (
-                            requests[request_id].token_ids
-                            + tuple(requests[request_id].generated_token_ids)
-                            for request_id in request_ids
-                        ),
-                        (requests[request_id].sampling_params for request_id in request_ids),
-                        steps=(
-                            len(requests[request_id].generated_token_ids)
-                            for request_id in request_ids
-                        ),
-                    )
-                    token_ids = tuple(sample.token_id for sample in samples)
-                    for request_id, token_id in zip(request_ids, token_ids, strict=True):
-                        requests[request_id].generated_token_ids.append(token_id)
-                    responses.put(
-                        {
-                            "op": "decode",
-                            "request_ids": request_ids,
-                            "token_ids": token_ids,
-                            "samples": samples,
-                        }
-                    )
+                    execute_decode(command)
                 elif operation == "release":
                     request_id = command["request_id"]
                     with state_lock:

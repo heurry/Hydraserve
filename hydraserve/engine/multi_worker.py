@@ -84,6 +84,7 @@ class PDClusterConfig:
     prefill_short_policy: str = "work-conserving"
     prefill_preempt_max_ops: int = 8
     hybrid_prefill_reserve_tokens: int = -1
+    hybrid_long_overflow_ms: float = 5000.0
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
@@ -152,6 +153,8 @@ class PDClusterConfig:
             raise ValueError("prefill_short_policy must be never or work-conserving")
         if self.hybrid_prefill_reserve_tokens < -1:
             raise ValueError("hybrid prefill reserve tokens must be -1 or non-negative")
+        if self.hybrid_long_overflow_ms < 0:
+            raise ValueError("hybrid long overflow wait must be non-negative")
 
     @property
     def effective_hybrid_prefill_reserve_tokens(self) -> int:
@@ -333,7 +336,14 @@ class MultiWorkerGenerationBackend:
         if not self._prefill_available():
             return "decode"
         if len(request.token_ids) >= threshold:
-            return "prefill"
+            if self._hybrid_prefill_slot_available():
+                return "prefill"
+            return (
+                "decode"
+                if self._idle_decode_slot_available(request)
+                or self._long_overflow_ready(request)
+                else "prefill"
+            )
         if (
             conditional
             and getattr(self.config, "prefill_short_policy", "work-conserving")
@@ -391,6 +401,11 @@ class MultiWorkerGenerationBackend:
         self._decode_commands = [self._context.Queue() for _ in range(worker_count)]
         self._decode_responses = [self._context.Queue() for _ in range(worker_count)]
         self._decode_locks = [Lock() for _ in range(worker_count)]
+        self._decode_response_locks = [Lock() for _ in range(worker_count)]
+        self._decode_waiters: list[dict[int, Queue]] = [
+            {} for _ in range(worker_count)
+        ]
+        self._decode_rpc_ids = count(1)
         self._decode_processes = [
             self._new_decode_process(index) for index in range(worker_count)
         ]
@@ -430,6 +445,8 @@ class MultiWorkerGenerationBackend:
             )
             for _ in range(prefill_count)
         ]
+        self._decode_capacity_versions = [-1] * worker_count
+        self._prefill_capacity_versions = [-1] * prefill_count
         self._worker_cache_stats: list[dict[str, int | float]] = [
             {} for _ in range(worker_count)
         ]
@@ -600,7 +617,11 @@ class MultiWorkerGenerationBackend:
 
         candidates = self._order_candidates(candidates)
         last_retryable = None
-        prefill_available = self._prefill_available()
+        # Health alone is insufficient: a healthy Hybrid already bound to a
+        # Long request has no second physical prefill slot.  Treat it as
+        # unavailable so another Long can fall back to collocated execution
+        # instead of waiting behind the same H worker indefinitely.
+        prefill_available = self._hybrid_prefill_slot_available()
         for candidate in candidates:
             try:
                 admitted = self._reserve_on(candidate.worker_id, request)
@@ -617,27 +638,31 @@ class MultiWorkerGenerationBackend:
             request.worker_pool = "decode"
             with self._state_lock:
                 conditional_pd_tokens = getattr(self.config, "conditional_pd_tokens", 0)
-                if conditional_pd_tokens and not prefill_available:
-                    decision = RouteDecision(
-                        Route.COLLOCATED,
-                        RouteReason.PREFILL_UNAVAILABLE,
-                        len(request.token_ids),
-                        candidate.decode_load,
-                        True,
-                    )
-                elif conditional_pd_tokens:
-                    if len(request.token_ids) >= conditional_pd_tokens:
+                if conditional_pd_tokens:
+                    if len(request.token_ids) < conditional_pd_tokens:
                         decision = RouteDecision(
-                            Route.PD_DISAGGREGATED,
-                            RouteReason.CONDITIONAL_LONG_PD,
+                            Route.COLLOCATED,
+                            RouteReason.CONDITIONAL_SHORT_COLLOCATED,
+                            len(request.token_ids),
+                            candidate.decode_load,
+                            True,
+                        )
+                    elif not prefill_available:
+                        decision = RouteDecision(
+                            Route.COLLOCATED,
+                            (
+                                RouteReason.HYBRID_QUEUE_OVERFLOW
+                                if self._prefill_available()
+                                else RouteReason.PREFILL_UNAVAILABLE
+                            ),
                             len(request.token_ids),
                             candidate.decode_load,
                             True,
                         )
                     else:
                         decision = RouteDecision(
-                            Route.COLLOCATED,
-                            RouteReason.CONDITIONAL_SHORT_COLLOCATED,
+                            Route.PD_DISAGGREGATED,
+                            RouteReason.CONDITIONAL_LONG_PD,
                             len(request.token_ids),
                             candidate.decode_load,
                             True,
@@ -1211,19 +1236,75 @@ class MultiWorkerGenerationBackend:
         *,
         dispatched: Event | None = None,
     ) -> dict:
+        self._ensure_decode_rpc_state()
+        rpc_id = next(self._decode_rpc_ids)
+        waiter: Queue = Queue(maxsize=1)
         failure = None
-        with self._decode_locks[worker_id]:
-            try:
+        try:
+            # Protect process replacement and queue handoff only.  Waiting for
+            # a background prepare must not prevent decode/release commands
+            # from reaching the same D worker.
+            with self._decode_locks[worker_id]:
                 if not self._decode_processes[worker_id].is_alive():
                     raise WorkerUnavailableError(
                         f"decode worker {worker_id} is not running"
                     )
-                self._decode_commands[worker_id].put(command)
+                with self._state_lock:
+                    self._decode_waiters[worker_id][rpc_id] = waiter
+                try:
+                    self._decode_commands[worker_id].put(
+                        {**command, "rpc_id": rpc_id}
+                    )
+                except Exception:
+                    with self._state_lock:
+                        self._decode_waiters[worker_id].pop(rpc_id, None)
+                    raise
                 if dispatched is not None:
                     dispatched.set()
-                result = self._get_decode_response(worker_id, self.operation_timeout)
-            except (TimeoutError, WorkerUnavailableError) as exc:
-                failure = exc
+
+            deadline = monotonic() + self.operation_timeout
+            while True:
+                try:
+                    result = waiter.get_nowait()
+                    break
+                except Empty:
+                    pass
+                if not self._decode_processes[worker_id].is_alive():
+                    raise WorkerUnavailableError(
+                        f"decode worker {worker_id} exited during RPC"
+                    )
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for decode worker")
+                acquired = self._decode_response_locks[worker_id].acquire(
+                    timeout=min(0.05, remaining)
+                )
+                if not acquired:
+                    continue
+                try:
+                    try:
+                        response = self._decode_responses[worker_id].get(
+                            timeout=min(0.05, remaining)
+                        )
+                    except Empty:
+                        continue
+                    response_id = response.get("rpc_id")
+                    with self._state_lock:
+                        target = self._decode_waiters[worker_id].get(response_id)
+                        if (
+                            response_id is None
+                            and len(self._decode_waiters[worker_id]) == 1
+                        ):
+                            target = waiter
+                    if target is not None:
+                        target.put_nowait(response)
+                finally:
+                    self._decode_response_locks[worker_id].release()
+        except (TimeoutError, WorkerUnavailableError) as exc:
+            failure = exc
+        finally:
+            with self._state_lock:
+                self._decode_waiters[worker_id].pop(rpc_id, None)
         if failure is not None:
             self._invalidate_worker(worker_id)
             self._schedule_decode_recovery(worker_id)
@@ -1231,6 +1312,17 @@ class MultiWorkerGenerationBackend:
         self._check(result, expected_op, request_id)
         self._update_worker_capacity(worker_id, result)
         return result
+
+    def _ensure_decode_rpc_state(self) -> None:
+        """Initialize correlated D-worker RPC state for old test doubles."""
+
+        count_workers = len(self._decode_processes)
+        if not hasattr(self, "_decode_response_locks"):
+            self._decode_response_locks = [Lock() for _ in range(count_workers)]
+        if not hasattr(self, "_decode_waiters"):
+            self._decode_waiters = [{} for _ in range(count_workers)]
+        if not hasattr(self, "_decode_rpc_ids"):
+            self._decode_rpc_ids = count(1)
 
     def _pick_prefill_worker(self) -> int:
         with self._state_lock:
@@ -1335,7 +1427,16 @@ class MultiWorkerGenerationBackend:
         )
         with self._state_lock:
             self._ensure_hybrid_state()
+            if not hasattr(self, "_prefill_capacity_versions"):
+                self._prefill_capacity_versions = [-1] * len(
+                    self._prefill_processes
+                )
+            version = int(result.get("response_sequence", -1))
+            if version >= 0 and version < self._prefill_capacity_versions[index]:
+                return
             self._prefill_capacities[index] = capacity
+            if version >= 0:
+                self._prefill_capacity_versions[index] = version
 
     def _bind_long_prefill(self, request_id: int) -> int:
         """Move one hybrid worker to PENDING before async prefill dispatch."""
@@ -1346,7 +1447,9 @@ class MultiWorkerGenerationBackend:
             if existing is not None:
                 return existing
             candidates = [
-                index for index, healthy in enumerate(self._prefill_healthy) if healthy
+                index
+                for index, healthy in enumerate(self._prefill_healthy)
+                if healthy and self._hybrid_roles[index] is HybridRole.DECODE
             ]
             if not candidates:
                 raise WorkerUnavailableError("no healthy hybrid prefill worker")
@@ -1364,6 +1467,46 @@ class MultiWorkerGenerationBackend:
             self._long_prefill_bound[request_id] = index
             self._hybrid_roles[index] = HybridRole.PREFILL_PENDING
             return index
+
+    def _hybrid_prefill_slot_available(self) -> bool:
+        """Return whether a healthy Hybrid can accept a new Long now.
+
+        Existing short requests bound to a decode-role Hybrid may continue and
+        are serviced at chunk boundaries.  A Hybrid already PENDING/ACTIVE for
+        another Long is not counted as another queue slot.
+        """
+
+        if not self._prefill_available():
+            return False
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            return any(
+                healthy and role is HybridRole.DECODE
+                for healthy, role in zip(
+                    self._prefill_healthy, self._hybrid_roles, strict=True
+                )
+            )
+
+    def _long_overflow_ready(self, request: ServingRequest) -> bool:
+        """Allow D-side fallback only after the Hybrid queue grace period."""
+
+        wait_ms = max(
+            0.0,
+            float(getattr(self.config, "hybrid_long_overflow_ms", 5000.0)),
+        )
+        return (monotonic() - request.submitted_at) * 1000.0 >= wait_ms
+
+    def _idle_decode_slot_available(self, request: ServingRequest) -> bool:
+        """Prefer immediate overflow only when it consumes an actually idle D."""
+
+        required_blocks = self._required_blocks(request)
+        return any(
+            worker.healthy
+            and worker.capacity.decode_load == 0.0
+            and worker.capacity.kv_free_blocks >= required_blocks
+            and worker.capacity.state_free_slots > 0
+            for worker in self.registry.snapshots()
+        )
 
     def _release_long_prefill_binding(self, request_id: int) -> None:
         with self._state_lock:
@@ -1853,6 +1996,14 @@ class MultiWorkerGenerationBackend:
             "state_total_slots",
             "state_free_slots",
         )
+        version = int(result.get("response_sequence", -1))
+        with self._state_lock:
+            if not hasattr(self, "_decode_capacity_versions"):
+                self._decode_capacity_versions = [-1] * len(self._decode_processes)
+            if version >= 0 and version < self._decode_capacity_versions[worker_id]:
+                return
+            if version >= 0:
+                self._decode_capacity_versions[worker_id] = version
         if all(key in result for key in keys):
             self.registry.update_capacity(
                 worker_id,

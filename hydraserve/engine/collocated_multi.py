@@ -15,9 +15,11 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from itertools import count
 import multiprocessing as mp
+import os
 from pathlib import Path
-from queue import Empty
+from queue import Empty, Queue
 from threading import Lock, RLock
 from time import monotonic
 from typing import Callable
@@ -108,6 +110,22 @@ class MultiGPUCollocatedBackend:
     supports_async_prefill = True
 
     @property
+    def supports_independent_decode(self) -> bool:
+        """Allow each physical DP worker to advance without a global barrier."""
+
+        return True
+
+    @property
+    def decode_executor_parallelism(self) -> int:
+        return len(self.config.devices)
+
+    def decode_executor_group(self, request: ServingRequest) -> tuple[str, int]:
+        """Return the immutable physical owner of a request's decode state."""
+
+        with self._state_lock:
+            return ("collocated", self._bound[request.request_id])
+
+    @property
     def release_parallelism(self) -> int:
         return len(self.config.devices)
 
@@ -115,6 +133,50 @@ class MultiGPUCollocatedBackend:
     def prefill_parallelism(self) -> int:
         """Concurrent prefill slots = worker count (each worker collocates)."""
         return len(self.config.devices)
+
+    @property
+    def prefill_executor_limits(self) -> dict[str, int]:
+        """Expose one running and one chunk-preemptible prefill per worker.
+
+        A physical GPU still executes only one kernel stream at a time.  The
+        second host slot exists so a short collocated prepare can reach the
+        worker command queue while a long prefill is running; the worker then
+        services it at the next chunk boundary.  Deeper host queues would only
+        reserve KV early and increase recursive/queueing pressure.
+        """
+
+        try:
+            queue_depth = min(
+                2,
+                max(
+                    1,
+                    int(os.environ.get("HYDRASERVE_DP_PREFILL_QUEUE_DEPTH", "2")),
+                ),
+            )
+        except ValueError:
+            queue_depth = 2
+        return {
+            self._prefill_group(index): queue_depth
+            for index in range(len(self.config.devices))
+        }
+
+    @staticmethod
+    def _prefill_group(index: int) -> str:
+        return f"collocated:{index}"
+
+    def prefill_executor_group(self, request: ServingRequest) -> str:
+        """Return the immutable worker selected during admission."""
+
+        with self._state_lock:
+            return self._prefill_group(self._bound[request.request_id])
+
+    def prefill_executor_group_hint(self, request: ServingRequest) -> str | None:
+        """Predict the least-loaded worker before admission without claiming it."""
+
+        try:
+            return self._prefill_group(self._select_worker(request, claim=False))
+        except LookupError:
+            return None
 
     def prefill_admission_tokens(self, request: ServingRequest) -> int:
         """Charge one executable chunk, not the request's full prompt."""
@@ -149,7 +211,15 @@ class MultiGPUCollocatedBackend:
             Path(config.worker_log_dir).mkdir(parents=True, exist_ok=True)
         self._commands = [self._context.Queue() for _ in range(worker_count)]
         self._responses = [self._context.Queue() for _ in range(worker_count)]
+        # Command locks cover only process/queue handoff. Responses are routed
+        # by rpc_id so callers waiting on one worker do not serialize behind a
+        # lock for the full duration of a GPU operation.
         self._locks = [Lock() for _ in range(worker_count)]
+        self._response_locks = [Lock() for _ in range(worker_count)]
+        self._waiters: list[dict[int, Queue]] = [
+            {} for _ in range(worker_count)
+        ]
+        self._rpc_ids = count(1)
         self._processes = [
             self._context.Process(
                 target=_prefill_worker,
@@ -170,9 +240,17 @@ class MultiGPUCollocatedBackend:
         # depth alone drops back to zero after prefill and makes burst traffic
         # repeatedly choose worker 0.
         self._assigned = [0] * worker_count
+        # Request count alone treats a 2K/128 request like an 8K/500 request.
+        # Keep simple token-weighted work and outstanding-prefill counters so
+        # admission can avoid workers that are about to run expensive prompt
+        # work. These are routing estimates, not device-capacity accounting.
+        self._assigned_work = [0] * worker_count
+        self._prefill_tokens = [0] * worker_count
+        self._request_loads: dict[int, tuple[int, int]] = {}
         self._healthy = [True] * worker_count
         self._bound: dict[int, int] = {}
         self._capacity: list[BackendCapacity | None] = [None] * worker_count
+        self._capacity_versions = [-1] * worker_count
         self._state_lock = RLock()
         self._closed = False
         self._round_robin = 0
@@ -209,42 +287,158 @@ class MultiGPUCollocatedBackend:
     def _update_capacity(self, index: int, result: dict) -> None:
         payload = result.get("capacity")
         if not isinstance(payload, dict):
-            return
-        self._capacity[index] = BackendCapacity(
+            # ``_prefill_worker`` returns capacity fields at the top level.
+            # Older/test workers may wrap them in ``capacity``; accept both.
+            required = {
+                "kv_total_blocks",
+                "kv_free_blocks",
+                "state_total_slots",
+                "state_free_slots",
+            }
+            if not required.issubset(result):
+                return
+            payload = result
+        capacity = BackendCapacity(
             kv_total_blocks=int(payload.get("kv_total_blocks", 0)),
             kv_free_blocks=int(payload.get("kv_free_blocks", 0)),
             state_total_slots=int(payload.get("state_total_slots", 0)),
             state_free_slots=int(payload.get("state_free_slots", 0)),
         )
+        with self._state_lock:
+            version = int(result.get("response_sequence", -1))
+            if version >= 0 and version < self._capacity_versions[index]:
+                return
+            self._capacity[index] = capacity
+            if version >= 0:
+                self._capacity_versions[index] = version
 
-    def _pick_worker(self) -> int:
-        """Reserve the least-loaded healthy worker, round-robin on ties."""
+    def _required_blocks(self, request: ServingRequest) -> int:
+        total_tokens = len(request.token_ids) + max(0, request.max_new_tokens - 1)
+        return (total_tokens + self.config.block_size - 1) // self.config.block_size
+
+    @staticmethod
+    def _request_work(request: ServingRequest) -> int:
+        """Cheap phase-aware routing proxy measured in token work units."""
+
+        return len(request.token_ids) + max(1, request.max_new_tokens)
+
+    def _select_worker(
+        self,
+        request: ServingRequest | None = None,
+        *,
+        excluded: set[int] | None = None,
+        claim: bool,
+    ) -> int:
+        """Select the best capacity-compatible worker for one request.
+
+        Outstanding prompt work is the strongest signal because a collocated
+        prefill serializes that worker's decode stream. RPC depth and
+        token-weighted live work then distinguish workers with the same request
+        count. Round-robin remains the deterministic final tie breaker.
+        """
+
+        excluded = excluded or set()
         with self._state_lock:
             count = len(self._processes)
-            candidates = [i for i in range(count) if self._healthy[i]]
+            candidates = [
+                i for i in range(count) if self._healthy[i] and i not in excluded
+            ]
             if not candidates:
-                candidates = list(range(count))
+                raise LookupError("no healthy collocated worker is available")
+            if request is not None:
+                required_blocks = self._required_blocks(request)
+                candidates = [
+                    i
+                    for i in candidates
+                    if self._capacity[i] is None
+                    or (
+                        self._capacity[i].kv_free_blocks >= required_blocks
+                        and self._capacity[i].state_free_slots > 0
+                    )
+                ]
+                if not candidates:
+                    raise LookupError("all collocated workers are temporarily full")
             start = self._round_robin % count
+
+            def score(i: int):
+                capacity = self._capacity[i]
+                capacity_load = 1.0 if capacity is None else capacity.decode_load
+                return (
+                    self._prefill_tokens[i] > 0,
+                    self._prefill_tokens[i],
+                    self._assigned_work[i],
+                    self._pending[i],
+                    capacity_load,
+                    self._assigned[i],
+                    (i - start) % count,
+                )
+
             index = min(
                 candidates,
-                key=lambda i: (
-                    self._assigned[i],
-                    self._pending[i],
-                    (i - start) % count,
-                ),
+                key=score,
             )
-            self._assigned[index] += 1
-            self._round_robin = (index + 1) % count
+            if claim:
+                self._assigned[index] += 1
+                if request is not None:
+                    self._assigned_work[index] += self._request_work(request)
+                    self._prefill_tokens[index] += len(request.token_ids)
+                self._round_robin = (index + 1) % count
             return index
 
-    def _unassign_worker(self, index: int) -> None:
+    def _pick_worker(
+        self,
+        request: ServingRequest | None = None,
+        *,
+        excluded: set[int] | None = None,
+    ) -> int:
+        """Select and claim one worker for request admission."""
+
+        return self._select_worker(request, excluded=excluded, claim=True)
+
+    def _unassign_worker(
+        self,
+        index: int,
+        request: ServingRequest | None = None,
+        *,
+        load: tuple[int, int] | None = None,
+    ) -> None:
         with self._state_lock:
             self._assigned[index] = max(0, self._assigned[index] - 1)
+            if request is not None:
+                load = (self._request_work(request), len(request.token_ids))
+            if load is not None:
+                work, outstanding_prefill = load
+                self._assigned_work[index] = max(
+                    0, self._assigned_work[index] - work
+                )
+                self._prefill_tokens[index] = max(
+                    0, self._prefill_tokens[index] - outstanding_prefill
+                )
+
+    def _mark_prefill_complete(self, request_id: int, index: int) -> None:
+        with self._state_lock:
+            load = self._request_loads.get(request_id)
+            if load is None:
+                return
+            work, outstanding_prefill = load
+            if outstanding_prefill:
+                self._prefill_tokens[index] = max(
+                    0, self._prefill_tokens[index] - outstanding_prefill
+                )
+                remaining_work = max(1, work - outstanding_prefill)
+                self._assigned_work[index] = max(
+                    0, self._assigned_work[index] - outstanding_prefill
+                )
+                self._request_loads[request_id] = (remaining_work, 0)
 
     def _rpc(self, index: int, command: dict, expected_op: str, request_id=None) -> dict:
-        failure = None
-        with self._locks[index]:
-            try:
+        rpc_id = next(self._rpc_ids)
+        waiter: Queue = Queue(maxsize=1)
+        # Serialize only the command handoff. The worker response sink tags
+        # every response with rpc_id, allowing any caller to drain the shared
+        # response queue and forward it to the correct waiter.
+        try:
+            with self._locks[index]:
                 if not self._processes[index].is_alive():
                     from hydraserve.engine import WorkerUnavailableError
 
@@ -252,18 +446,67 @@ class MultiGPUCollocatedBackend:
                         f"collocated worker {index} is not running"
                     )
                 with self._state_lock:
+                    self._waiters[index][rpc_id] = waiter
                     self._pending[index] += 1
-                self._commands[index].put(command)
-                result = self._get_response(index, self.operation_timeout)
-            except Exception as exc:
-                failure = exc
-            finally:
-                with self._state_lock:
-                    self._pending[index] = max(0, self._pending[index] - 1)
-        if failure is not None:
+                try:
+                    self._commands[index].put({**command, "rpc_id": rpc_id})
+                except Exception:
+                    with self._state_lock:
+                        self._waiters[index].pop(rpc_id, None)
+                        self._pending[index] = max(0, self._pending[index] - 1)
+                    raise
+        except Exception:
             with self._state_lock:
                 self._healthy[index] = False
-            raise failure
+            raise
+
+        deadline = monotonic() + self.operation_timeout
+        try:
+            while True:
+                try:
+                    result = waiter.get_nowait()
+                    break
+                except Empty:
+                    pass
+                if not self._processes[index].is_alive():
+                    from hydraserve.engine import WorkerUnavailableError
+
+                    raise WorkerUnavailableError(
+                        f"collocated worker {index} exited during RPC"
+                    )
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for collocated worker")
+                acquired = self._response_locks[index].acquire(
+                    timeout=min(0.05, remaining)
+                )
+                if not acquired:
+                    continue
+                try:
+                    try:
+                        response = self._responses[index].get(
+                            timeout=min(0.05, remaining)
+                        )
+                    except Empty:
+                        continue
+                    response_id = response.get("rpc_id")
+                    with self._state_lock:
+                        target = self._waiters[index].get(response_id)
+                        # Compatibility for old/test workers that omit rpc_id.
+                        if response_id is None and len(self._waiters[index]) == 1:
+                            target = waiter
+                    if target is not None:
+                        target.put_nowait(response)
+                finally:
+                    self._response_locks[index].release()
+        except Exception:
+            with self._state_lock:
+                self._healthy[index] = False
+            raise
+        finally:
+            with self._state_lock:
+                self._waiters[index].pop(rpc_id, None)
+                self._pending[index] = max(0, self._pending[index] - 1)
         self._check(result, expected_op, request_id)
         self._update_capacity(index, result)
         return result
@@ -314,37 +557,85 @@ class MultiGPUCollocatedBackend:
             raise RuntimeError("worker returned a different request")
 
     def admit(self, request: ServingRequest) -> AdmissionDecision:
-        index = self._pick_worker()
-        try:
-            result = self._rpc(
-                index,
-                self._request_command("reserve", request),
-                "admission",
-                request.request_id,
-            )
-        except Exception as exc:
-            self._unassign_worker(index)
-            return AdmissionDecision.defer(f"collocated reserve failed: {exc}")
-        if not result.get("admitted"):
-            self._unassign_worker(index)
-            reason = result.get("reason", "worker rejected the reservation")
-            return AdmissionDecision.defer(reason)
+        required_blocks = self._required_blocks(request)
         with self._state_lock:
-            self._bound[request.request_id] = index
-        request.worker_id = index
-        request.worker_pool = "collocated"
-        request.route = "collocated"
-        request.route_reason = "fixed_collocated"
-        return AdmissionDecision.accept()
+            healthy = [i for i, value in enumerate(self._healthy) if value]
+            known_capacities = [
+                self._capacity[i]
+                for i in healthy
+                if self._capacity[i] is not None
+            ]
+        if (
+            healthy
+            and len(known_capacities) == len(healthy)
+            and required_blocks
+            > max(capacity.kv_total_blocks for capacity in known_capacities)
+        ):
+            return AdmissionDecision.reject(
+                f"request needs {required_blocks} KV blocks, largest worker capacity "
+                f"is {max(capacity.kv_total_blocks for capacity in known_capacities)}"
+            )
+        attempted: set[int] = set()
+        retryable_reasons: list[str] = []
+        permanent_reasons: list[str] = []
+        while len(attempted) < len(self._processes):
+            try:
+                index = self._pick_worker(request, excluded=attempted)
+            except LookupError as exc:
+                retryable_reasons.append(str(exc))
+                break
+            attempted.add(index)
+            try:
+                result = self._rpc(
+                    index,
+                    self._request_command("reserve", request),
+                    "admission",
+                    request.request_id,
+                )
+            except Exception as exc:
+                self._unassign_worker(index, request)
+                retryable_reasons.append(
+                    f"collocated worker {index} reserve failed: {exc}"
+                )
+                continue
+            if not result.get("admitted"):
+                self._unassign_worker(index, request)
+                reason = result.get("reason", "worker rejected the reservation")
+                if result.get("retryable", True):
+                    retryable_reasons.append(reason)
+                else:
+                    permanent_reasons.append(reason)
+                continue
+            with self._state_lock:
+                self._bound[request.request_id] = index
+                self._request_loads[request.request_id] = (
+                    self._request_work(request),
+                    len(request.token_ids),
+                )
+            request.worker_id = index
+            request.worker_pool = "collocated"
+            request.route = "collocated"
+            request.route_reason = "load_aware_collocated"
+            return AdmissionDecision.accept()
+        if retryable_reasons:
+            return AdmissionDecision.defer(retryable_reasons[-1])
+        if permanent_reasons:
+            return AdmissionDecision.reject(permanent_reasons[-1])
+        return AdmissionDecision.defer(
+            "no collocated worker accepted the reservation"
+        )
 
     def prefill(self, request: ServingRequest) -> int | TokenSample:
         index = self._bound[request.request_id]
-        result = self._rpc(
-            index,
-            self._request_command("collocated_prepare", request),
-            "collocated_prepare",
-            request.request_id,
-        )
+        try:
+            result = self._rpc(
+                index,
+                self._request_command("collocated_prepare", request),
+                "collocated_prepare",
+                request.request_id,
+            )
+        finally:
+            self._mark_prefill_complete(request.request_id, index)
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(result["token_id"])
 
@@ -436,7 +727,8 @@ class MultiGPUCollocatedBackend:
         finally:
             with self._state_lock:
                 self._bound.pop(request_id, None)
-            self._unassign_worker(index)
+                load = self._request_loads.pop(request_id, None)
+            self._unassign_worker(index, load=load)
 
     def capacity(self) -> BackendCapacity:
         with self._state_lock:
