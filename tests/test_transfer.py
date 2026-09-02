@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
+from threading import Event, Thread
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from hydraserve.transfer import (
     SharedMemoryRingTransferBackend,
     StateTransferDescriptor,
     TransferMode,
+    TransferCancelledError,
     TransferPipeline,
     StateType,
 )
@@ -110,6 +112,26 @@ def test_partial_transfer_excludes_kv(tiny_model) -> None:
     assert descriptor == received_descriptor
     assert received.kv_cache is None
     assert received.recurrent.ssm_state.dtype == np.float32
+
+
+def test_in_memory_receive_can_be_cancelled_without_waiting_for_timeout() -> None:
+    backend = InMemoryTransferBackend()
+    cancelled = Event()
+    errors = []
+
+    def receive() -> None:
+        try:
+            backend.receive("never-published", 1, timeout=2, cancel_event=cancelled)
+        except Exception as exc:  # pragma: no branch - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=receive)
+    thread.start()
+    cancelled.set()
+    thread.join(1)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TransferCancelledError)
 
 
 def test_descriptor_records_n_minus_one_state_boundary(tiny_model) -> None:
@@ -272,6 +294,137 @@ def test_persistent_shared_memory_ring_reuses_slots() -> None:
             restored = receiver.receive(f"chunk-{sequence}", 1, timeout=1)
             assert restored["sequence"] == sequence
             np.testing.assert_array_equal(restored["value"], payload["value"])
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_ring_demultiplexes_other_requests_to_break_head_of_line_blocking() -> None:
+    namespace = "hydraserve-ring-demux-pytest"
+    sender = SharedMemoryRingTransferBackend(
+        namespace=namespace,
+        slots=2,
+        slot_bytes=1 << 20,
+        send_timeout_s=2,
+    )
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    producer_error = []
+
+    def send_a_after_b_fills_ring() -> None:
+        try:
+            sender.send("a", {"request": "a"}, 1)
+        except Exception as exc:  # pragma: no cover - asserted below
+            producer_error.append(exc)
+
+    try:
+        sender.send("b-0", {"sequence": 0}, 1)
+        sender.send("b-1", {"sequence": 1}, 1)
+        producer = Thread(target=send_a_after_b_fills_ring)
+        producer.start()
+
+        # Waiting for A must drain B's two READY slots into the receiver-side
+        # mailbox, allowing A's blocked producer to make progress.
+        assert receiver.receive("a", 1, timeout=1) == {"request": "a"}
+        producer.join(timeout=1)
+        assert not producer.is_alive()
+        assert not producer_error
+        assert receiver.receive("b-0", 1, timeout=1) == {"sequence": 0}
+        assert receiver.receive("b-1", 1, timeout=1) == {"sequence": 1}
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_ring_segments_payloads_larger_than_one_slot() -> None:
+    namespace = "hydraserve-ring-segment-pytest"
+    sender = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=4096, send_timeout_s=2
+    )
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=4096
+    )
+    payload = {
+        "values": np.arange(5000, dtype=np.float32),
+        "request": 19,
+    }
+    errors = []
+
+    def send() -> None:
+        try:
+            sender.send("oversized", payload, 1)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    producer = Thread(target=send)
+    producer.start()
+    try:
+        restored = receiver.receive("oversized", 1, timeout=2)
+        producer.join(1)
+        assert not producer.is_alive()
+        assert not errors
+        assert restored["request"] == 19
+        np.testing.assert_array_equal(restored["values"], payload["values"])
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_ring_releases_slot_when_decode_raises() -> None:
+    namespace = "hydraserve-ring-corrupt-release-pytest"
+    sender = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=1, slot_bytes=1 << 20, send_timeout_s=1
+    )
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=1, slot_bytes=1 << 20
+    )
+    original_decode = receiver._decode
+
+    def fail_decode(_metadata, _payload):
+        raise RuntimeError("synthetic decode failure")
+
+    try:
+        receiver._decode = fail_decode
+        sender.send("bad", np.arange(8), 1)
+        with pytest.raises(RuntimeError, match="synthetic decode failure"):
+            receiver.receive("bad", 1, timeout=1)
+
+        # A one-slot ring proves the failed receive returned the slot to FREE.
+        receiver._decode = original_decode
+        sender.send("good", np.arange(8), 1)
+        np.testing.assert_array_equal(
+            receiver.receive("good", 1, timeout=1), np.arange(8)
+        )
+    finally:
+        receiver.close()
+        sender.close()
+
+
+def test_ring_dispatcher_drains_late_segments_for_cancelled_key() -> None:
+    namespace = "hydraserve-ring-cancel-drain-pytest"
+    sender = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20, send_timeout_s=1
+    )
+    receiver = SharedMemoryRingTransferBackend(
+        namespace=namespace, slots=2, slot_bytes=1 << 20
+    )
+    errors = []
+
+    def send_late_chunks() -> None:
+        try:
+            for sequence in range(10):
+                sender.send("cancelled-chunk", {"sequence": sequence}, 1)
+        except Exception as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    try:
+        receiver.discard("cancelled-chunk", 1)
+        producer = Thread(target=send_late_chunks)
+        producer.start()
+        producer.join(2)
+        assert not producer.is_alive()
+        assert not errors
     finally:
         receiver.close()
         sender.close()

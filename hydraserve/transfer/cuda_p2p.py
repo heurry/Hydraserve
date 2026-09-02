@@ -10,7 +10,7 @@ from threading import Condition
 from time import monotonic
 from typing import Any
 
-from hydraserve.transfer.backend import TransferBackend
+from hydraserve.transfer.backend import TransferBackend, _raise_if_cancelled
 from hydraserve.transfer.descriptor import TransferMode
 
 
@@ -69,7 +69,12 @@ class CudaP2PTransferBackend(TransferBackend):
             self._condition.notify_all()
 
     def receive(
-        self, key: str, src: int, stream: Any = None, timeout: float | None = None
+        self,
+        key: str,
+        src: int,
+        stream: Any = None,
+        timeout: float | None = None,
+        cancel_event=None,
     ) -> Any:
         import torch
 
@@ -78,10 +83,14 @@ class CudaP2PTransferBackend(TransferBackend):
         deadline = None if timeout is None else monotonic() + timeout
         with self._condition:
             while key not in self._messages:
+                _raise_if_cancelled(cancel_event)
                 remaining = None if deadline is None else deadline - monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"timed out waiting for P2P transfer {key}")
-                self._condition.wait(remaining)
+                self._condition.wait(
+                    0.05 if remaining is None else min(0.05, remaining)
+                )
+            _raise_if_cancelled(cancel_event)
             payload, event = self._messages.pop(key)
         with torch.cuda.device(self.dst_gpu):
             consumer_stream = stream or torch.cuda.current_stream(self.dst_gpu)
@@ -96,6 +105,11 @@ class CudaP2PTransferBackend(TransferBackend):
 
     def supports_layer_pipeline(self) -> bool:
         return True
+
+    def discard(self, key: str, endpoint: int) -> None:
+        with self._condition:
+            self._messages.pop(key, None)
+            self._condition.notify_all()
 
     @classmethod
     def _copy_payload(cls, payload: Any, destination: int) -> Any:

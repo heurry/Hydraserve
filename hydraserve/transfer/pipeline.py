@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Lock
 from typing import Any
 
 import numpy as np
@@ -51,6 +52,8 @@ class TransferPipeline:
         self.dst_tp_rank = dst_tp_rank
         self.tp_world_size = tp_world_size
         self.bootstrap = bootstrap
+        self._receive_keys_lock = Lock()
+        self._receive_keys: dict[int, set[str]] = {}
         if tp_world_size <= 0 or not (
             0 <= src_tp_rank < tp_world_size and 0 <= dst_tp_rank < tp_world_size
         ):
@@ -198,13 +201,18 @@ class TransferPipeline:
             self.bootstrap.publish(request_id, "kv_chunks", manifest)
 
     def begin_chunked_receive(
-        self, request_id: int, *, timeout: float | None = None
+        self,
+        request_id: int,
+        *,
+        timeout: float | None = None,
+        cancel_event=None,
     ) -> tuple[tuple[int, int], ...]:
         manifest = (
             self.backend.receive(
                 f"{self._key(request_id)}:chunks:manifest",
                 self.dst_gpu,
                 timeout=timeout,
+                cancel_event=cancel_event,
             )
             if self.bootstrap is None
             else self.bootstrap.consume(
@@ -215,7 +223,13 @@ class TransferPipeline:
             raise RuntimeError("received KV chunk manifest for the wrong request")
         if TransferMode(manifest["mode"]) is not self.backend.transfer_mode:
             raise RuntimeError("KV chunk manifest transfer mode mismatch")
-        return tuple((int(item[0]), int(item[1])) for item in manifest["ranges"])
+        ranges = tuple((int(item[0]), int(item[1])) for item in manifest["ranges"])
+        with self._receive_keys_lock:
+            self._receive_keys[request_id] = {
+                f"{self._key(request_id)}:chunks:{start}:{end}"
+                for start, end in ranges
+            } | {f"{self._key(request_id)}:bundle"}
+        return ranges
 
     def send_kv_chunk(self, request_id: int, start: int, end: int, payload) -> None:
         mode = self.backend.transfer_mode
@@ -238,17 +252,28 @@ class TransferPipeline:
         end: int,
         *,
         timeout: float | None = None,
+        cancel_event=None,
     ):
         return self.backend.receive(
             f"{self._key(request_id)}:chunks:{start}:{end}",
             self.dst_gpu,
             timeout=timeout,
+            cancel_event=cancel_event,
         )
 
-    def receive(self, request_id: int, timeout: float | None = None) -> tuple[StateTransferDescriptor, HybridStateBundle]:
+    def receive(
+        self,
+        request_id: int,
+        timeout: float | None = None,
+        *,
+        cancel_event=None,
+    ) -> tuple[StateTransferDescriptor, HybridStateBundle]:
         key = self._key(request_id)
         envelope = self.backend.receive(
-            f"{key}:bundle", self.dst_gpu, timeout=timeout
+            f"{key}:bundle",
+            self.dst_gpu,
+            timeout=timeout,
+            cancel_event=cancel_event,
         )
         if not isinstance(envelope, dict) or set(envelope) != {"descriptor", "payload"}:
             raise RuntimeError("received an invalid state-transfer envelope")
@@ -256,12 +281,37 @@ class TransferPipeline:
         payload = envelope["payload"]
         if descriptor.request_id != request_id:
             raise RuntimeError("received descriptor for the wrong request")
+        with self._receive_keys_lock:
+            self._receive_keys.pop(request_id, None)
         recurrent = LinearState(
             payload[RegionType.LINEAR_SSM.value], payload[RegionType.LINEAR_CONV.value]
         )
         return descriptor, HybridStateBundle(
             recurrent=recurrent, kv_cache=payload.get(RegionType.FULL_ATTN_KV.value)
         )
+
+    def cancel_receive(self, request_id: int) -> None:
+        """Wake a receiver blocked on the metadata control-plane handshake."""
+        bootstrap_error = None
+        if self.bootstrap is not None:
+            try:
+                self.bootstrap.cancel(request_id, "kv_chunks")
+            except Exception as exc:  # data-plane cleanup must still run
+                bootstrap_error = exc
+        with self._receive_keys_lock:
+            keys = self._receive_keys.pop(request_id, set())
+        keys.update(
+            {
+                f"{self._key(request_id)}:chunks:manifest",
+                f"{self._key(request_id)}:bundle",
+            }
+        )
+        discard = getattr(self.backend, "discard", None)
+        if discard is not None:
+            for key in keys:
+                discard(key, self.dst_gpu)
+        if bootstrap_error is not None:
+            raise bootstrap_error
 
     def _region(
         self, region_type: RegionType, layer_indices: tuple[int, ...], tensor: np.ndarray

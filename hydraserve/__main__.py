@@ -245,6 +245,9 @@ def main() -> int:
     serve_parser.add_argument("--pd-transfer-quant", choices=("int8",), default=None)
     serve_parser.add_argument("--pd-transfer-target-mb", type=float, default=8.0)
     serve_parser.add_argument("--pd-transfer-inflight", type=int, default=2)
+    serve_parser.add_argument("--pd-max-concurrent-prepares", type=int, default=2)
+    serve_parser.add_argument("--pd-receiver-dispatch-timeout-s", type=float, default=5.0)
+    serve_parser.add_argument("--pd-receiver-arm-timeout-s", type=float, default=10.0)
     serve_parser.add_argument("--shm-ring-slots", type=int, default=3)
     serve_parser.add_argument("--shm-ring-slot-mb", type=float, default=64.0)
     serve_parser.add_argument("--prefill-chunk-size", type=int, default=4096)
@@ -404,6 +407,9 @@ def main() -> int:
     benchmark_parser.add_argument("--pd-transfer-quant", choices=("int8",), default=None)
     benchmark_parser.add_argument("--pd-transfer-target-mb", type=float, default=8.0)
     benchmark_parser.add_argument("--pd-transfer-inflight", type=int, default=2)
+    benchmark_parser.add_argument("--pd-max-concurrent-prepares", type=int, default=2)
+    benchmark_parser.add_argument("--pd-receiver-dispatch-timeout-s", type=float, default=5.0)
+    benchmark_parser.add_argument("--pd-receiver-arm-timeout-s", type=float, default=10.0)
     benchmark_parser.add_argument("--shm-ring-slots", type=int, default=3)
     benchmark_parser.add_argument("--shm-ring-slot-mb", type=float, default=64.0)
     benchmark_parser.add_argument("--kv-quant", choices=["int8"], default=None, help="compress KV cache to INT8")
@@ -549,6 +555,7 @@ def main() -> int:
                     transfer_quant=args.pd_transfer_quant,
                     transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
                     max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                    max_concurrent_prepares_per_worker=args.pd_max_concurrent_prepares,
                     shm_ring_slots=args.shm_ring_slots,
                     shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
@@ -560,6 +567,8 @@ def main() -> int:
                     hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
                 ),
                 router=router,
+                receiver_dispatch_timeout=args.pd_receiver_dispatch_timeout_s,
+                receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
             )
             model_name = backend.model_name
         elif args.pd or args.adaptive:
@@ -582,14 +591,22 @@ def main() -> int:
                 transfer_quant=args.pd_transfer_quant,
                 transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
                 max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                max_concurrent_prepares=args.pd_max_concurrent_prepares,
                 shm_ring_slots=args.shm_ring_slots,
                 shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (
-                AdaptiveGenerationBackend(worker_config, router=router)
+                AdaptiveGenerationBackend(
+                    worker_config,
+                    router=router,
+                    receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
+                )
                 if args.adaptive
-                else DisaggregatedGenerationBackend(worker_config)
+                else DisaggregatedGenerationBackend(
+                    worker_config,
+                    receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
+                )
             )
             model_name = backend.model_name
         else:
@@ -1017,6 +1034,7 @@ def main() -> int:
                     transfer_quant=args.pd_transfer_quant,
                     transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
                     max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                    max_concurrent_prepares_per_worker=args.pd_max_concurrent_prepares,
                     shm_ring_slots=args.shm_ring_slots,
                     shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                     worker_log_dir=args.worker_log_dir,
@@ -1028,6 +1046,8 @@ def main() -> int:
                     hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
                 ),
                 router=router,
+                receiver_dispatch_timeout=args.pd_receiver_dispatch_timeout_s,
+                receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
             )
         elif args.pd or args.adaptive:
             worker_config = PDWorkerConfig(
@@ -1049,14 +1069,22 @@ def main() -> int:
                 transfer_quant=args.pd_transfer_quant,
                 transfer_target_bytes=int(args.pd_transfer_target_mb * (1 << 20)),
                 max_inflight_transfer_chunks=args.pd_transfer_inflight,
+                max_concurrent_prepares=args.pd_max_concurrent_prepares,
                 shm_ring_slots=args.shm_ring_slots,
                 shm_ring_slot_bytes=int(args.shm_ring_slot_mb * (1 << 20)),
                 worker_log_dir=args.worker_log_dir,
             )
             backend = (
-                AdaptiveGenerationBackend(worker_config, router=router)
+                AdaptiveGenerationBackend(
+                    worker_config,
+                    router=router,
+                    receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
+                )
                 if args.adaptive
-                else DisaggregatedGenerationBackend(worker_config)
+                else DisaggregatedGenerationBackend(
+                    worker_config,
+                    receiver_arm_timeout=args.pd_receiver_arm_timeout_s,
+                )
             )
         else:
             import torch

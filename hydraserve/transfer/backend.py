@@ -15,6 +15,15 @@ from hydraserve.transfer.descriptor import TransferMode
 from hydraserve.cache.kv_quantizer import Int4Tensor, Int8Tensor
 
 
+class TransferCancelledError(RuntimeError):
+    """Raised when a pending receive is explicitly cancelled."""
+
+
+def _raise_if_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise TransferCancelledError("transfer receive was cancelled")
+
+
 class TransferBackend(ABC):
     """Transport boundary independent of the tensor runtime."""
 
@@ -27,7 +36,12 @@ class TransferBackend(ABC):
 
     @abstractmethod
     def receive(
-        self, key: str, src: int, stream: Any = None, timeout: float | None = None
+        self,
+        key: str,
+        src: int,
+        stream: Any = None,
+        timeout: float | None = None,
+        cancel_event=None,
     ) -> Any: ...
 
     @abstractmethod
@@ -72,7 +86,12 @@ class InMemoryTransferBackend(TransferBackend):
             self._condition.notify_all()
 
     def receive(
-        self, key: str, src: int, stream: Any = None, timeout: float | None = None
+        self,
+        key: str,
+        src: int,
+        stream: Any = None,
+        timeout: float | None = None,
+        cancel_event=None,
     ) -> Any:
         if src < 0 or not key:
             raise ValueError("invalid transfer source or key")
@@ -82,10 +101,14 @@ class InMemoryTransferBackend(TransferBackend):
         deadline = None if timeout is None else monotonic() + timeout
         with self._condition:
             while message_key not in self._messages:
+                _raise_if_cancelled(cancel_event)
                 remaining = None if deadline is None else deadline - monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError(f"timed out waiting for transfer {key}")
-                self._condition.wait(remaining)
+                self._condition.wait(
+                    0.05 if remaining is None else min(0.05, remaining)
+                )
+            _raise_if_cancelled(cancel_event)
             return self._messages.pop(message_key)
 
     def get_bandwidth(self) -> float:
@@ -96,6 +119,11 @@ class InMemoryTransferBackend(TransferBackend):
 
     def supports_layer_pipeline(self) -> bool:
         return self._bandwidth >= 10.0
+
+    def discard(self, key: str, endpoint: int) -> None:
+        with self._condition:
+            self._messages.pop((endpoint, key), None)
+            self._condition.notify_all()
 
 
 class SharedMemoryTransferBackend(TransferBackend):
@@ -175,13 +203,19 @@ class SharedMemoryTransferBackend(TransferBackend):
             memory.close()
 
     def receive(
-        self, key: str, src: int, stream: Any = None, timeout: float | None = None
+        self,
+        key: str,
+        src: int,
+        stream: Any = None,
+        timeout: float | None = None,
+        cancel_event=None,
     ) -> Any:
         if src < 0 or not key:
             raise ValueError("invalid transfer source or key")
         name = self._mailbox_name(key, src)
         deadline = None if timeout is None else monotonic() + timeout
         while True:
+            _raise_if_cancelled(cancel_event)
             try:
                 memory = shared_memory.SharedMemory(name=name, create=False)
                 break
@@ -200,6 +234,7 @@ class SharedMemoryTransferBackend(TransferBackend):
             sleep(self._poll_interval)
         try:
             while True:
+                _raise_if_cancelled(cancel_event)
                 magic, metadata_size, payload_size = self._HEADER.unpack(
                     bytes(memory.buf[: self._HEADER.size])
                 )
@@ -354,6 +389,18 @@ class SharedMemoryTransferBackend(TransferBackend):
             finally:
                 memory.close()
                 self._owned_names.discard(name)
+
+    def discard(self, key: str, endpoint: int) -> None:
+        name = self._mailbox_name(key, endpoint)
+        try:
+            memory = shared_memory.SharedMemory(name=name, create=False)
+        except (FileNotFoundError, ValueError):
+            return
+        try:
+            memory.unlink()
+        finally:
+            memory.close()
+            self._owned_names.discard(name)
 
     def _mailbox_name(self, key: str, endpoint: int) -> str:
         digest = sha256(f"{self.namespace}:{endpoint}:{key}".encode()).hexdigest()[:24]

@@ -10,3 +10,4 @@ build/
 worker_logs/
 .claude/
 benchmark_output/v5/
+benchmark_output/v5_gpu_gate/

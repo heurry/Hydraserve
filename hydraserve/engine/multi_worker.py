@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from enum import Enum
 from itertools import count
@@ -19,6 +19,7 @@ from hydraserve.engine.pd_service import (
     PDWorkerConfig,
     RoutingStats,
     _decode_worker,
+    _pd_protocol_trace,
     _prefill_worker,
 )
 from hydraserve.engine.serving_loop import (
@@ -76,6 +77,7 @@ class PDClusterConfig:
     transfer_quant: str | None = None
     transfer_target_bytes: int = 8 << 20
     max_inflight_transfer_chunks: int = 2
+    max_concurrent_prepares_per_worker: int = 2
     shm_ring_slots: int = 3
     shm_ring_slot_bytes: int = 64 << 20
     worker_log_dir: str = ""
@@ -121,6 +123,7 @@ class PDClusterConfig:
                 self.prefix_cache_min_frequency,
                 self.transfer_target_bytes,
                 self.max_inflight_transfer_chunks,
+                self.max_concurrent_prepares_per_worker,
                 self.shm_ring_slots,
                 self.shm_ring_slot_bytes,
                 self.prefill_preempt_max_ops,
@@ -192,6 +195,7 @@ class PDClusterConfig:
             transfer_quant=self.transfer_quant,
             transfer_target_bytes=self.transfer_target_bytes,
             max_inflight_transfer_chunks=self.max_inflight_transfer_chunks,
+            max_concurrent_prepares=self.max_concurrent_prepares_per_worker,
             shm_ring_slots=self.shm_ring_slots,
             shm_ring_slot_bytes=self.shm_ring_slot_bytes,
             prefill_preempt_max_ops=self.prefill_preempt_max_ops,
@@ -223,6 +227,7 @@ class PDClusterConfig:
             transfer_quant=self.transfer_quant,
             transfer_target_bytes=self.transfer_target_bytes,
             max_inflight_transfer_chunks=self.max_inflight_transfer_chunks,
+            max_concurrent_prepares=self.max_concurrent_prepares_per_worker,
             shm_ring_slots=self.shm_ring_slots,
             shm_ring_slot_bytes=self.shm_ring_slot_bytes,
             prefill_preempt_max_ops=self.prefill_preempt_max_ops,
@@ -360,15 +365,27 @@ class MultiWorkerGenerationBackend:
         prefix_affinity: PrefixAffinity | None = None,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        receiver_dispatch_timeout: float = 5.0,
+        receiver_arm_timeout: float = 10.0,
         max_worker_restarts: int = 3,
         worker_restart_backoff_s: float = 0.5,
     ) -> None:
-        if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
+        if (
+            max_worker_restarts <= 0
+            or worker_restart_backoff_s < 0
+            or receiver_dispatch_timeout <= 0
+            or receiver_arm_timeout <= 0
+            or operation_timeout <= 0
+        ):
             raise ValueError("invalid decode worker recovery policy")
         self.config = config
         self.router = router or CostAwareRouter()
         self.prefix_affinity = prefix_affinity
         self.operation_timeout = operation_timeout
+        self.receiver_dispatch_timeout = min(
+            receiver_dispatch_timeout, operation_timeout
+        )
+        self.receiver_arm_timeout = min(receiver_arm_timeout, operation_timeout)
         self.startup_timeout = startup_timeout
         self.max_worker_restarts = max_worker_restarts
         self.worker_restart_backoff_s = worker_restart_backoff_s
@@ -785,12 +802,13 @@ class MultiWorkerGenerationBackend:
         command["host_cache_hit"] = host_cache_hit
         command["host_prefix_tokens"] = host_prefix_tokens
         # Arm the D-side receiver before the P worker can publish streamed KV.
-        # The serving loop already runs this method in a bounded P executor, so
-        # delegating the producer to a second pool only weakens ordering: under
-        # load P can fill the bounded data plane while D still has no prepare
-        # command and therefore no consumer.  Keep only the receiver in the
-        # auxiliary pool and execute the producer in this physical P slot.
+        # Queue dispatch and receiver readiness are separate phases: only the
+        # prepare executor thread emits ``prepare_armed``. The serving loop
+        # already runs this method in a bounded P executor, so keep only the
+        # receiver in the auxiliary pool and execute the producer in this
+        # physical P slot after both handshakes complete.
         receiver_dispatched = Event()
+        receiver_armed = Event()
         prepare_future = self._pd_executor.submit(
             self._decode_rpc,
             worker_id,
@@ -802,13 +820,79 @@ class MultiWorkerGenerationBackend:
             "prepare",
             request.request_id,
             dispatched=receiver_dispatched,
+            receiver_armed=receiver_armed,
         )
-        if not receiver_dispatched.wait(min(5.0, self.operation_timeout)):
-            if prepare_future.done():
-                prepare_future.result()
-            raise TimeoutError("decode prepare was not dispatched before PD transfer")
-        result = self._prefill_rpc(command, request.request_id)
-        prepared = prepare_future.result()
+        _pd_protocol_trace(
+            "coordinator_prepare_dispatched",
+            request.request_id,
+            worker_index=worker_id,
+        )
+        try:
+            dispatch_timeout = getattr(
+                self, "receiver_dispatch_timeout", min(5.0, self.operation_timeout)
+            )
+            if not receiver_dispatched.wait(dispatch_timeout):
+                if prepare_future.done():
+                    prepare_future.result()
+                raise TimeoutError("decode prepare was not dispatched before PD transfer")
+            arm_timeout = getattr(
+                self, "receiver_arm_timeout", min(10.0, self.operation_timeout)
+            )
+            if not receiver_armed.wait(arm_timeout):
+                if prepare_future.done():
+                    prepare_future.result()
+                raise TimeoutError("decode receiver was not armed before PD transfer")
+            _pd_protocol_trace(
+                "coordinator_receiver_armed",
+                request.request_id,
+                worker_index=worker_id,
+            )
+            _pd_protocol_trace(
+                "coordinator_prefill_started",
+                request.request_id,
+                worker_index=worker_id,
+            )
+            prefill_future = self._pd_executor.submit(
+                self._prefill_rpc, command, request.request_id
+            )
+            done, _ = wait(
+                (prefill_future, prepare_future),
+                return_when=FIRST_COMPLETED,
+            )
+            if prepare_future in done:
+                prepared = prepare_future.result()
+            if prefill_future in done:
+                result = prefill_future.result()
+            result = prefill_future.result()
+            _pd_protocol_trace(
+                "coordinator_prefill_finished",
+                request.request_id,
+                worker_index=worker_id,
+            )
+            prepared = prepare_future.result()
+            _pd_protocol_trace(
+                "coordinator_prepare_finished",
+                request.request_id,
+                worker_index=worker_id,
+            )
+        except Exception:
+            if not prepare_future.done():
+                try:
+                    self._decode_rpc(
+                        worker_id,
+                        {
+                            "op": "cancel_prepare",
+                            "request_id": request.request_id,
+                        },
+                        "cancel_prepare",
+                        request.request_id,
+                    )
+                except Exception:
+                    # Preserve the original transfer/prepare failure. Worker
+                    # liveness handling in _decode_rpc records cancellation
+                    # transport failures independently.
+                    pass
+            raise
         if result.get("worker_index") != worker_id:
             raise RuntimeError("prefill worker returned a different decode target")
         if result["token_id"] != prepared["token_id"]:
@@ -1235,10 +1319,16 @@ class MultiWorkerGenerationBackend:
         request_id: int | None = None,
         *,
         dispatched: Event | None = None,
+        receiver_armed: Event | None = None,
     ) -> dict:
         self._ensure_decode_rpc_state()
         rpc_id = next(self._decode_rpc_ids)
-        waiter: Queue = Queue(maxsize=1)
+        # Prepare is a two-response RPC: the D worker first confirms that its
+        # background receive thread is running, then returns the installed
+        # state.  Keep this queue unbounded so a fast final response cannot
+        # race the coordinator while the intermediate acknowledgement is
+        # still waiting to be consumed.
+        waiter: Queue = Queue()
         failure = None
         try:
             # Protect process replacement and queue handoff only.  Waiting for
@@ -1266,9 +1356,25 @@ class MultiWorkerGenerationBackend:
             while True:
                 try:
                     result = waiter.get_nowait()
-                    break
                 except Empty:
-                    pass
+                    result = None
+                if result is not None:
+                    if result.get("op") == "prepare_armed":
+                        if expected_op != "prepare":
+                            raise RuntimeError(
+                                "received prepare_armed for a non-prepare RPC"
+                            )
+                        if (
+                            request_id is not None
+                            and result.get("request_id") != request_id
+                        ):
+                            raise RuntimeError(
+                                "decode receiver armed a different request"
+                            )
+                        if receiver_armed is not None:
+                            receiver_armed.set()
+                        continue
+                    break
                 if not self._decode_processes[worker_id].is_alive():
                     raise WorkerUnavailableError(
                         f"decode worker {worker_id} exited during RPC"

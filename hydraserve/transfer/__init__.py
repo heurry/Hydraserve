@@ -2,6 +2,7 @@ from hydraserve.transfer.backend import (
     InMemoryTransferBackend,
     SharedMemoryTransferBackend,
     TransferBackend,
+    TransferCancelledError,
 )
 from hydraserve.transfer.descriptor import (
     RegionDescriptor,
@@ -39,6 +40,7 @@ __all__ = [
     "RuntimeStateCodec",
     "StateHandlerRegistry",
     "TransferBackend",
+    "TransferCancelledError",
     "TransferMode",
     "TransferPipeline",
     "select_transfer_backend",

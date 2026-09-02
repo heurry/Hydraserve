@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from threading import Event, Thread
 
 from hydraserve.cache import HostPrefixCache
 from hydraserve.engine.dp_graph_sync import pad_dp_batch, synchronize_dp_token_count
@@ -13,6 +14,7 @@ from hydraserve.transfer import (
     NetworkBootstrapClient,
     StateHandlerRegistry,
     StateType,
+    TransferCancelledError,
     compute_head_slice_params,
 )
 
@@ -79,6 +81,30 @@ def test_bootstrap_metadata_is_one_shot() -> None:
     assert client.consume(7, "kv_chunks", timeout=0.1) == {"ranges": [[0, 4]]}
     with pytest.raises(TimeoutError):
         client.consume(7, "kv_chunks", timeout=0.001)
+
+
+def test_bootstrap_cancel_wakes_a_blocked_consumer() -> None:
+    client = BootstrapClient(BootstrapRegistry())
+    entered = Event()
+    errors = []
+
+    def consume() -> None:
+        entered.set()
+        try:
+            client.consume(71, "kv_chunks", timeout=2)
+        except Exception as exc:  # pragma: no branch - asserted below
+            errors.append(exc)
+
+    thread = Thread(target=consume)
+    thread.start()
+    assert entered.wait(1)
+    client.cancel(71, "kv_chunks")
+    thread.join(1)
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], TransferCancelledError)
+    with pytest.raises(TransferCancelledError):
+        client.publish(71, "kv_chunks", {"ranges": [[0, 4]]})
 
 
 def test_network_bootstrap_keeps_metadata_off_data_plane() -> None:

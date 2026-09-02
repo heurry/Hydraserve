@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from threading import Event
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -12,7 +14,12 @@ from hydraserve.engine import (
     RequestState,
 )
 from hydraserve.model.runtime import QwenTextRuntime
-from hydraserve.transfer import InMemoryTransferBackend, TransferMode, TransferPipeline
+from hydraserve.transfer import (
+    InMemoryTransferBackend,
+    TransferCancelledError,
+    TransferMode,
+    TransferPipeline,
+)
 from hydraserve.engine.pd_worker import adaptive_transfer_chunk_size
 from tests.test_runtime import make_weights
 
@@ -58,6 +65,62 @@ def test_partial_pd_workers_recompute_kv_and_restore_gdn(tiny_model) -> None:
         1,
         cache.block_manager.blocks_required(expected_kv_tokens),
     )
+
+
+def test_decode_receiver_arms_only_after_kv_allocation_is_valid(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    pipeline = TransferPipeline(InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER))
+    request = CentralScheduler().submit([1, 2, 3, 4], max_new_tokens=2)
+    PrefillWorker(runtime, pipeline).process(request)
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(16, block_size=4),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    armed_allocations = []
+
+    def armed() -> None:
+        armed_allocations.append(cache.block_manager.get(request.request_id))
+
+    DecodeWorker(runtime, pipeline, cache).receive_and_prepare(
+        request, receiver_armed_callback=armed
+    )
+    assert len(armed_allocations) == 1
+    assert armed_allocations[0].num_tokens == len(request.token_ids)
+
+
+def test_cancelled_decode_prepare_does_not_arm_and_releases_kv(tiny_model) -> None:
+    weights = make_weights(tiny_model)
+    runtime = QwenTextRuntime(
+        tiny_model, weights, use_triton=False, use_flash_attention=False
+    )
+    pipeline = TransferPipeline(InMemoryTransferBackend(TransferMode.PARTIAL_TRANSFER))
+    request = CentralScheduler().submit([1, 2, 3, 4], max_new_tokens=2)
+    PrefillWorker(runtime, pipeline).process(request)
+    cache = PagedKVCache(
+        tiny_model,
+        KVBlockManager(16, block_size=4),
+        device="cpu",
+        dtype=torch.float32,
+    )
+    cancelled = Event()
+    cancelled.set()
+    armed = []
+
+    with pytest.raises(TransferCancelledError):
+        DecodeWorker(runtime, pipeline, cache).receive_and_prepare(
+            request,
+            receiver_armed_callback=lambda: armed.append(True),
+            cancel_event=cancelled,
+        )
+    assert not armed
+    assert request.state is RequestState.FAILED
+    with pytest.raises(KeyError):
+        cache.block_manager.get(request.request_id)
 
 
 def test_adaptive_transfer_chunk_is_page_aligned_and_bounded(tiny_model) -> None:

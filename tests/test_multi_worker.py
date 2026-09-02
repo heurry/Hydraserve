@@ -99,10 +99,19 @@ class FakeMultiWorkerBackend(MultiWorkerGenerationBackend):
         return request.request_id + 100
 
     def _decode_rpc(
-        self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+        self,
+        worker_id,
+        command,
+        expected_op,
+        request_id=None,
+        *,
+        dispatched=None,
+        receiver_armed=None,
     ):
         if dispatched is not None:
             dispatched.set()
+        if receiver_armed is not None:
+            receiver_armed.set()
         self.rpc_commands.append((worker_id, dict(command)))
         self.rpc_calls.append(
             (expected_op, worker_id, tuple(command.get("request_ids", ())))
@@ -135,10 +144,12 @@ def test_cluster_config_propagates_decode_workspace_capacity() -> None:
         ("cuda:1",),
         max_state_slots_per_worker=12,
         max_decode_batch_size_per_worker=5,
+        max_concurrent_prepares_per_worker=3,
     )
     worker = config.worker_config(0)
     assert worker.max_state_slots == 12
     assert worker.max_decode_batch_size == 5
+    assert worker.max_concurrent_prepares == 3
 
 
 def test_cluster_config_validates_conditional_and_prefill_short_policies() -> None:
@@ -378,6 +389,7 @@ def test_decode_rpc_does_not_hold_worker_lock_while_prepare_is_inflight() -> Non
     backend._decode_commands = [Queue(), Queue()]
     backend._decode_responses = [Queue(), Queue()]
     results = {}
+    receiver_armed = Event()
 
     prepare_thread = Thread(
         target=lambda: results.setdefault(
@@ -388,11 +400,22 @@ def test_decode_rpc_does_not_hold_worker_lock_while_prepare_is_inflight() -> Non
                 {"op": "prepare", "request_id": 1},
                 "prepare",
                 1,
+                receiver_armed=receiver_armed,
             ),
         )
     )
     prepare_thread.start()
     prepare_command = backend._decode_commands[0].get(timeout=1)
+
+    backend._decode_responses[0].put(
+        {
+            "rpc_id": prepare_command["rpc_id"],
+            "op": "prepare_armed",
+            "request_id": 1,
+        }
+    )
+    assert receiver_armed.wait(1)
+    assert prepare_thread.is_alive()
 
     decode_thread = Thread(
         target=lambda: results.setdefault(
@@ -444,7 +467,14 @@ def test_pd_prefill_arms_decode_receiver_before_starting_producer() -> None:
             self._pd_executor = ThreadPoolExecutor(max_workers=1)
 
         def _decode_rpc(
-            self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+            self,
+            worker_id,
+            command,
+            expected_op,
+            request_id=None,
+            *,
+            dispatched=None,
+            receiver_armed=None,
         ):
             if expected_op != "prepare":
                 return super()._decode_rpc(
@@ -453,11 +483,15 @@ def test_pd_prefill_arms_decode_receiver_before_starting_producer() -> None:
                     expected_op,
                     request_id,
                     dispatched=dispatched,
+                    receiver_armed=receiver_armed,
                 )
             assert not self.producer_started.is_set()
-            self.receiver_armed.set()
             if dispatched is not None:
                 dispatched.set()
+            assert not self.producer_started.is_set()
+            self.receiver_armed.set()
+            if receiver_armed is not None:
+                receiver_armed.set()
             return {
                 "op": "prepare",
                 "request_id": request_id,
@@ -523,10 +557,19 @@ def test_multi_worker_reports_physical_decode_batch_widths() -> None:
 def test_multi_worker_decode_isolates_failed_worker_group() -> None:
     class OneWorkerFails(FakeMultiWorkerBackend):
         def _decode_rpc(
-            self, worker_id, command, expected_op, request_id=None, *, dispatched=None
+            self,
+            worker_id,
+            command,
+            expected_op,
+            request_id=None,
+            *,
+            dispatched=None,
+            receiver_armed=None,
         ):
             if dispatched is not None:
                 dispatched.set()
+            if receiver_armed is not None:
+                receiver_armed.set()
             if expected_op == "decode" and worker_id == 1:
                 raise RuntimeError("worker 1 failed")
             return super()._decode_rpc(worker_id, command, expected_op, request_id)

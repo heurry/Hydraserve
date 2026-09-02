@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from queue import Queue
-from threading import Event, Lock, RLock
+from threading import Event, Lock, RLock, Thread
 from types import SimpleNamespace
 
 from hydraserve.engine import (
@@ -75,6 +75,47 @@ def test_pd_recovery_rpc_carries_exact_history_without_prefill_sampling() -> Non
     assert command["generated_token_ids"] == (8, 9, 10)
     assert command["replay_token_ids"] == (1, 2, 8, 9)
     assert backend.released == []
+
+
+def test_fixed_pd_prepare_rpc_waits_for_final_response_after_receiver_armed() -> None:
+    class AliveProcess:
+        @staticmethod
+        def is_alive():
+            return True
+
+    backend = object.__new__(DisaggregatedGenerationBackend)
+    backend._decode_lock = Lock()
+    backend._decode = AliveProcess()
+    backend._decode_commands = Queue()
+    backend._decode_responses = Queue()
+    backend.operation_timeout = 2.0
+    receiver_armed = Event()
+    results = {}
+
+    thread = Thread(
+        target=lambda: results.setdefault(
+            "prepare",
+            backend._decode_rpc(
+                {"op": "prepare", "request_id": 7},
+                "prepare",
+                7,
+                receiver_armed=receiver_armed,
+            ),
+        )
+    )
+    thread.start()
+    backend._decode_commands.get(timeout=1)
+    backend._decode_responses.put({"op": "prepare_armed", "request_id": 7})
+
+    assert receiver_armed.wait(1)
+    assert thread.is_alive()
+
+    backend._decode_responses.put(
+        {"op": "prepare", "request_id": 7, "token_id": 11}
+    )
+    thread.join(1)
+    assert not thread.is_alive()
+    assert results["prepare"]["token_id"] == 11
 
 
 def test_fixed_pd_detects_dead_prefill_before_waiting_for_rpc_timeout() -> None:

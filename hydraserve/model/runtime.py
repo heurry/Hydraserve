@@ -408,7 +408,15 @@ class QwenTextRuntime:
                 chunk_callback(start, end, state)
         return logits, state
 
-    def decode_batch(self, input_ids, states: list[RuntimeState], paged_cache, request_ids):
+    def decode_batch(
+        self,
+        input_ids,
+        states: list[RuntimeState],
+        paged_cache,
+        request_ids,
+        *,
+        use_cuda_graphs: bool = True,
+    ):
         """Advance heterogeneous requests by one token in a shared decode batch."""
         from contextlib import nullcontext
 
@@ -426,6 +434,7 @@ class QwenTextRuntime:
         with context as pooled_batch:
             if (
                 pooled_batch is not None
+                and use_cuda_graphs
                 and self._use_cuda_graphs()
             ):
                 return self._decode_batch_graph(
@@ -800,7 +809,11 @@ class QwenTextRuntime:
                         advance_sequence=False,
                     )
             torch.cuda.current_stream().wait_stream(stream)
-            with torch.cuda.graph(graph):
+            # D-side state installation runs on another host thread/stream.
+            # Thread-local capture mode permits unrelated CUDA work from that
+            # thread; the decode worker additionally stays eager while a
+            # prepare is already known to be active.
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 self._decode_batch_transaction(
                     input_ids,
                     states,

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from typing import Callable
 
 from hydraserve.engine.scheduler import Request, RequestState
 from hydraserve.engine.sampling import TokenSample, sample_logits
 from hydraserve.model.runtime import RuntimeState
+from hydraserve.transfer.backend import TransferCancelledError
 from hydraserve.transfer.pipeline import TransferPipeline
 from hydraserve.transfer.runtime_codec import RuntimeStateCodec
 from hydraserve.transfer.descriptor import TransferMode
@@ -306,6 +308,8 @@ class DecodeWorker:
         streamed_transfer: bool = False,
         host_prefix_tokens: int = 0,
         host_match=None,
+        receiver_armed_callback: Callable[[], None] | None = None,
+        cancel_event=None,
     ) -> DecodePrepared:
         import torch
 
@@ -361,13 +365,27 @@ class DecodeWorker:
                     host_match.payload,
                     start=0,
                 )
+            # Signal readiness only after the reservation and optional host
+            # prefix restore have succeeded. At this boundary the next action
+            # is the blocking receive, so a producer cannot fill the bounded
+            # ring before a viable consumer exists.
+            if cancel_event is not None and cancel_event.is_set():
+                raise TransferCancelledError("decode prepare was cancelled before receive")
+            if receiver_armed_callback is not None:
+                receiver_armed_callback()
             if streamed_transfer:
                 received_ranges = self.pipeline.begin_chunked_receive(
-                    request.request_id, timeout=timeout
+                    request.request_id,
+                    timeout=timeout,
+                    cancel_event=cancel_event,
                 )
                 for start, end in received_ranges:
                     payload = self.pipeline.receive_kv_chunk(
-                        request.request_id, start, end, timeout=timeout
+                        request.request_id,
+                        start,
+                        end,
+                        timeout=timeout,
+                        cancel_event=cancel_event,
                     )
                     RuntimeStateCodec.install_kv_range(
                         self.runtime.config,
@@ -377,7 +395,11 @@ class DecodeWorker:
                         start=start,
                     )
                     received_chunks.append(payload)
-            descriptor, bundle = self.pipeline.receive(request.request_id, timeout=timeout)
+            descriptor, bundle = self.pipeline.receive(
+                request.request_id,
+                timeout=timeout,
+                cancel_event=cancel_event,
+            )
             if descriptor.host_cache_hit and host_match is None:
                 if self.host_cache is None:
                     raise RuntimeError("host KV restore requested without HiCache L2")

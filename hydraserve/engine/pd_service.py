@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import json
 import multiprocessing as mp
 import os
 from pathlib import Path
 from queue import Empty
+import sys
 from threading import Event, Lock, RLock, Thread, local
 from time import monotonic
 from uuid import uuid4
@@ -25,6 +27,20 @@ from hydraserve.router import (
     RouteDecision,
     RouteReason,
 )
+
+
+def _pd_protocol_trace(phase: str, request_id: int, **fields) -> None:
+    """Emit opt-in machine-readable PD phase diagnostics to worker stderr."""
+    if os.environ.get("HYDRASERVE_PROTOCOL_TRACE", "0") != "1":
+        return
+    record = {
+        "component": "hydraserve_pd_protocol",
+        "phase": phase,
+        "request_id": request_id,
+        "monotonic_s": monotonic(),
+        **fields,
+    }
+    print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +63,7 @@ class PDWorkerConfig:
     transfer_quant: str | None = None
     transfer_target_bytes: int = 8 << 20
     max_inflight_transfer_chunks: int = 2
+    max_concurrent_prepares: int = 2
     shm_ring_slots: int = 3
     shm_ring_slot_bytes: int = 64 << 20
     worker_log_dir: str = ""
@@ -924,6 +941,7 @@ def _decode_worker(
         from hydraserve.model.runtime import QwenTextRuntime
         from hydraserve.transfer import (
             NetworkBootstrapClient,
+            TransferCancelledError,
             TransferPipeline,
         )
 
@@ -1014,8 +1032,10 @@ def _decode_worker(
             cache,
             host_cache=host_cache,
         )
+        # Receive-side ring demultiplexing makes concurrent prepare safe.
+        # Keep this limit independent from P-side chunk submission depth.
         prepare_executor = ThreadPoolExecutor(
-            max_workers=config.max_inflight_transfer_chunks
+            max_workers=config.max_concurrent_prepares
         )
         requests = {}
         states = {}
@@ -1036,6 +1056,7 @@ def _decode_worker(
         state_lock = _ThreadLock()
         host_reservations = {}
         preparing = set()
+        prepare_cancellations = {}
 
         def capacity_payload():
             with state_lock:
@@ -1086,9 +1107,15 @@ def _decode_worker(
                 dtype=torch.long,
             ).unsqueeze(1)
             batch_states = [states[request_id] for request_id in request_ids]
+            with state_lock:
+                allow_cuda_graph = not preparing
             with torch.inference_mode():
                 logits, _ = runtime.decode_batch(
-                    input_ids, batch_states, cache, request_ids
+                    input_ids,
+                    batch_states,
+                    cache,
+                    request_ids,
+                    use_cuda_graphs=allow_cuda_graph,
                 )
             samples = sample_logits(
                 logits[:, -1],
@@ -1156,7 +1183,15 @@ def _decode_worker(
             responses.rpc_id = command.get("rpc_id")
             if operation == "shutdown":
                 with state_lock:
-                    live_ids = tuple(set(states) | reservations)
+                    active_prepares = tuple(prepare_cancellations.items())
+                    active_prepare_ids = set(prepare_cancellations)
+                    live_ids = tuple(
+                        (set(states) | reservations) - active_prepare_ids
+                    )
+                    for _, cancel_event in active_prepares:
+                        cancel_event.set()
+                for request_id, _ in active_prepares:
+                    worker.pipeline.cancel_receive(request_id)
                 for request_id in live_ids:
                     cache.free(request_id)
                 if host_cache is not None:
@@ -1267,6 +1302,20 @@ def _decode_worker(
                         )
                 elif operation == "prepare":
                     request_id = command["request_id"]
+                    with state_lock:
+                        duplicate_prepare = request_id in preparing
+                    if duplicate_prepare:
+                        responses.put(
+                            {
+                                "op": "error",
+                                "request_id": request_id,
+                                "message": "request prepare is already in progress",
+                            }
+                        )
+                        continue
+                    _pd_protocol_trace(
+                        "d_prepare_command", request_id, worker_index=worker_index
+                    )
                     host_lease = host_reservations.get(request_id)
                     request = _request(
                         request_id,
@@ -1275,6 +1324,7 @@ def _decode_worker(
                         transferred=True,
                         sampling_params=command.get("sampling_params"),
                     )
+                    cancel_event = Event()
 
                     # Overlap the transfer/install (SHM receive, KV install,
                     # N-1 replay) with the decode loop: other requests keep
@@ -1286,9 +1336,24 @@ def _decode_worker(
                         command=command,
                         host_lease=host_lease,
                         rpc_id=command.get("rpc_id"),
+                        cancel_event=cancel_event,
                     ):
                         responses.rpc_id = rpc_id
+                        failed = False
                         try:
+                            def receiver_armed() -> None:
+                                _pd_protocol_trace(
+                                    "d_receiver_armed",
+                                    request_id,
+                                    worker_index=worker_index,
+                                )
+                                responses.put(
+                                    {
+                                        "op": "prepare_armed",
+                                        "request_id": request_id,
+                                    }
+                                )
+
                             prepared = worker.receive_and_prepare(
                                 request,
                                 timeout=command.get("timeout"),
@@ -1301,11 +1366,26 @@ def _decode_worker(
                                     command.get("host_prefix_tokens", 0)
                                 ),
                                 host_match=host_lease,
+                                receiver_armed_callback=receiver_armed,
+                                cancel_event=cancel_event,
+                            )
+                            _pd_protocol_trace(
+                                "d_transfer_installed",
+                                request_id,
+                                worker_index=worker_index,
                             )
                             with state_lock:
+                                if cancel_event.is_set():
+                                    raise TransferCancelledError(
+                                        "decode prepare was cancelled before install"
+                                    )
                                 requests[request_id] = request
                                 states[request_id] = state_pool.install(
                                     request_id, prepared.state
+                                )
+                            if cancel_event.is_set():
+                                raise TransferCancelledError(
+                                    "decode prepare was cancelled after install"
                                 )
                             responses.put(
                                 {
@@ -1316,6 +1396,13 @@ def _decode_worker(
                                 }
                             )
                         except Exception as exc:
+                            failed = True
+                            _pd_protocol_trace(
+                                "d_prepare_failed",
+                                request_id,
+                                worker_index=worker_index,
+                                error=repr(exc),
+                            )
                             responses.put(
                                 {
                                     "op": "error",
@@ -1326,6 +1413,28 @@ def _decode_worker(
                         finally:
                             with state_lock:
                                 preparing.discard(request_id)
+                                prepare_cancellations.pop(request_id, None)
+                                should_cleanup = failed or cancel_event.is_set()
+                                if should_cleanup:
+                                    reservations.discard(request_id)
+                                    states.pop(request_id, None)
+                                    state_pool.free(request_id)
+                                    requests.pop(request_id, None)
+                            if should_cleanup:
+                                try:
+                                    # Mark all remaining request keys as
+                                    # cancelled before freeing device state.
+                                    # The resident ring dispatcher then drains
+                                    # P-side chunks that were already in flight.
+                                    worker.pipeline.cancel_receive(request_id)
+                                except Exception as cancel_exc:
+                                    _pd_protocol_trace(
+                                        "d_prepare_cancel_failed",
+                                        request_id,
+                                        worker_index=worker_index,
+                                        error=repr(cancel_exc),
+                                    )
+                                cache.free(request_id)
                             lease = host_reservations.pop(request_id, None)
                             if lease is not None and host_cache is not None:
                                 host_cache.unpin(lease)
@@ -1333,15 +1442,36 @@ def _decode_worker(
 
                     with state_lock:
                         preparing.add(request_id)
+                        prepare_cancellations[request_id] = cancel_event
                     try:
                         prepare_executor.submit(prepare_in_background)
                     except Exception:
                         with state_lock:
                             preparing.discard(request_id)
+                            prepare_cancellations.pop(request_id, None)
                         lease = host_reservations.pop(request_id, None)
                         if lease is not None and host_cache is not None:
                             host_cache.unpin(lease)
                         raise
+                elif operation == "cancel_prepare":
+                    request_id = command["request_id"]
+                    _pd_protocol_trace(
+                        "d_prepare_cancel", request_id, worker_index=worker_index
+                    )
+                    with state_lock:
+                        cancel_event = prepare_cancellations.get(request_id)
+                        if cancel_event is not None:
+                            cancel_event.set()
+                    if cancel_event is not None:
+                        worker.pipeline.cancel_receive(request_id)
+                    if not command.get("fire_and_forget", False):
+                        responses.put(
+                            {
+                                "op": "cancel_prepare",
+                                "request_id": request_id,
+                                "cancelled": cancel_event is not None,
+                            }
+                        )
                 elif operation == "collocated_prepare":
                     request_id = command["request_id"]
                     if request_id not in reservations:
@@ -1447,15 +1577,21 @@ def _decode_worker(
                     request_id = command["request_id"]
                     with state_lock:
                         is_preparing = request_id in preparing
-                        reservations.discard(request_id)
-                        states.pop(request_id, None)
-                        state_pool.free(request_id)
-                        requests.pop(request_id, None)
-                    if not is_preparing:
+                        cancel_event = prepare_cancellations.get(request_id)
+                        if is_preparing and cancel_event is not None:
+                            cancel_event.set()
+                        if not is_preparing:
+                            reservations.discard(request_id)
+                            states.pop(request_id, None)
+                            state_pool.free(request_id)
+                            requests.pop(request_id, None)
+                    if is_preparing:
+                        worker.pipeline.cancel_receive(request_id)
+                    else:
                         lease = host_reservations.pop(request_id, None)
                         if lease is not None and host_cache is not None:
                             host_cache.unpin(lease)
-                    cache.free(request_id)
+                        cache.free(request_id)
                     responses.put(
                         {"op": "release", "request_id": request_id, **capacity_payload()}
                     )
@@ -1518,6 +1654,7 @@ class DisaggregatedGenerationBackend:
         *,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        receiver_arm_timeout: float = 10.0,
         max_worker_restarts: int = 3,
         worker_restart_backoff_s: float = 0.5,
     ) -> None:
@@ -1532,6 +1669,7 @@ class DisaggregatedGenerationBackend:
             config.prefix_cache_min_frequency,
             config.transfer_target_bytes,
             config.max_inflight_transfer_chunks,
+            config.max_concurrent_prepares,
             config.shm_ring_slots,
             config.shm_ring_slot_bytes,
             config.prefill_preempt_max_ops,
@@ -1545,7 +1683,12 @@ class DisaggregatedGenerationBackend:
             raise ValueError("transfer_backend must be shm-ring or shm")
         if config.transfer_quant not in {None, "int8"}:
             raise ValueError("transfer_quant must be None or int8")
-        if max_worker_restarts <= 0 or worker_restart_backoff_s < 0:
+        if (
+            max_worker_restarts <= 0
+            or worker_restart_backoff_s < 0
+            or receiver_arm_timeout <= 0
+            or operation_timeout <= 0
+        ):
             raise ValueError("invalid worker recovery policy")
         total_blocks = (
             config.cache_tokens + config.block_size - 1
@@ -1555,6 +1698,7 @@ class DisaggregatedGenerationBackend:
         self.config = config
         self.supports_async_prefill = True
         self.operation_timeout = operation_timeout
+        self.receiver_arm_timeout = min(receiver_arm_timeout, operation_timeout)
         self.startup_timeout = startup_timeout
         self.max_worker_restarts = max_worker_restarts
         self.worker_restart_backoff_s = worker_restart_backoff_s
@@ -1687,12 +1831,10 @@ class DisaggregatedGenerationBackend:
             "host_cache_hit": host_cache_hit,
             "host_prefix_tokens": host_prefix_tokens,
         }
-        # Start decode-side manifest/chunk receive before prefill compute. The
-        # transfer and KV installation then progress chunk-by-chunk while the
-        # prefill GPU produces later chunks.
-        prefill_future = self._pd_executor.submit(
-            self._prefill_rpc, command, request.request_id
-        )
+        # Start the D-side receive thread before prefill compute. Queue.put()
+        # alone is not a receiver-ready handshake: the acknowledgement below
+        # is emitted from the actual D prepare executor thread.
+        receiver_armed = Event()
         prepare_future = self._pd_executor.submit(
             self._decode_rpc,
             {
@@ -1702,9 +1844,51 @@ class DisaggregatedGenerationBackend:
             },
             "prepare",
             request.request_id,
+            receiver_armed=receiver_armed,
         )
-        result = prefill_future.result()
-        prepared = prepare_future.result()
+        _pd_protocol_trace("coordinator_prepare_dispatched", request.request_id)
+        try:
+            arm_timeout = getattr(
+                self, "receiver_arm_timeout", min(10.0, self.operation_timeout)
+            )
+            if not receiver_armed.wait(arm_timeout):
+                if prepare_future.done():
+                    prepare_future.result()
+                raise TimeoutError("decode receiver was not armed before PD transfer")
+            _pd_protocol_trace("coordinator_receiver_armed", request.request_id)
+            _pd_protocol_trace("coordinator_prefill_started", request.request_id)
+            prefill_future = self._pd_executor.submit(
+                self._prefill_rpc, command, request.request_id
+            )
+            # Observe both halves instead of blocking on P first. If D rejects
+            # an install, its cleanup marks the remaining ring keys cancelled
+            # and this coordinator can fail immediately rather than waiting
+            # for a producer stuck behind ring backpressure.
+            done, _ = wait(
+                (prefill_future, prepare_future),
+                return_when=FIRST_COMPLETED,
+            )
+            if prepare_future in done:
+                prepared = prepare_future.result()
+            if prefill_future in done:
+                result = prefill_future.result()
+            result = prefill_future.result()
+            _pd_protocol_trace("coordinator_prefill_finished", request.request_id)
+            prepared = prepare_future.result()
+            _pd_protocol_trace("coordinator_prepare_finished", request.request_id)
+        except Exception:
+            if not prepare_future.done() and self._decode.is_alive():
+                # Fixed-PD uses a FIFO response queue guarded by _decode_lock.
+                # This command must therefore be response-free; the cancelled
+                # prepare's own terminal error wakes its existing RPC waiter.
+                self._decode_commands.put(
+                    {
+                        "op": "cancel_prepare",
+                        "request_id": request.request_id,
+                        "fire_and_forget": True,
+                    }
+                )
+            raise
         if result["token_id"] != prepared["token_id"]:
             raise RuntimeError("prefill/decode first-token mismatch")
         if not prepared.get("replay_consistent", True):
@@ -1943,7 +2127,12 @@ class DisaggregatedGenerationBackend:
         return result
 
     def _decode_rpc(
-        self, command: dict, expected_op: str, request_id: int | None = None
+        self,
+        command: dict,
+        expected_op: str,
+        request_id: int | None = None,
+        *,
+        receiver_armed: Event | None = None,
     ) -> dict:
         failure = None
         with self._decode_lock:
@@ -1951,7 +2140,25 @@ class DisaggregatedGenerationBackend:
                 if not self._decode.is_alive():
                     raise PDWorkerUnavailableError("decode worker is not running")
                 self._decode_commands.put(command)
-                result = self._get_worker_response("decode", self.operation_timeout)
+                while True:
+                    result = self._get_worker_response(
+                        "decode", self.operation_timeout
+                    )
+                    if result.get("op") != "prepare_armed":
+                        break
+                    if expected_op != "prepare":
+                        raise RuntimeError(
+                            "received prepare_armed for a non-prepare RPC"
+                        )
+                    if (
+                        request_id is not None
+                        and result.get("request_id") != request_id
+                    ):
+                        raise RuntimeError(
+                            "decode receiver armed a different request"
+                        )
+                    if receiver_armed is not None:
+                        receiver_armed.set()
             except (TimeoutError, PDWorkerUnavailableError) as exc:
                 failure = exc
         if failure is not None:
@@ -2164,6 +2371,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
         router: AdaptiveRouter | None = None,
         startup_timeout: float = 180.0,
         operation_timeout: float = 600.0,
+        receiver_arm_timeout: float = 10.0,
         max_worker_restarts: int = 3,
         worker_restart_backoff_s: float = 0.5,
     ) -> None:
@@ -2178,6 +2386,7 @@ class AdaptiveGenerationBackend(DisaggregatedGenerationBackend):
             config,
             startup_timeout=startup_timeout,
             operation_timeout=operation_timeout,
+            receiver_arm_timeout=receiver_arm_timeout,
             max_worker_restarts=max_worker_restarts,
             worker_restart_backoff_s=worker_restart_backoff_s,
         )

@@ -10,18 +10,23 @@ import socket
 import socketserver
 from threading import Thread
 
+from hydraserve.transfer.backend import TransferCancelledError
+
 
 class BootstrapRegistry:
     """One-shot request metadata registry, separate from the tensor data plane."""
 
     def __init__(self) -> None:
         self._messages = defaultdict(dict)
+        self._cancelled = set()
         self._condition = Condition()
 
     def publish(self, request_id: int, kind: str, metadata: dict) -> None:
         if request_id < 0 or not kind or not isinstance(metadata, dict):
             raise ValueError("invalid bootstrap metadata")
         with self._condition:
+            if (request_id, kind) in self._cancelled:
+                raise TransferCancelledError("bootstrap handshake was cancelled")
             if kind in self._messages[request_id]:
                 raise RuntimeError("bootstrap metadata was already published")
             self._messages[request_id][kind] = dict(metadata)
@@ -33,6 +38,8 @@ class BootstrapRegistry:
         deadline = None if timeout is None else monotonic() + timeout
         with self._condition:
             while kind not in self._messages.get(request_id, {}):
+                if (request_id, kind) in self._cancelled:
+                    raise TransferCancelledError("bootstrap handshake was cancelled")
                 remaining = None if deadline is None else deadline - monotonic()
                 if remaining is not None and remaining <= 0:
                     raise TimeoutError("bootstrap metadata handshake timed out")
@@ -41,6 +48,18 @@ class BootstrapRegistry:
             if not self._messages[request_id]:
                 self._messages.pop(request_id, None)
             return metadata
+
+    def cancel(self, request_id: int, kind: str) -> None:
+        if request_id < 0 or not kind:
+            raise ValueError("invalid bootstrap cancellation")
+        with self._condition:
+            self._cancelled.add((request_id, kind))
+            request_messages = self._messages.get(request_id)
+            if request_messages is not None:
+                request_messages.pop(kind, None)
+                if not request_messages:
+                    self._messages.pop(request_id, None)
+            self._condition.notify_all()
 
 
 class BootstrapClient:
@@ -57,27 +76,40 @@ class BootstrapClient:
     ) -> dict:
         return self.registry.consume(request_id, kind, timeout=timeout)
 
+    def cancel(self, request_id: int, kind: str) -> None:
+        self.registry.cancel(request_id, kind)
+
 
 class _BootstrapTCPHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
-        request = json.loads(self.rfile.readline().decode("utf-8"))
-        registry = self.server.registry  # type: ignore[attr-defined]
-        if request["op"] == "publish":
-            registry.publish(
-                int(request["request_id"]), request["kind"], request["metadata"]
-            )
-            response = {"ok": True}
-        elif request["op"] == "consume":
+        try:
+            request = json.loads(self.rfile.readline().decode("utf-8"))
+            registry = self.server.registry  # type: ignore[attr-defined]
+            if request["op"] == "publish":
+                registry.publish(
+                    int(request["request_id"]), request["kind"], request["metadata"]
+                )
+                response = {"ok": True}
+            elif request["op"] == "consume":
+                response = {
+                    "ok": True,
+                    "metadata": registry.consume(
+                        int(request["request_id"]),
+                        request["kind"],
+                        timeout=request.get("timeout"),
+                    ),
+                }
+            elif request["op"] == "cancel":
+                registry.cancel(int(request["request_id"]), request["kind"])
+                response = {"ok": True}
+            else:
+                response = {"ok": False, "error": "unknown bootstrap operation"}
+        except Exception as exc:
             response = {
-                "ok": True,
-                "metadata": registry.consume(
-                    int(request["request_id"]),
-                    request["kind"],
-                    timeout=request.get("timeout"),
-                ),
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
             }
-        else:
-            response = {"ok": False, "error": "unknown bootstrap operation"}
         self.wfile.write(json.dumps(response, separators=(",", ":")).encode() + b"\n")
 
 
@@ -138,6 +170,8 @@ class NetworkBootstrapClient:
                 response += part
         decoded = json.loads(response.decode("utf-8"))
         if not decoded.get("ok"):
+            if decoded.get("error_type") == "TransferCancelledError":
+                raise TransferCancelledError(decoded.get("error", "cancelled"))
             raise RuntimeError(decoded.get("error", "bootstrap request failed"))
         return decoded
 
@@ -163,3 +197,12 @@ class NetworkBootstrapClient:
             },
             timeout=None if timeout is None else timeout + 0.25,
         )["metadata"]
+
+    def cancel(self, request_id: int, kind: str) -> None:
+        self._call(
+            {
+                "op": "cancel",
+                "request_id": request_id,
+                "kind": kind,
+            }
+        )
