@@ -228,6 +228,34 @@ def main() -> int:
         help="wait this long for a busy Hybrid prefill slot before a Long request "
         "falls back to collocated execution on a D-bound worker",
     )
+    serve_parser.add_argument(
+        "--pd-prefill-token-budget",
+        type=int,
+        default=0,
+        help="maximum outstanding Long prompt tokens admitted to the P/Hybrid pool "
+        "(0 disables the token-aware guard)",
+    )
+    serve_parser.add_argument(
+        "--hybrid-short-max-prefill-backlog-tokens",
+        type=int,
+        default=0,
+        help="allow Hybrid to serve new Short requests only when its outstanding "
+        "prefill backlog is at or below this token budget (0 disables)",
+    )
+    serve_parser.add_argument(
+        "--hybrid-short-max-assigned-work",
+        type=int,
+        default=0,
+        help="allow Hybrid to serve new Short requests only when its assigned "
+        "token work is at or below this budget (0 disables)",
+    )
+    serve_parser.add_argument(
+        "--hybrid-long-pressure-hold-ms",
+        type=float,
+        default=0.0,
+        help="after a Long request is deferred waiting for Hybrid/P capacity, "
+        "keep idle Hybrid workers out of the Short pool for this long (0 disables)",
+    )
     serve_parser.add_argument("--cache-tokens", type=int, default=65536)
     serve_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     serve_parser.add_argument("--block-size", type=int, default=16)
@@ -394,6 +422,34 @@ def main() -> int:
         help="wait this long for a busy Hybrid prefill slot before a Long request "
         "falls back to collocated execution on a D-bound worker",
     )
+    benchmark_parser.add_argument(
+        "--pd-prefill-token-budget",
+        type=int,
+        default=0,
+        help="maximum outstanding Long prompt tokens admitted to the P/Hybrid pool "
+        "(0 disables the token-aware guard)",
+    )
+    benchmark_parser.add_argument(
+        "--hybrid-short-max-prefill-backlog-tokens",
+        type=int,
+        default=0,
+        help="allow Hybrid to serve new Short requests only when its outstanding "
+        "prefill backlog is at or below this token budget (0 disables)",
+    )
+    benchmark_parser.add_argument(
+        "--hybrid-short-max-assigned-work",
+        type=int,
+        default=0,
+        help="allow Hybrid to serve new Short requests only when its assigned "
+        "token work is at or below this budget (0 disables)",
+    )
+    benchmark_parser.add_argument(
+        "--hybrid-long-pressure-hold-ms",
+        type=float,
+        default=0.0,
+        help="after a Long request is deferred waiting for Hybrid/P capacity, "
+        "keep idle Hybrid workers out of the Short pool for this long (0 disables)",
+    )
     benchmark_parser.add_argument("--cache-tokens", type=int, default=65536)
     benchmark_parser.add_argument("--kv-headroom-blocks", type=int, default=0)
     benchmark_parser.add_argument("--block-size", type=int, default=16)
@@ -498,6 +554,14 @@ def main() -> int:
             parser.error("host prefix cache size cannot be negative")
         if args.max_preemptions_per_request < 0:
             parser.error("--max-preemptions-per-request cannot be negative")
+        if args.pd_prefill_token_budget < 0:
+            parser.error("--pd-prefill-token-budget cannot be negative")
+        if args.hybrid_short_max_prefill_backlog_tokens < 0:
+            parser.error("--hybrid-short-max-prefill-backlog-tokens cannot be negative")
+        if args.hybrid_short_max_assigned_work < 0:
+            parser.error("--hybrid-short-max-assigned-work cannot be negative")
+        if args.hybrid_long_pressure_hold_ms < 0:
+            parser.error("--hybrid-long-pressure-hold-ms cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
@@ -565,6 +629,12 @@ def main() -> int:
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                     hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
                     hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
+                    pd_prefill_token_budget=args.pd_prefill_token_budget,
+                    hybrid_short_max_prefill_backlog_tokens=(
+                        args.hybrid_short_max_prefill_backlog_tokens
+                    ),
+                    hybrid_short_max_assigned_work=args.hybrid_short_max_assigned_work,
+                    hybrid_long_pressure_hold_ms=args.hybrid_long_pressure_hold_ms,
                 ),
                 router=router,
                 receiver_dispatch_timeout=args.pd_receiver_dispatch_timeout_s,
@@ -760,6 +830,14 @@ def main() -> int:
             parser.error("host prefix cache size cannot be negative")
         if args.max_preemptions_per_request < 0:
             parser.error("--max-preemptions-per-request cannot be negative")
+        if args.pd_prefill_token_budget < 0:
+            parser.error("--pd-prefill-token-budget cannot be negative")
+        if args.hybrid_short_max_prefill_backlog_tokens < 0:
+            parser.error("--hybrid-short-max-prefill-backlog-tokens cannot be negative")
+        if args.hybrid_short_max_assigned_work < 0:
+            parser.error("--hybrid-short-max-assigned-work cannot be negative")
+        if args.hybrid_long_pressure_hold_ms < 0:
+            parser.error("--hybrid-long-pressure-hold-ms cannot be negative")
         cache_blocks = (args.cache_tokens + args.block_size - 1) // args.block_size
         if not 0 <= args.kv_headroom_blocks < cache_blocks:
             parser.error("--kv-headroom-blocks must be below physical cache blocks")
@@ -1044,6 +1122,12 @@ def main() -> int:
                     prefill_preempt_max_ops=args.prefill_preempt_max_ops,
                     hybrid_prefill_reserve_tokens=args.hybrid_prefill_reserve_tokens,
                     hybrid_long_overflow_ms=args.hybrid_long_overflow_ms,
+                    pd_prefill_token_budget=args.pd_prefill_token_budget,
+                    hybrid_short_max_prefill_backlog_tokens=(
+                        args.hybrid_short_max_prefill_backlog_tokens
+                    ),
+                    hybrid_short_max_assigned_work=args.hybrid_short_max_assigned_work,
+                    hybrid_long_pressure_hold_ms=args.hybrid_long_pressure_hold_ms,
                 ),
                 router=router,
                 receiver_dispatch_timeout=args.pd_receiver_dispatch_timeout_s,

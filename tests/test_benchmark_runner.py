@@ -86,6 +86,35 @@ def test_benchmark_resets_online_router_state_after_warmup() -> None:
     assert backend.reset_count == 1
 
 
+def test_benchmark_marks_short_trace_records_as_higher_priority() -> None:
+    class PriorityBackend(Backend):
+        def __init__(self):
+            super().__init__()
+            self.priorities: dict[tuple[int, ...], int] = {}
+
+        def prefill(self, request):
+            self.priorities[tuple(request.token_ids)] = request.priority
+            return super().prefill(request)
+
+    backend = PriorityBackend()
+    loop = ContinuousGenerationLoop(backend)
+    run_benchmark(
+        loop,
+        Tokenizer(),
+        [
+            BenchmarkSample("toy", "s", "s", klass="short"),
+            BenchmarkSample("toy", "l", "l", klass="long"),
+            BenchmarkSample("toy", "d", "d"),
+        ],
+        max_new_tokens=1,
+    )
+    loop.close()
+
+    assert backend.priorities[tuple(Tokenizer().encode("s"))] == 1
+    assert backend.priorities[tuple(Tokenizer().encode("l"))] == 0
+    assert backend.priorities[tuple(Tokenizer().encode("d"))] == 0
+
+
 def test_benchmark_records_request_error() -> None:
     class FailingBackend(Backend):
         def prefill(self, request):

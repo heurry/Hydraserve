@@ -505,6 +505,17 @@ def run_benchmark(
             token_ids = token_ids[-max_prompt_tokens:]
         return token_ids
 
+    def sample_priority(sample: BenchmarkSample) -> int:
+        """Give interactive Short trace records first-class admission priority.
+
+        The V5 comparison is about serving quality under mixed traffic, not
+        about letting burst ordering accidentally starve Short requests behind
+        Long prefill.  Applying the same priority to DP and H1 keeps the
+        baseline honest.
+        """
+
+        return 1 if sample.klass == "short" else 0
+
     for sample in warmups:
         handle = generation_loop.submit(
             encode(sample),
@@ -542,7 +553,10 @@ def run_benchmark(
         handle = None
         try:
             handle = generation_loop.submit(
-                token_ids, per_sample_max, ignore_eos=sample.ignore_eos
+                token_ids,
+                per_sample_max,
+                ignore_eos=sample.ignore_eos,
+                priority=sample_priority(sample),
             )
             for event in handle:
                 now = perf_counter()

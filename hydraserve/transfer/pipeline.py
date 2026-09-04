@@ -9,6 +9,7 @@ import numpy as np
 from hydraserve.cache.kv_quantizer import (
     Int4Tensor,
     Int8Tensor,
+    PagedInt8KVTensor,
     quantize_int4,
     quantize_int8,
 )
@@ -113,7 +114,8 @@ class TransferPipeline:
                 dtype, quantized = "int4", True
             elif mode is TransferMode.INT8_TRANSFER:
                 kv_payload = (
-                    state.kv_cache if isinstance(state.kv_cache, Int8Tensor)
+                    state.kv_cache
+                    if isinstance(state.kv_cache, (Int8Tensor, PagedInt8KVTensor))
                     else quantize_int8(state.kv_cache)
                 )
                 kv_shape = kv_payload.shape
@@ -237,7 +239,9 @@ class TransferPipeline:
             raise ValueError("partial transfer has no KV chunks")
         if mode is TransferMode.QUANTIZED_TRANSFER and not isinstance(payload, Int4Tensor):
             payload = quantize_int4(payload)
-        if mode is TransferMode.INT8_TRANSFER and not isinstance(payload, Int8Tensor):
+        if mode is TransferMode.INT8_TRANSFER and not isinstance(
+            payload, (Int8Tensor, PagedInt8KVTensor)
+        ):
             payload = quantize_int8(payload)
         self.backend.send(
             f"{self._key(request_id)}:chunks:{start}:{end}",

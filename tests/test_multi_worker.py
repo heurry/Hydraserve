@@ -17,6 +17,7 @@ from hydraserve.engine import (
     WorkerUnavailableError,
     WorkerStateLostError,
 )
+from hydraserve.engine.multi_worker import HybridRole
 from hydraserve.router import (
     AdaptiveRouter,
     DecodeWorkerRegistry,
@@ -160,9 +161,17 @@ def test_cluster_config_validates_conditional_and_prefill_short_policies() -> No
         prefill_short_policy="never",
         prefill_preempt_max_ops=4,
         hybrid_long_overflow_ms=250.0,
+        pd_prefill_token_budget=65536,
+        hybrid_short_max_prefill_backlog_tokens=1024,
+        hybrid_short_max_assigned_work=2048,
+        hybrid_long_pressure_hold_ms=750.0,
     )
     assert config.conditional_pd_tokens == 8192
     assert config.hybrid_long_overflow_ms == 250.0
+    assert config.pd_prefill_token_budget == 65536
+    assert config.hybrid_short_max_prefill_backlog_tokens == 1024
+    assert config.hybrid_short_max_assigned_work == 2048
+    assert config.hybrid_long_pressure_hold_ms == 750.0
     assert config.prefill_config(0).prefill_preempt_max_ops == 4
     with pytest.raises(ValueError, match="prefill_short_policy"):
         PDClusterConfig("model", ("cuda:1",), prefill_short_policy="always")
@@ -177,6 +186,16 @@ def test_cluster_config_validates_conditional_and_prefill_short_policies() -> No
     )
     with pytest.raises(ValueError, match="hybrid prefill reserve"):
         PDClusterConfig("model", ("cuda:1",), hybrid_prefill_reserve_tokens=-2)
+    with pytest.raises(ValueError, match="PD prefill token budget"):
+        PDClusterConfig("model", ("cuda:1",), pd_prefill_token_budget=-1)
+    with pytest.raises(ValueError, match="hybrid short prefill backlog"):
+        PDClusterConfig(
+            "model", ("cuda:1",), hybrid_short_max_prefill_backlog_tokens=-1
+        )
+    with pytest.raises(ValueError, match="hybrid short assigned-work"):
+        PDClusterConfig("model", ("cuda:1",), hybrid_short_max_assigned_work=-1)
+    with pytest.raises(ValueError, match="hybrid long pressure hold"):
+        PDClusterConfig("model", ("cuda:1",), hybrid_long_pressure_hold_ms=-1)
 
 
 def test_work_conserving_short_admission_balances_hybrid_with_decode_pool() -> None:
@@ -199,6 +218,148 @@ def test_work_conserving_short_admission_balances_hybrid_with_decode_pool() -> N
     pools = [request.worker_pool for request in requests]
     assert pools.count("prefill") == 2
     assert pools.count("decode") == 4
+
+
+def test_decode_admission_avoids_worker_with_outstanding_prefill_tokens() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    backend._ensure_hybrid_state()
+    backend._decode_prefill_tokens[0] = 16_000
+    backend._decode_assigned_work[0] = 16_512
+    backend.registry.update_capacity(0, BackendCapacity(10, 10, 4, 4))
+    backend.registry.update_capacity(1, BackendCapacity(10, 8, 4, 3))
+    request = ServingRequest(910, tuple(range(4)), 2)
+
+    assert backend.admit(request).admitted
+    assert request.worker_pool == "decode"
+    assert request.worker_id == 1
+    assert backend.rpc_calls[0] == ("reserve", 1, 910)
+
+
+def test_hybrid_short_admission_respects_token_weighted_backpressure() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+    backend._ensure_hybrid_state()
+    backend._prefill_prefill_tokens[0] = 4096
+    backend._prefill_assigned_work[0] = 4352
+    request = ServingRequest(911, tuple(range(4)), 2)
+
+    assert backend.admit(request).admitted
+    assert request.worker_pool == "decode"
+    assert request.route_reason == "conditional_short_collocated"
+
+
+def test_hybrid_short_budget_keeps_busy_hybrid_out_of_short_pool() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+    backend.config.hybrid_short_max_assigned_work = 1024
+    backend._ensure_hybrid_state()
+    backend._prefill_assigned_work[0] = 4096
+    request = ServingRequest(914, tuple(range(4)), 2)
+
+    assert backend.admit(request).admitted
+    assert request.worker_pool == "decode"
+    assert not any(call[0] == "prefill_serve" for call in backend.rpc_calls)
+
+
+def test_long_prefill_token_budget_defers_before_decode_reservation() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    backend.config.pd_prefill_token_budget = 16
+    backend._ensure_hybrid_state()
+    backend._prefill_prefill_tokens[0] = 12
+    backend.registry.update_capacity(0, BackendCapacity(10, 8, 4, 3))
+    backend.registry.update_capacity(1, BackendCapacity(10, 8, 4, 3))
+    request = ServingRequest(915, tuple(range(8)), 2)
+
+    decision = backend.admit(request)
+
+    assert not decision.admitted
+    assert decision.retryable
+    assert "token budget" in (decision.reason or "")
+    assert not backend.rpc_calls
+
+
+def test_long_prefill_token_budget_allows_overflow_after_grace() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    backend.config.pd_prefill_token_budget = 16
+    backend.config.hybrid_long_overflow_ms = 1
+    backend._ensure_hybrid_state()
+    backend._prefill_prefill_tokens[0] = 12
+    request = ServingRequest(916, tuple(range(8)), 2)
+    request.submitted_at -= 1.0
+
+    assert backend.admit(request).admitted
+    assert request.route == "collocated"
+    assert request.route_reason == "hybrid_queue_overflow"
+
+
+def test_token_weighted_load_accounting_is_released_for_decode_owner() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    request = ServingRequest(912, tuple(range(4)), 2)
+
+    assert backend.admit(request).admitted
+    worker_id = request.worker_id
+    assert backend._decode_assigned_work[worker_id] == 6
+    assert backend._decode_prefill_tokens[worker_id] == 4
+
+    backend._mark_decode_load_prefill_complete(request.request_id)
+    assert backend._decode_assigned_work[worker_id] == 2
+    assert backend._decode_prefill_tokens[worker_id] == 0
+
+    backend.release(request.request_id)
+    assert backend._decode_assigned_work[worker_id] == 0
+    assert backend._decode_prefill_tokens[worker_id] == 0
+    assert request.request_id not in backend._decode_request_loads
+
+
+def test_token_weighted_load_accounting_is_released_for_pd_prefill() -> None:
+    backend = FakeMultiWorkerBackend()
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "never"
+    request = ServingRequest(913, tuple(range(8)), 2)
+
+    assert backend.admit(request).admitted
+    assert request.route == "pd_disaggregated"
+    assert backend._prefill_assigned_work[0] == 8
+    assert backend._prefill_prefill_tokens[0] == 8
+
+    backend._mark_prefill_load_prefill_complete(request.request_id)
+    assert backend._prefill_assigned_work[0] == 0
+    assert backend._prefill_prefill_tokens[0] == 0
+
+    backend.release(request.request_id)
+    assert backend._prefill_assigned_work[0] == 0
+    assert backend._prefill_prefill_tokens[0] == 0
+    assert request.request_id not in backend._prefill_request_loads
 
 
 def test_long_prefill_pending_temporarily_removes_hybrid_from_short_pool() -> None:
@@ -229,6 +390,90 @@ def test_long_prefill_pending_temporarily_removes_hybrid_from_short_pool() -> No
     backend._release_long_prefill_binding(900)
     assert backend.hybrid_role_states == ("decode",)
     assert backend.capacity() == BackendCapacity(30, 30, 12, 12)
+
+
+def test_multi_hybrid_keeps_idle_peer_open_for_short_without_long_pressure() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.prefill_devices = ("cuda:0", "cuda:3")
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+    backend._prefill_processes = [
+        SimpleNamespace(is_alive=lambda: True),
+        SimpleNamespace(is_alive=lambda: True),
+    ]
+    backend._prefill_healthy = [True, True]
+    backend._prefill_pending = [0, 0]
+    backend._prefill_long_inflight = [1, 0]
+    backend._prefill_dispatch_claims = [0, 0]
+    backend._prefill_capacities = [
+        BackendCapacity(10, 10, 4, 4),
+        BackendCapacity(10, 10, 4, 4),
+    ]
+    backend._hybrid_roles = [HybridRole.PREFILL_ACTIVE, HybridRole.DECODE]
+    backend._prefill_assigned_work = [8, 0]
+    backend._prefill_prefill_tokens = [8, 0]
+    backend._prefill_request_loads = {}
+    for worker_id in range(2):
+        backend.registry.update_capacity(worker_id, BackendCapacity(10, 2, 4, 1))
+
+    short = ServingRequest(930, (1, 2, 3, 4), 2)
+
+    assert backend.admit(short).admitted
+    assert short.worker_pool == "prefill"
+    assert short.worker_id == 1
+    assert ("prefill_serve", 1, "reserve") in backend.rpc_calls
+
+
+def test_long_pressure_hold_closes_idle_hybrid_short_gate() -> None:
+    class HybridServingBackend(FakeMultiWorkerBackend):
+        def _prefill_serving_rpc(self, index, command, expected_op, request_id=None):
+            self.rpc_calls.append(("prefill_serve", index, command.get("op")))
+            return {
+                "op": expected_op,
+                "request_id": request_id,
+                "admitted": True,
+            }
+
+    backend = HybridServingBackend()
+    backend.config.prefill_devices = ("cuda:0", "cuda:3")
+    backend.config.conditional_pd_tokens = 8
+    backend.config.prefill_short_policy = "work-conserving"
+    backend.config.hybrid_prefill_reserve_tokens = 0
+    backend.config.hybrid_long_pressure_hold_ms = 1000.0
+    backend._prefill_processes = [
+        SimpleNamespace(is_alive=lambda: True),
+        SimpleNamespace(is_alive=lambda: True),
+    ]
+    backend._prefill_healthy = [True, True]
+    backend._prefill_pending = [0, 0]
+    backend._prefill_long_inflight = [0, 0]
+    backend._prefill_dispatch_claims = [0, 0]
+    backend._prefill_capacities = [
+        BackendCapacity(10, 10, 4, 4),
+        BackendCapacity(10, 10, 4, 4),
+    ]
+    backend._hybrid_roles = [HybridRole.DECODE, HybridRole.DECODE]
+    backend._prefill_assigned_work = [0, 0]
+    backend._prefill_prefill_tokens = [0, 0]
+    backend._prefill_request_loads = {}
+    backend._note_hybrid_long_pressure()
+
+    short = ServingRequest(931, (1, 2, 3, 4), 2)
+
+    assert backend.admit(short).admitted
+    assert short.worker_pool == "decode"
+    assert not any(call[0] == "prefill_serve" for call in backend.rpc_calls)
+    assert backend._hybrid_short_gate_closures == 1
 
 
 def test_second_conditional_long_falls_back_when_hybrid_slot_is_busy() -> None:

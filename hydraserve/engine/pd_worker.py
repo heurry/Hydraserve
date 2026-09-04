@@ -461,8 +461,10 @@ class DecodeWorker:
                         from hydraserve.cache import (
                             Int4Tensor,
                             Int8Tensor,
+                            PagedInt8KVTensor,
                             dequantize_int4,
                             dequantize_int8,
+                            dequantize_paged_int8_kv,
                         )
 
                         normalized = [
@@ -470,6 +472,8 @@ class DecodeWorker:
                             if isinstance(part, Int4Tensor)
                             else dequantize_int8(part)
                             if isinstance(part, Int8Tensor)
+                            else dequantize_paged_int8_kv(part)
+                            if isinstance(part, PagedInt8KVTensor)
                             else part
                             for part in parts
                         ]

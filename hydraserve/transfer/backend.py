@@ -12,7 +12,7 @@ from time import monotonic, sleep
 from typing import Any
 
 from hydraserve.transfer.descriptor import TransferMode
-from hydraserve.cache.kv_quantizer import Int4Tensor, Int8Tensor
+from hydraserve.cache.kv_quantizer import Int4Tensor, Int8Tensor, PagedInt8KVTensor
 
 
 class TransferCancelledError(RuntimeError):
@@ -287,6 +287,16 @@ class SharedMemoryTransferBackend(TransferBackend):
                     "group_size": value.group_size,
                     "original_dtype": value.original_dtype,
                 }
+            if isinstance(value, PagedInt8KVTensor):
+                return {
+                    "__hydra_paged_int8_kv__": True,
+                    "key": visit(value.key),
+                    "value": visit(value.value),
+                    "key_scales": visit(value.key_scales),
+                    "value_scales": visit(value.value_scales),
+                    "shape": list(value.shape),
+                    "original_dtype": value.original_dtype,
+                }
             if isinstance(value, np.ndarray):
                 contiguous = np.ascontiguousarray(value)
                 index = len(arrays)
@@ -334,6 +344,18 @@ class SharedMemoryTransferBackend(TransferBackend):
                     visit(value["scales"]),
                     tuple(int(item) for item in value["shape"]),
                     int(value["group_size"]),
+                    str(value["original_dtype"]),
+                )
+            if (
+                isinstance(value, dict)
+                and value.get("__hydra_paged_int8_kv__") is True
+            ):
+                return PagedInt8KVTensor(
+                    visit(value["key"]),
+                    visit(value["value"]),
+                    visit(value["key_scales"]),
+                    visit(value["value_scales"]),
+                    tuple(int(item) for item in value["shape"]),
                     str(value["original_dtype"]),
                 )
             if isinstance(value, dict) and "__hydra_ndarray__" in value:

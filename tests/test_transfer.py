@@ -6,9 +6,20 @@ from threading import Event, Thread
 
 import numpy as np
 import pytest
+import torch
 
 import hydraserve.transfer.backend as transfer_backend_module
-from hydraserve.cache import Int4Tensor, Int8Tensor, LinearState, dequantize_int8
+from hydraserve.cache import (
+    Int4Tensor,
+    Int8Tensor,
+    KVBlockManager,
+    LinearState,
+    PagedInt8KVTensor,
+    PagedKVCache,
+    dequantize_int8,
+    dequantize_paged_int8_kv,
+)
+from hydraserve.transfer.runtime_codec import RuntimeStateCodec
 from hydraserve.transfer import (
     CudaP2PTransferBackend,
     HybridStateBundle,
@@ -178,6 +189,103 @@ def test_int8_transfer_quantizes_and_shared_memory_round_trips(tiny_model) -> No
         assert received.kv_cache.nbytes < kv.nbytes / 2
     finally:
         backend.close()
+
+
+def test_raw_paged_int8_kv_transfer_round_trips_without_bf16_payload(tiny_model) -> None:
+    backend = InMemoryTransferBackend(TransferMode.INT8_TRANSFER)
+    pipeline = TransferPipeline(backend)
+    key = np.arange(
+        tiny_model.num_full_attention_layers
+        * 4
+        * tiny_model.num_kv_heads
+        * tiny_model.head_dim,
+        dtype=np.int8,
+    ).reshape(
+        tiny_model.num_full_attention_layers,
+        4,
+        tiny_model.num_kv_heads,
+        tiny_model.head_dim,
+    )
+    value = -key
+    key_scales = np.full(
+        (tiny_model.num_full_attention_layers, 4, tiny_model.num_kv_heads),
+        0.25,
+        dtype=np.float32,
+    )
+    value_scales = np.full_like(key_scales, 0.5)
+    raw = PagedInt8KVTensor(
+        key,
+        value,
+        key_scales,
+        value_scales,
+        (
+            tiny_model.num_full_attention_layers,
+            2,
+            4,
+            tiny_model.num_kv_heads,
+            tiny_model.head_dim,
+        ),
+        "bfloat16",
+    )
+
+    descriptor = pipeline.send(
+        61,
+        tiny_model,
+        4,
+        HybridStateBundle(_state(tiny_model), raw),
+        first_token_id=9,
+    )
+    _, received = pipeline.receive(61)
+
+    assert descriptor.regions[-1].dtype == "int8"
+    assert isinstance(received.kv_cache, PagedInt8KVTensor)
+    np.testing.assert_array_equal(received.kv_cache.key, key)
+    np.testing.assert_array_equal(received.kv_cache.value, value)
+    np.testing.assert_array_equal(received.kv_cache.key_scales, key_scales)
+    np.testing.assert_allclose(
+        dequantize_paged_int8_kv(received.kv_cache)[:, 0],
+        key.astype(np.float32) * key_scales[..., None],
+    )
+
+
+def test_runtime_codec_installs_raw_int8_cache_without_requantizing(tiny_model) -> None:
+    src = PagedKVCache(
+        tiny_model,
+        KVBlockManager(4, 4),
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_quant="int8",
+    )
+    dst = PagedKVCache(
+        tiny_model,
+        KVBlockManager(4, 4),
+        device="cpu",
+        dtype=torch.bfloat16,
+        kv_quant="int8",
+    )
+    src.allocate(71, 4)
+    dst.allocate(71, 4)
+    positions = torch.arange(4)
+    for layer_index in tiny_model.full_attention_layer_indices:
+        key = torch.linspace(-1, 1, 4 * tiny_model.num_kv_heads * tiny_model.head_dim)
+        key = key.reshape(4, tiny_model.num_kv_heads, tiny_model.head_dim)
+        value = key * 0.5
+        src.write(71, layer_index, positions, key, value)
+
+    payload = RuntimeStateCodec.extract_kv_range(
+        tiny_model, src, 71, 0, 4, mode=TransferMode.INT8_TRANSFER
+    )
+    assert isinstance(payload, PagedInt8KVTensor)
+    RuntimeStateCodec.install_kv_range(tiny_model, dst, 71, payload, start=0)
+    restored = RuntimeStateCodec.extract_kv_range(
+        tiny_model, dst, 71, 0, 4, mode=TransferMode.INT8_TRANSFER
+    )
+
+    assert isinstance(restored, PagedInt8KVTensor)
+    np.testing.assert_array_equal(restored.key, payload.key)
+    np.testing.assert_array_equal(restored.value, payload.value)
+    np.testing.assert_array_equal(restored.key_scales, payload.key_scales)
+    np.testing.assert_array_equal(restored.value_scales, payload.value_scales)
 
 
 def test_chunked_kv_manifest_and_final_bundle(tiny_model) -> None:

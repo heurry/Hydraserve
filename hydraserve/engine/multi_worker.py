@@ -87,6 +87,10 @@ class PDClusterConfig:
     prefill_preempt_max_ops: int = 8
     hybrid_prefill_reserve_tokens: int = -1
     hybrid_long_overflow_ms: float = 5000.0
+    pd_prefill_token_budget: int = 0
+    hybrid_short_max_prefill_backlog_tokens: int = 0
+    hybrid_short_max_assigned_work: int = 0
+    hybrid_long_pressure_hold_ms: float = 0.0
 
     def __post_init__(self) -> None:
         if not self.model_dir or not self.decode_devices:
@@ -158,6 +162,14 @@ class PDClusterConfig:
             raise ValueError("hybrid prefill reserve tokens must be -1 or non-negative")
         if self.hybrid_long_overflow_ms < 0:
             raise ValueError("hybrid long overflow wait must be non-negative")
+        if self.pd_prefill_token_budget < 0:
+            raise ValueError("PD prefill token budget cannot be negative")
+        if self.hybrid_short_max_prefill_backlog_tokens < 0:
+            raise ValueError("hybrid short prefill backlog budget cannot be negative")
+        if self.hybrid_short_max_assigned_work < 0:
+            raise ValueError("hybrid short assigned-work budget cannot be negative")
+        if self.hybrid_long_pressure_hold_ms < 0:
+            raise ValueError("hybrid long pressure hold must be non-negative")
 
     @property
     def effective_hybrid_prefill_reserve_tokens(self) -> int:
@@ -341,7 +353,10 @@ class MultiWorkerGenerationBackend:
         if not self._prefill_available():
             return "decode"
         if len(request.token_ids) >= threshold:
-            if self._hybrid_prefill_slot_available():
+            if (
+                self._hybrid_prefill_slot_available()
+                and self._pd_prefill_budget_available(request)
+            ):
                 return "prefill"
             return (
                 "decode"
@@ -453,6 +468,12 @@ class MultiWorkerGenerationBackend:
         )
         self._reserved_blocks = [dict() for _ in range(worker_count)]
         self._prefill_reserved_blocks = [dict() for _ in range(prefill_count)]
+        self._decode_assigned_work = [0] * worker_count
+        self._decode_prefill_tokens = [0] * worker_count
+        self._decode_request_loads: dict[int, tuple[int, int, int]] = {}
+        self._prefill_assigned_work = [0] * prefill_count
+        self._prefill_prefill_tokens = [0] * prefill_count
+        self._prefill_request_loads: dict[int, tuple[int, int, int]] = {}
         self._prefill_capacities = [
             BackendCapacity(
                 total_blocks,
@@ -497,6 +518,8 @@ class MultiWorkerGenerationBackend:
         self._decode_round_robin = 0
         self._short_round_robin = 0
         self._hybrid_roles = [HybridRole.DECODE] * prefill_count
+        self._hybrid_long_pressure_until = 0.0
+        self._hybrid_short_gate_closures = 0
         # Long requests are bound at admission time so the hybrid worker stops
         # accepting new short requests before the asynchronous prefill RPC is
         # actually submitted.  The legacy unbound selector remains below as a
@@ -595,6 +618,9 @@ class MultiWorkerGenerationBackend:
                 required_blocks=required_blocks,
                 competing_decode_load=decode_load,
                 decode_candidates=len(candidates),
+                decode_candidate_ids=tuple(
+                    candidate.worker_id for candidate in candidates
+                ),
                 preferred_index=(
                     request.worker_id if request.worker_pool == "prefill" else None
                 ),
@@ -616,6 +642,12 @@ class MultiWorkerGenerationBackend:
                     with self._state_lock:
                         self._prefill_bound[request.request_id] = index
                         self._record_prefill_reservation(index, request)
+                        self._record_prefill_load(
+                            index,
+                            request,
+                            work=self._request_work(request),
+                            prefill_tokens=len(request.token_ids),
+                        )
                         self._prefill_short_count = (
                             getattr(self, "_prefill_short_count", 0) + 1
                         )
@@ -624,6 +656,11 @@ class MultiWorkerGenerationBackend:
                     request.worker_id = index
                     request.worker_pool = "prefill"
                     return AdmissionDecision.accept()
+        if self._should_defer_long_for_prefill(request):
+            self._note_hybrid_long_pressure()
+            return AdmissionDecision.defer(
+                "hybrid prefill slot or token budget is busy"
+            )
         if not candidates:
             total_blocks = self._total_blocks_per_worker()
             if required_blocks > total_blocks:
@@ -632,13 +669,16 @@ class MultiWorkerGenerationBackend:
                 )
             return AdmissionDecision.defer("all decode workers are temporarily full")
 
-        candidates = self._order_candidates(candidates)
+        candidates = self._order_candidates(candidates, request=request)
         last_retryable = None
         # Health alone is insufficient: a healthy Hybrid already bound to a
         # Long request has no second physical prefill slot.  Treat it as
         # unavailable so another Long can fall back to collocated execution
         # instead of waiting behind the same H worker indefinitely.
-        prefill_available = self._hybrid_prefill_slot_available()
+        prefill_available = (
+            self._hybrid_prefill_slot_available()
+            and self._pd_prefill_budget_available(request)
+        )
         for candidate in candidates:
             try:
                 admitted = self._reserve_on(candidate.worker_id, request)
@@ -707,7 +747,7 @@ class MultiWorkerGenerationBackend:
                     )
                 if decision.route is Route.PD_DISAGGREGATED:
                     try:
-                        self._bind_long_prefill(request.request_id)
+                        prefill_index = self._bind_long_prefill(request)
                     except WorkerUnavailableError:
                         # Health can change between candidate scoring and the
                         # role claim. Keep the already-reserved decode state and
@@ -715,11 +755,35 @@ class MultiWorkerGenerationBackend:
                         # leaking the admission or failing the request.
                         decision = RouteDecision(
                             Route.COLLOCATED,
-                            RouteReason.PREFILL_UNAVAILABLE,
+                            (
+                                RouteReason.HYBRID_QUEUE_OVERFLOW
+                                if self._prefill_available()
+                                else RouteReason.PREFILL_UNAVAILABLE
+                            ),
                             len(request.token_ids),
                             candidate.decode_load,
                             True,
                         )
+                        prefill_index = None
+                    else:
+                        self._record_prefill_load(
+                            prefill_index,
+                            request,
+                            work=max(1, len(request.token_ids)),
+                            prefill_tokens=len(request.token_ids),
+                        )
+                if decision.route is Route.PD_DISAGGREGATED:
+                    decode_work = max(1, request.max_new_tokens)
+                    decode_prefill_tokens = 0
+                else:
+                    decode_work = self._request_work(request)
+                    decode_prefill_tokens = len(request.token_ids)
+                self._record_decode_load(
+                    candidate.worker_id,
+                    request,
+                    work=decode_work,
+                    prefill_tokens=decode_prefill_tokens,
+                )
                 self._route_decisions[request.request_id] = decision
                 request.route = decision.route.value
                 request.route_reason = decision.reason.value
@@ -735,7 +799,11 @@ class MultiWorkerGenerationBackend:
             last_retryable or "all decode workers rejected the reservation"
         )
 
-    def _order_candidates(self, candidates):
+    @staticmethod
+    def _request_work(request: ServingRequest) -> int:
+        return len(request.token_ids) + max(1, request.max_new_tokens)
+
+    def _order_candidates(self, candidates, *, request: ServingRequest | None = None):
         """Reorder decode-worker candidates per ``--pd-schedule``.
 
         ``load-aware`` keeps the registry's composite score order (the pre-change
@@ -744,7 +812,27 @@ class MultiWorkerGenerationBackend:
         """
         schedule = self.config.pd_schedule
         if schedule in ("load-aware", ""):
-            return list(candidates)
+            with self._state_lock:
+                self._ensure_hybrid_state()
+                start = self._decode_round_robin % max(1, len(self.config.decode_devices))
+
+                def score(candidate):
+                    worker_id = candidate.worker_id
+                    return (
+                        self._decode_prefill_tokens[worker_id] > 0,
+                        self._decode_prefill_tokens[worker_id],
+                        self._decode_assigned_work[worker_id],
+                        candidate.decode_load,
+                        candidate.score,
+                        (worker_id - start) % max(1, len(self.config.decode_devices)),
+                    )
+
+                ordered = sorted(candidates, key=score)
+                if request is not None and ordered:
+                    self._decode_round_robin = (ordered[0].worker_id + 1) % max(
+                        1, len(self.config.decode_devices)
+                    )
+                return ordered
         if schedule == "kv-aware":
             used = {
                 snapshot.worker_id: snapshot.capacity.kv_total_blocks
@@ -777,6 +865,7 @@ class MultiWorkerGenerationBackend:
             )
             with self._state_lock:
                 self._collocated_count += 1
+                self._mark_prefill_load_prefill_complete(request.request_id)
             sample = result.get("sample")
             return (
                 sample if isinstance(sample, TokenSample) else int(result["token_id"])
@@ -788,6 +877,7 @@ class MultiWorkerGenerationBackend:
             self._observe_route_cost(request, decision, started)
             with self._state_lock:
                 self._collocated_count += 1
+                self._mark_decode_load_prefill_complete(request.request_id)
             return token_id
         command = self._request_command("prefill", request)
         command["worker_index"] = worker_id
@@ -903,6 +993,7 @@ class MultiWorkerGenerationBackend:
         self._observe_route_cost(request, decision, started)
         with self._state_lock:
             self._pd_count += 1
+            self._mark_prefill_load_prefill_complete(request.request_id)
         sample = result.get("sample")
         return sample if isinstance(sample, TokenSample) else int(prepared["token_id"])
 
@@ -1052,6 +1143,7 @@ class MultiWorkerGenerationBackend:
                     self._prefill_bound.pop(request_id, None)
                     self._ensure_hybrid_state()
                     self._prefill_reserved_blocks[prefill_index].pop(request_id, None)
+                    self._release_prefill_load(request_id)
                     self._route_decisions.pop(request_id, None)
                     self._lost_requests.discard(request_id)
             return
@@ -1073,6 +1165,8 @@ class MultiWorkerGenerationBackend:
             self.registry.release(request_id)
             with self._state_lock:
                 self._reserved_blocks[worker_id].pop(request_id, None)
+                self._release_decode_load(request_id)
+                self._release_prefill_load(request_id)
                 getattr(self, "_host_prefix_tokens", {}).pop(request_id, None)
                 self._route_decisions.pop(request_id, None)
                 self._lost_requests.discard(request_id)
@@ -1085,6 +1179,7 @@ class MultiWorkerGenerationBackend:
                 self._ensure_hybrid_state()
                 if prefill_index is not None:
                     self._prefill_reserved_blocks[prefill_index].pop(request_id, None)
+                self._release_prefill_load(request_id)
                 self._route_decisions.pop(request_id, None)
                 self._lost_requests.discard(request_id)
             return
@@ -1093,9 +1188,12 @@ class MultiWorkerGenerationBackend:
         with self._state_lock:
             if worker_id is not None:
                 self._reserved_blocks[worker_id].pop(request_id, None)
+                self._release_decode_load(request_id)
             else:
                 for reservations in self._reserved_blocks:
                     reservations.pop(request_id, None)
+                self._release_decode_load(request_id)
+            self._release_prefill_load(request_id)
             self._route_decisions.pop(request_id, None)
             self._lost_requests.discard(request_id)
 
@@ -1500,6 +1598,134 @@ class MultiWorkerGenerationBackend:
             self._long_prefill_bound = {}
         if not hasattr(self, "_short_round_robin"):
             self._short_round_robin = 0
+        if not hasattr(self, "_decode_assigned_work"):
+            self._decode_assigned_work = [0] * len(self.config.decode_devices)
+        if not hasattr(self, "_decode_prefill_tokens"):
+            self._decode_prefill_tokens = [0] * len(self.config.decode_devices)
+        if not hasattr(self, "_decode_request_loads"):
+            self._decode_request_loads = {}
+        if not hasattr(self, "_prefill_assigned_work"):
+            self._prefill_assigned_work = [0] * count_workers
+        if not hasattr(self, "_prefill_prefill_tokens"):
+            self._prefill_prefill_tokens = [0] * count_workers
+        if not hasattr(self, "_prefill_request_loads"):
+            self._prefill_request_loads = {}
+        if not hasattr(self, "_hybrid_long_pressure_until"):
+            self._hybrid_long_pressure_until = 0.0
+        if not hasattr(self, "_hybrid_short_gate_closures"):
+            self._hybrid_short_gate_closures = 0
+
+    def _record_decode_load(
+        self,
+        worker_id: int,
+        request: ServingRequest,
+        *,
+        work: int,
+        prefill_tokens: int,
+    ) -> None:
+        self._ensure_hybrid_state()
+        old = self._decode_request_loads.pop(request.request_id, None)
+        if old is not None:
+            old_worker, old_work, old_prefill = old
+            self._decode_assigned_work[old_worker] = max(
+                0, self._decode_assigned_work[old_worker] - old_work
+            )
+            self._decode_prefill_tokens[old_worker] = max(
+                0, self._decode_prefill_tokens[old_worker] - old_prefill
+            )
+        work = max(1, int(work))
+        prefill_tokens = max(0, int(prefill_tokens))
+        self._decode_request_loads[request.request_id] = (
+            worker_id,
+            work,
+            prefill_tokens,
+        )
+        self._decode_assigned_work[worker_id] += work
+        self._decode_prefill_tokens[worker_id] += prefill_tokens
+
+    def _record_prefill_load(
+        self,
+        index: int,
+        request: ServingRequest,
+        *,
+        work: int,
+        prefill_tokens: int,
+    ) -> None:
+        self._ensure_hybrid_state()
+        old = self._prefill_request_loads.pop(request.request_id, None)
+        if old is not None:
+            old_index, old_work, old_prefill = old
+            self._prefill_assigned_work[old_index] = max(
+                0, self._prefill_assigned_work[old_index] - old_work
+            )
+            self._prefill_prefill_tokens[old_index] = max(
+                0, self._prefill_prefill_tokens[old_index] - old_prefill
+            )
+        work = max(1, int(work))
+        prefill_tokens = max(0, int(prefill_tokens))
+        self._prefill_request_loads[request.request_id] = (
+            index,
+            work,
+            prefill_tokens,
+        )
+        self._prefill_assigned_work[index] += work
+        self._prefill_prefill_tokens[index] += prefill_tokens
+
+    def _mark_decode_load_prefill_complete(self, request_id: int) -> None:
+        load = self._decode_request_loads.get(request_id)
+        if load is None:
+            return
+        worker_id, work, prefill_tokens = load
+        if prefill_tokens <= 0:
+            return
+        self._decode_prefill_tokens[worker_id] = max(
+            0, self._decode_prefill_tokens[worker_id] - prefill_tokens
+        )
+        remaining = max(0, work - prefill_tokens)
+        self._decode_assigned_work[worker_id] = max(
+            0, self._decode_assigned_work[worker_id] - prefill_tokens
+        )
+        self._decode_request_loads[request_id] = (worker_id, remaining, 0)
+
+    def _mark_prefill_load_prefill_complete(self, request_id: int) -> None:
+        load = self._prefill_request_loads.get(request_id)
+        if load is None:
+            return
+        index, work, prefill_tokens = load
+        if prefill_tokens <= 0:
+            return
+        self._prefill_prefill_tokens[index] = max(
+            0, self._prefill_prefill_tokens[index] - prefill_tokens
+        )
+        remaining = max(0, work - prefill_tokens)
+        self._prefill_assigned_work[index] = max(
+            0, self._prefill_assigned_work[index] - prefill_tokens
+        )
+        self._prefill_request_loads[request_id] = (index, remaining, 0)
+
+    def _release_decode_load(self, request_id: int) -> None:
+        load = self._decode_request_loads.pop(request_id, None)
+        if load is None:
+            return
+        worker_id, work, prefill_tokens = load
+        self._decode_assigned_work[worker_id] = max(
+            0, self._decode_assigned_work[worker_id] - work
+        )
+        self._decode_prefill_tokens[worker_id] = max(
+            0, self._decode_prefill_tokens[worker_id] - prefill_tokens
+        )
+
+    def _release_prefill_load(self, request_id: int) -> None:
+        load = self._prefill_request_loads.pop(request_id, None)
+        if load is None:
+            return
+        index, work, prefill_tokens = load
+        self._prefill_assigned_work[index] = max(
+            0, self._prefill_assigned_work[index] - work
+        )
+        self._prefill_prefill_tokens[index] = max(
+            0, self._prefill_prefill_tokens[index] - prefill_tokens
+        )
 
     def _hybrid_reserve_blocks(self) -> int:
         configured = getattr(
@@ -1544,14 +1770,54 @@ class MultiWorkerGenerationBackend:
             if version >= 0:
                 self._prefill_capacity_versions[index] = version
 
-    def _bind_long_prefill(self, request_id: int) -> int:
+    def _pd_prefill_outstanding_tokens(self) -> int:
+        self._ensure_hybrid_state()
+        return int(sum(self._prefill_prefill_tokens))
+
+    def _pd_prefill_budget_available(self, request: ServingRequest) -> bool:
+        """Return whether adding this Long keeps the P/Hybrid token queue bounded."""
+
+        budget = int(getattr(self.config, "pd_prefill_token_budget", 0) or 0)
+        if budget <= 0:
+            return True
+        outstanding = self._pd_prefill_outstanding_tokens()
+        return outstanding + len(request.token_ids) <= budget
+
+    def _should_defer_long_for_prefill(self, request: ServingRequest) -> bool:
+        """Token-aware Long admission guard for dynamic Hybrid topologies.
+
+        If a Long request cannot currently claim a Hybrid/P slot or would push
+        the P side over its prompt-token budget, keep it in the serving-loop
+        admission queue until the configured overflow grace expires.  This
+        avoids immediately falling back to D-bound collocated execution and
+        reintroducing the Short decode pollution that H1 is meant to isolate.
+        """
+
+        threshold = int(getattr(self.config, "conditional_pd_tokens", 0) or 0)
+        if threshold <= 0 or len(request.token_ids) < threshold:
+            return False
+        if not self._prefill_available():
+            return False
+        if self._long_overflow_ready(request) or self._idle_decode_slot_available(request):
+            return False
+        return not (
+            self._hybrid_prefill_slot_available()
+            and self._pd_prefill_budget_available(request)
+        )
+
+    def _bind_long_prefill(self, request: ServingRequest | int) -> int:
         """Move one hybrid worker to PENDING before async prefill dispatch."""
 
+        request_id = request.request_id if isinstance(request, ServingRequest) else int(request)
         with self._state_lock:
             self._ensure_hybrid_state()
             existing = self._long_prefill_bound.get(request_id)
             if existing is not None:
                 return existing
+            if isinstance(
+                request, ServingRequest
+            ) and not self._pd_prefill_budget_available(request):
+                raise WorkerUnavailableError("hybrid prefill token budget is full")
             candidates = [
                 index
                 for index, healthy in enumerate(self._prefill_healthy)
@@ -1562,10 +1828,9 @@ class MultiWorkerGenerationBackend:
             index = min(
                 candidates,
                 key=lambda candidate: (
-                    sum(
-                        bound == candidate
-                        for bound in self._long_prefill_bound.values()
-                    ),
+                    self._prefill_prefill_tokens[candidate] > 0,
+                    self._prefill_prefill_tokens[candidate],
+                    self._prefill_assigned_work[candidate],
                     self._prefill_pending[candidate],
                     candidate,
                 ),
@@ -1601,6 +1866,33 @@ class MultiWorkerGenerationBackend:
             float(getattr(self.config, "hybrid_long_overflow_ms", 5000.0)),
         )
         return (monotonic() - request.submitted_at) * 1000.0 >= wait_ms
+
+    def _note_hybrid_long_pressure(self) -> None:
+        """Temporarily reserve decode-role Hybrid workers for queued Long work.
+
+        A Long request can be deferred before it binds a concrete Hybrid worker
+        because all P slots are busy or the P-side token budget is full.  During
+        that gap, an idle Hybrid should not immediately accept fresh Short
+        collocated work, otherwise the queued Long loses the first available P
+        opportunity and H1 degrades back toward a noisy DP baseline.
+        """
+
+        hold_ms = float(getattr(self.config, "hybrid_long_pressure_hold_ms", 0.0) or 0.0)
+        if hold_ms <= 0:
+            return
+        with self._state_lock:
+            self._ensure_hybrid_state()
+            self._hybrid_long_pressure_until = max(
+                self._hybrid_long_pressure_until,
+                monotonic() + hold_ms / 1000.0,
+            )
+
+    def _hybrid_long_pressure_active(self) -> bool:
+        hold_ms = float(getattr(self.config, "hybrid_long_pressure_hold_ms", 0.0) or 0.0)
+        if hold_ms <= 0:
+            return False
+        self._ensure_hybrid_state()
+        return monotonic() < self._hybrid_long_pressure_until
 
     def _idle_decode_slot_available(self, request: ServingRequest) -> bool:
         """Prefer immediate overflow only when it consumes an actually idle D."""
@@ -1638,6 +1930,7 @@ class MultiWorkerGenerationBackend:
         required_blocks: int = 1,
         competing_decode_load: float = 1.0,
         decode_candidates: int = 0,
+        decode_candidate_ids: tuple[int, ...] = (),
         preferred_index: int | None = None,
     ) -> int | None:
         """Pick a decode-role hybrid worker for a collocated short request.
@@ -1668,6 +1961,30 @@ class MultiWorkerGenerationBackend:
             ]
             if not idle:
                 return None
+            if self._hybrid_long_pressure_active():
+                self._hybrid_short_gate_closures += 1
+                return None
+            backlog_budget = int(
+                getattr(
+                    self.config,
+                    "hybrid_short_max_prefill_backlog_tokens",
+                    0,
+                )
+                or 0
+            )
+            assigned_budget = int(
+                getattr(self.config, "hybrid_short_max_assigned_work", 0) or 0
+            )
+            if backlog_budget and all(
+                self._prefill_prefill_tokens[candidate] > backlog_budget
+                for candidate in idle
+            ):
+                return None
+            if assigned_budget and all(
+                self._prefill_assigned_work[candidate] > assigned_budget
+                for candidate in idle
+            ):
+                return None
             index = (
                 preferred_index
                 if preferred_index in idle
@@ -1687,17 +2004,52 @@ class MultiWorkerGenerationBackend:
             hybrid_load = max(
                 self._prefill_capacities[index].decode_load, pending_load
             )
+            hybrid_score = (
+                self._prefill_prefill_tokens[index] > 0,
+                self._prefill_prefill_tokens[index],
+                self._prefill_assigned_work[index],
+                self._prefill_pending[index] + self._prefill_dispatch_claims[index],
+                hybrid_load,
+            )
+            best_decode_score = (
+                self._best_decode_short_score(decode_candidate_ids)
+                if decode_candidates > 0
+                else (True, 1 << 60, 1 << 60, 1 << 60, 1.0)
+            )
             total_candidates = max(1, len(idle) + decode_candidates)
             tie_turn = self._short_round_robin % total_candidates
             self._short_round_robin += 1
             if preferred_index not in idle and (
                 hybrid_load > competing_decode_load
+                or hybrid_score > best_decode_score
                 or (hybrid_load == competing_decode_load and tie_turn >= len(idle))
             ):
                 return None
             self._prefill_dispatch_claims[index] += 1
             self._prefill_serve_round_robin = (index + 1) % count
             return index
+
+    def _best_decode_short_score(
+        self, candidate_ids: tuple[int, ...] = ()
+    ) -> tuple[bool, int, int, int, float]:
+        allowed = set(candidate_ids)
+        snapshots = tuple(
+            worker
+            for worker in self.registry.snapshots()
+            if worker.healthy and (not allowed or worker.worker_id in allowed)
+        )
+        if not snapshots:
+            return (True, 1 << 60, 1 << 60, 1 << 60, 1.0)
+        return min(
+            (
+                self._decode_prefill_tokens[worker.worker_id] > 0,
+                self._decode_prefill_tokens[worker.worker_id],
+                self._decode_assigned_work[worker.worker_id],
+                worker.active_requests,
+                worker.capacity.decode_load,
+            )
+            for worker in snapshots
+        )
 
     def _prefill_rpc(self, command: dict, request_id: int) -> dict:
         self._ensure_hybrid_state()

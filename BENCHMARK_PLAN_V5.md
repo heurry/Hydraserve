@@ -122,15 +122,29 @@ warmup                   = 8 synthetic requests（不消费正式 trace）
 conditional_pd_tokens   = 6144（仅 H1）
 hybrid_long_overflow_ms = 5000（仅 H1）
 pd_schedule              = load-aware（仅 H1）
+pd_prefill_token_budget  = 32768（仅 H1，限制单 Hybrid Long 排队污染）
+hybrid_short_assigned_work_budget = 8192（仅 H1，Hybrid 只在低负载接 Short）
+hybrid_long_pressure_hold_ms = 1000（仅 H1，Long 被 defer 后临时收回 Hybrid Short 入口）
+pd_transfer_quant        = int8（仅 H1；kv_quant=int8 时走 INT8 Cache 直传）
 ```
 
 要求：
 
 - 不得为 DP 和 H1 分别选择有利的 chunk、cache、并发度或采样参数；
+- DP4 与 H1 共享同一个 ServingLoop admission priority：trace class 为 `short`
+  的请求优先级为 1，其余为 0；DP4 baseline 内部按 outstanding prefill tokens、
+  token-weighted assigned work、RPC pending 与真实 cache/state load 选择 worker；
 - Prefix Cache 首轮关闭，避免当前混合注意力 Prefix Cache 不完整污染主结论；
 - 同一 seed 的 DP/H1 必须使用相同 trace hash；
 - 正式运行必须基于 clean commit，并保存模型 manifest、CLI、CUDA/Triton、GPU 和拓扑；
 - 任一请求 OOM、超时或输出不完整，该次运行不能进入性能汇总。
+
+H1 新增的 token-aware admission、Hybrid Long-pressure 动态门控和 INT8 wire 是为了减少错误回退、
+降低状态迁移成本并明确 Short SLO 隔离窗口。无 Long 压力时，空闲 Hybrid 仍可承接 Short；
+Long 已经在等待 P/Hybrid capacity 时，Hybrid 的 Short 入口会短暂关闭，避免刚释放的 P 机会
+被新 Short 抢走。它们不改变单 Hybrid 在 Long-heavy 负载下会成为
+prefill bottleneck 的事实，也不保证 H1 在所有 M1/B1 seed 上超过强 DP。最终结论必须以正式
+复跑结果为准。
 
 ## 6. 命令模板
 
@@ -153,10 +167,12 @@ python -m hydraserve benchmark MODEL DATASETS --dataset synthetic \
 python -m hydraserve benchmark MODEL DATASETS --dataset synthetic --adaptive \
   --trace TRACE --prefill-devices 0 --decode-devices 1 \
   --conditional-pd-tokens 6144 --hybrid-long-overflow-ms 5000 \
+  --pd-prefill-token-budget 32768 --hybrid-short-max-assigned-work 8192 \
+  --hybrid-long-pressure-hold-ms 1000 \
   --prefill-short-policy work-conserving --pd-schedule load-aware \
   --concurrency 16 --warmup 8 --kv-quant int8 --cache-tokens 65536 \
   --block-size 256 --prefix-cache-blocks 0 --prefill-chunk-size 16384 \
-  --max-step-tokens 8192 --pd-transfer-backend shm-ring \
+  --max-step-tokens 8192 --pd-transfer-backend shm-ring --pd-transfer-quant int8 \
   --worker-log-dir WORKERS --output OUT --seed SEED
 ```
 

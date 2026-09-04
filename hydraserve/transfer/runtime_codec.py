@@ -12,6 +12,7 @@ from hydraserve.transfer.pipeline import HybridStateBundle
 from hydraserve.cache.kv_quantizer import (
     Int4Tensor,
     Int8Tensor,
+    PagedInt8KVTensor,
     dequantize_int4,
     dequantize_int8,
     dequantize_int8_torch,
@@ -99,6 +100,14 @@ class RuntimeStateCodec:
         """
         import torch
 
+        if mode is TransferMode.INT8_TRANSFER:
+            allocation = paged_cache.block_manager.get(request_id)
+            raw = RuntimeStateCodec._extract_raw_int8_kv(
+                model, paged_cache, request_id, 0, allocation.num_tokens
+            )
+            if raw is not None:
+                return raw
+
         layers = []
         for layer_index in model.full_attention_layer_indices:
             key, value = paged_cache.read(request_id, layer_index)
@@ -126,6 +135,13 @@ class RuntimeStateCodec:
         if start < 0 or end <= start:
             raise ValueError("invalid KV token range")
         import torch
+
+        if mode is TransferMode.INT8_TRANSFER:
+            raw = RuntimeStateCodec._extract_raw_int8_kv(
+                model, paged_cache, request_id, start, end
+            )
+            if raw is not None:
+                return raw
 
         if paged_cache.device.type == "cuda" and paged_cache.kv_quant is None:
             from hydraserve.kernels.staging import fused_gather_paged_kv
@@ -180,6 +196,16 @@ class RuntimeStateCodec:
         device_values = None
         if isinstance(payload, Int8Tensor) and paged_cache.device.type == "cuda":
             device_values = dequantize_int8_torch(payload, device=paged_cache.device)
+            values = device_values
+        elif isinstance(payload, PagedInt8KVTensor):
+            if paged_cache.kv_quant == "int8":
+                RuntimeStateCodec._install_raw_int8_kv(
+                    model, paged_cache, request_id, payload, start=start
+                )
+                return
+            device_values = RuntimeStateCodec._dequantize_raw_int8_kv(
+                payload, device=paged_cache.device
+            )
             values = device_values
         elif isinstance(payload, Int8Tensor):
             values = dequantize_int8(payload)
@@ -244,6 +270,161 @@ class RuntimeStateCodec:
             key = key.to(device=paged_cache.device, dtype=paged_cache.dtype)
             value = value.to(device=paged_cache.device, dtype=paged_cache.dtype)
             paged_cache.write(request_id, layer_index, positions, key, value)
+
+    @staticmethod
+    def _extract_raw_int8_kv(
+        model: ModelConfig,
+        paged_cache,
+        request_id: int,
+        start: int,
+        end: int,
+    ) -> PagedInt8KVTensor | None:
+        """Gather the native INT8 cache layout without BF16 dequantization."""
+
+        if getattr(paged_cache, "kv_quant", None) != "int8":
+            return None
+        import torch
+
+        allocation = paged_cache.block_manager.get(request_id)
+        length = end - start
+        if start < 0 or length <= 0 or end > allocation.num_tokens:
+            raise ValueError("invalid raw INT8 KV range")
+        physical = torch.tensor(
+            allocation.block_ids,
+            device=paged_cache.device,
+            dtype=torch.long,
+        )
+        keys = []
+        values = []
+        key_scales = []
+        value_scales = []
+        for layer_index in model.full_attention_layer_indices:
+            slot = paged_cache.layer_to_slot[layer_index]
+            key = paged_cache.key[slot, physical].reshape(
+                -1, model.num_kv_heads, model.head_dim
+            )[start:end]
+            value = paged_cache.value[slot, physical].reshape(
+                -1, model.num_kv_heads, model.head_dim
+            )[start:end]
+            k_scale = paged_cache.key_scales[slot, physical].reshape(
+                -1, model.num_kv_heads
+            )[start:end]
+            v_scale = paged_cache.value_scales[slot, physical].reshape(
+                -1, model.num_kv_heads
+            )[start:end]
+            keys.append(key.contiguous())
+            values.append(value.contiguous())
+            key_scales.append(k_scale.contiguous())
+            value_scales.append(v_scale.contiguous())
+        key_tensor = torch.stack(keys, dim=0)
+        value_tensor = torch.stack(values, dim=0)
+        key_scale_tensor = torch.stack(key_scales, dim=0)
+        value_scale_tensor = torch.stack(value_scales, dim=0)
+        return PagedInt8KVTensor(
+            _PINNED_STAGING.stage(key_tensor).numpy(),
+            _PINNED_STAGING.stage(value_tensor, slot=1).numpy(),
+            _PINNED_STAGING.stage(key_scale_tensor, slot=2).numpy(),
+            _PINNED_STAGING.stage(value_scale_tensor, slot=3).numpy(),
+            (
+                model.num_full_attention_layers,
+                2,
+                length,
+                model.num_kv_heads,
+                model.head_dim,
+            ),
+            str(paged_cache.dtype).removeprefix("torch."),
+        )
+
+    @staticmethod
+    def _install_raw_int8_kv(
+        model: ModelConfig,
+        paged_cache,
+        request_id: int,
+        payload: PagedInt8KVTensor,
+        *,
+        start: int,
+    ) -> None:
+        """Install raw INT8 KV/scales directly into a quantized PagedKVCache."""
+
+        import torch
+
+        expected = (
+            model.num_full_attention_layers,
+            2,
+            payload.key.shape[1],
+            model.num_kv_heads,
+            model.head_dim,
+        )
+        if payload.shape != expected:
+            raise ValueError(f"invalid raw INT8 KV shape {payload.shape}")
+        if payload.key.shape != payload.value.shape or payload.key.shape != (
+            model.num_full_attention_layers,
+            payload.shape[2],
+            model.num_kv_heads,
+            model.head_dim,
+        ):
+            raise ValueError("invalid raw INT8 KV tensor layout")
+        if payload.key_scales.shape != payload.value_scales.shape or payload.key_scales.shape != (
+            model.num_full_attention_layers,
+            payload.shape[2],
+            model.num_kv_heads,
+        ):
+            raise ValueError("invalid raw INT8 KV scale layout")
+        allocation = paged_cache.block_manager.get(request_id)
+        end = start + payload.shape[2]
+        if start < 0 or end > allocation.num_tokens:
+            raise ValueError("raw INT8 KV range exceeds allocation")
+        positions = torch.arange(start, end, device=paged_cache.device)
+        block_ids = torch.tensor(
+            allocation.block_ids,
+            device=paged_cache.device,
+            dtype=torch.long,
+        )
+        logical = torch.div(
+            positions,
+            paged_cache.block_manager.block_size,
+            rounding_mode="floor",
+        ).long()
+        offsets = positions.remainder(paged_cache.block_manager.block_size).long()
+        physical = block_ids[logical]
+        for slot, layer_index in enumerate(model.full_attention_layer_indices):
+            cache_slot = paged_cache.layer_to_slot[layer_index]
+            key = torch.from_numpy(payload.key[slot]).to(
+                device=paged_cache.device, dtype=torch.int8, non_blocking=True
+            )
+            value = torch.from_numpy(payload.value[slot]).to(
+                device=paged_cache.device, dtype=torch.int8, non_blocking=True
+            )
+            key_scale = torch.from_numpy(payload.key_scales[slot]).to(
+                device=paged_cache.device, dtype=torch.float32, non_blocking=True
+            )
+            value_scale = torch.from_numpy(payload.value_scales[slot]).to(
+                device=paged_cache.device, dtype=torch.float32, non_blocking=True
+            )
+            paged_cache.key[cache_slot, physical, offsets] = key
+            paged_cache.value[cache_slot, physical, offsets] = value
+            paged_cache.key_scales[cache_slot, physical, offsets] = key_scale
+            paged_cache.value_scales[cache_slot, physical, offsets] = value_scale
+
+    @staticmethod
+    def _dequantize_raw_int8_kv(payload: PagedInt8KVTensor, *, device):
+        import torch
+
+        key = torch.from_numpy(payload.key).to(device, non_blocking=True).float()
+        value = torch.from_numpy(payload.value).to(device, non_blocking=True).float()
+        key_scales = torch.from_numpy(payload.key_scales).to(
+            device, non_blocking=True
+        )
+        value_scales = torch.from_numpy(payload.value_scales).to(
+            device, non_blocking=True
+        )
+        return torch.stack(
+            (
+                key * key_scales.unsqueeze(-1),
+                value * value_scales.unsqueeze(-1),
+            ),
+            dim=1,
+        )
 
     @staticmethod
     def install(

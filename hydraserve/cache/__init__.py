@@ -7,8 +7,10 @@ from hydraserve.cache.host_prefix_cache import (
 from hydraserve.cache.kv_quantizer import (
     Int4Tensor,
     Int8Tensor,
+    PagedInt8KVTensor,
     dequantize_int4,
     dequantize_int8,
+    dequantize_paged_int8_kv,
     quantize_int4,
     quantize_int8,
 )
@@ -42,6 +44,7 @@ __all__ = [
     "CostAwarePrefixPolicy",
     "Int4Tensor",
     "Int8Tensor",
+    "PagedInt8KVTensor",
     "KVBlockManager",
     "LinearState",
     "LinearStatePool",
@@ -58,6 +61,7 @@ __all__ = [
     "PrefixMatch",
     "dequantize_int4",
     "dequantize_int8",
+    "dequantize_paged_int8_kv",
     "quantize_int4",
     "quantize_int8",
     "plan_paged_kv_blocks",

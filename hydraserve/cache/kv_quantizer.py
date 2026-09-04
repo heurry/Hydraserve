@@ -33,6 +33,34 @@ class Int8Tensor:
         return self.quantized.nbytes + self.scales.nbytes
 
 
+@dataclass(frozen=True, slots=True)
+class PagedInt8KVTensor:
+    """Raw per-token INT8 KV cache payload plus FP32 scales.
+
+    This represents the on-GPU ``PagedKVCache(kv_quant="int8")`` layout after
+    logical-page gather: key/value are already int8, and scales are the
+    per-token-per-head FP32 factors used by the destination cache.  Unlike
+    ``Int8Tensor``, this is not a group-wise wire quantization of BF16 values;
+    it is a direct cache-to-cache payload that avoids the BF16 middle format.
+    """
+
+    key: np.ndarray
+    value: np.ndarray
+    key_scales: np.ndarray
+    value_scales: np.ndarray
+    shape: tuple[int, ...]
+    original_dtype: str
+
+    @property
+    def nbytes(self) -> int:
+        return (
+            self.key.nbytes
+            + self.value.nbytes
+            + self.key_scales.nbytes
+            + self.value_scales.nbytes
+        )
+
+
 def quantize_int4(tensor: np.ndarray, group_size: int = 64) -> Int4Tensor:
     if group_size <= 0:
         raise ValueError("group_size must be positive")
@@ -90,6 +118,12 @@ def dequantize_int8(tensor: Int8Tensor) -> np.ndarray:
     )
     logical_size = int(np.prod(tensor.shape, dtype=np.int64))
     return restored.reshape(-1)[:logical_size].reshape(tensor.shape)
+
+
+def dequantize_paged_int8_kv(tensor: PagedInt8KVTensor) -> np.ndarray:
+    key = tensor.key.astype(np.float32) * tensor.key_scales[..., None]
+    value = tensor.value.astype(np.float32) * tensor.value_scales[..., None]
+    return np.stack((key, value), axis=1)
 
 
 def quantize_int8_torch(tensor, group_size: int = 64) -> Int8Tensor:
