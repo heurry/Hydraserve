@@ -1,95 +1,57 @@
-# H1 调度问题分析:为什么 H1-4GPU 落后 DP4(V5 M1)
+# H1 调度问题:诊断 → 修复(8949816)→ 复跑状态
 
-> 背景:V5 M1 真实混合 RAG(48 short 1-4K + 16 long 8-16K)。DP4 每 seed 64/64 成功、
-> short SLO goodput 中位 48 tok/s;H1-4GPU(1P+3D)同样 64/64 成功但 short goodput
-> 只有 17.6 tok/s,long TTFT 4x 于 DP。功能正常,纯调度/结构问题。
+> 记录 H1-4GPU(1P+3D)在 V5 M1 上落后 DP4 的调度根因、作者修复与本机复跑结果。
 
-## 1. H1 准入/路由的负载信号(实测核对结论)
+## 1. 原始诊断(2026-09-03,旧代码,commit e19648b 前后)
 
-`MultiWorkerGenerationBackend`(`multi_worker.py`)的路由**没有任何 token 加权负载账本**:
+当时 H1 落后 DP4(short goodput 只有 DP 的 30-45%)。核对代码后确认:
 
-| 信号 | 类型 | 位置 |
-|---|---|---|
-| `_prefill_available()` | 二元:prefill worker 是否健康 | multi_worker.py:1865 |
-| `_prefill_long_inflight[i]` | 0/1:是否正在 prefill 一个 long | :476 |
-| `_prefill_pending[i]` | 计数:in-flight 操作数 | :476 |
-| `decode_load` | `max(1-kv_free/kv_total, 1-state_free/state_total)` 占用率 | serving_loop.py:101 |
-| `_prefill_capacities` | 剩余 KV 块/state 槽(仅可行性过滤) | :456 |
-| round-robin | 轮转兜底 | :1691 |
+- **H1(`MultiWorkerGenerationBackend`)无 token 加权负载账本**。路由只用:
+  - `_prefill_available()`(二元健康)、`_prefill_long_inflight[i]`(0/1)、
+    `_prefill_pending[i]`(计数)、`decode_load`(KV/state 占用率快照)、round-robin。
+  - `len(request.token_ids)` 仅用于阈值/元数据,不参与负载比较。
+- **DP(`MultiGPUCollocatedBackend`)有 token 加权账本**:`_select_worker` 按
+  `_prefill_tokens[i]`(outstanding prefill token,prefill 完成时精确增减)+ `_assigned_work[i]`
+  (token 加权 prompt+output)多级比较 → 16 个 long 的 prefill 摊到 4 卡。
+- 后果:`work-conserving` 的 short 只看 decode_load 就会抢占唯一 hybrid prefill 槽;
+  1P 下 16 个 8-16K long 的 prefill 全串行在 GPU0。
 
-`len(request.token_ids)` 在 multi_worker.py 只用于阈值(short_cutoff / conditional_pd_tokens)
-和路由元数据,**不参与负载比较**。
+## 2. 作者修复(commit 8949816,"Optimize hybrid PD scheduling")
 
-## 2. DP 的调度(collocated_multi.py:363,对照基准)
+8949816 实现了缺失的机制(与原始诊断一致):
 
-```python
-def score(i):
-    return (
-        self._prefill_tokens[i] > 0,     # ① 有 outstanding prefill 排后
-        self._prefill_tokens[i],         # ② outstanding prefill TOKEN 数最少 ←核心
-        self._assigned_work[i],          # ③ token 加权(prompt+output)live work
-        self._pending[i],                # ④ in-flight RPC
-        capacity.decode_load,            # ⑤ decode 占用
-        self._assigned[i], round_robin,
-    )
-```
-- `_request_work = len(prompt) + max_new_tokens`(:320):每请求折算成 token 工作量。
-- `_prefill_tokens[i]` 在 prefill 完成时精确增减(`_mark_prefill_complete`:418)。
-- 16 个 long 的 prefill 按 token 摊到 4 张对称卡 → 无单卡瓶颈、负载均衡。
+- **token 加权账本**:`_decode_prefill_tokens[i]` / `_prefill_prefill_tokens[i]`(per-worker
+  outstanding prefill token)、`_request_loads`(work=max(1,prompt)+output 同款 DP 模型)。
+- **Long-pressure 动态门控**:`_should_defer_long_for_prefill()` + `_hybrid_long_pressure_until`
+  + `hybrid_long_pressure_hold_ms`(Long 在等时短暂关闭 Hybrid 的 short 入口)。
+- **预算旋钮**:`pd_prefill_token_budget`、`hybrid_short_max_assigned_work`、
+  `hybrid_short_max_prefill_backlog_tokens`。
+- **INT8 wire**:`--pd-transfer-quant int8`(kv_quant=int8 时 KV 缓存直传,免 dequant→requant)。
+- 计划 §5 同步更新,明确"不保证 H1 超过强 DP,以正式复跑为准"。
 
-## 3. H1 失衡的两处根因
+## 3. 本机补充修复(commit 202bd12)
 
-### 3a. short 抢 hybrid prefill 槽 —— 只比 decode_load(`_pick_serve_prefill_worker`:1635)
+`--pd-transfer-quant int8` 高并发下 prefill worker 间歇 CUDA IMA/segfault(约 1/4 次,在
+`runtime_codec._extract_raw_int8_kv` 的 `stage` sync 处爆出;`CUDA_LAUNCH_BLOCKING` 可规避 →
+时序竞态)。修复:prefill worker 释放请求 KV 块前 `torch.cuda.synchronize(cache.device)`,
+使块复用严格晚于所有异步访问。M1 单轮未复现,仍需更多轮确认。
 
-`admit()`(:549)对每个 short 先尝试塞 hybrid(:584-626),判定:
-```python
-if prefill_short_policy=="work-conserving" and short<cutoff and _prefill_available():
-    index = _pick_serve_prefill_worker(...)   # 只看 decode_load
-    ...
-    route_reason = "prefill_worker_collocated"
-```
-`_pick_serve_prefill_worker` 在 `hybrid_load > competing_decode_load` 时才拒绝收 short。
-`hybrid_load/decode_load` 都是 KV/state **占用率快照**,不反映:
-- **token 成本**(2K short 与 16K long 同权重);
-- **排队的 long**(下一时刻要 prefill 的 long 没进任何信号);
-- **hybrid 的角色不对称**(decode 是兼职,主业 long prefill)。
+## 4. 修复后复跑(新方法学,2026-09-04)
 
-结果:decode worker 一忙,short 就涌向此刻"占用率低"的 hybrid → 占掉唯一 prefill 槽 →
-后续 long 排队。V5 配置 `conditional-pd-tokens 6144` 走确定性路由,**连 cost router 的
-token 感知成本估计都没用上**(`router.decide` 只在 conditional_pd_tokens=0 时触发)。
+DP4 与 H1-4GPU 均跑在 8949816 + 202bd12,结果见 `results/v5_dp4_h1_summary.md`:
 
-### 3b. 单 prefill 引擎串行化全部 long(`_hybrid_prefill_slot_available`:1577)
+- H1 short SLO goodput 中位从旧配置的 ~15-17 tok/s 提升到 **37.6 tok/s**(DP 44.1,-15%);
+- H1 short e2e TTFT **p50 反超 DP**(634 vs 656ms),但 p95/p99 仍差于 DP → 隔离改善中位数、
+  尾部仍受 long 排队影响;
+- H1 long e2e TTFT p50 6934 vs DP 2779(2.5x),单 Hybrid prefill 瓶颈未变;
+- B1 边界验收通过(H1 全 SLO 达标、无 starvation)。
 
-```python
-return any(healthy and role is HybridRole.DECODE ...)   # 一次只能接一个 long
-```
-1P+3D 下 16 个 8-16K long 的 prefill 全部串行在 GPU0。M1 里这是硬天花板,任何
-short 调度都救不了 —— 这也是 DP 不存在的问题(每卡自带 prefill)。
+**结论**:调度账本补上后 H1 明显更接近 DP,但 M1 上仍不满足 §8.1(short goodput 未超 DP)。
+剩余差距主要是结构性的单 Hybrid prefill bottleneck + short 尾部隔离。计划原文对此已有预期。
 
-### 3c. decode worker 上 short 与 long decode 混排
+## 复现/复跑材料
 
-`conditional_short_collocated` 的 short 由 decode worker collocated prefill+decode,
-但同一 worker 还要给 PD long decode。s42 里 `decode:1` 上 6 个 short p50 达 13.3s。
-
-## 4. s42 路由分布佐证
-
-| 路由 | 数量 | 说明 |
-|---|---|---|
-| `prefill_worker_collocated` | 18 | 占 prefill 槽的 short,p50 TTFT 5.8s |
-| `conditional_short_collocated` | 30 | decode worker 上的 short,0.7~13.3s 不等 |
-| `conditional_long_pd` | 13 | PD long |
-| `hybrid_queue_overflow` | 3 | 回退 collocated |
-
-## 5. 建议(不是"有 long 等就不收 short"的补丁)
-
-1. 给 H1 补 DP 式 **token 加权账本**:按 worker 记 outstanding prefill token + token 加权
-   assigned work;short→hybrid 的判定换成 DP 的 `score()` 式多级比较,并计入排队 long;
-2. 正视 1P 的结构瓶颈:M1(25% 8-16K long)对单 prefill 卡就是超载,应对比 2P+2D
-   (`--prefill-devices 0 1 --decode-devices 2 3`)或把该结论写入 H1 的边界(计划 §8.2 B1 意图);
-3. 若 H1 目标是 short SLO 优先,可把 `prefill-short-policy` 设为 `never`,让 hybrid 专职 long,
-   重新对比 —— 但那牺牲了 worker 利用率,是否值需要单独验证。
-
-## 复现材料
-
-- 最小死锁复现(已修复后通过):`traces/v5/tiny_seed42.jsonl`,命令见 `scripts/run_h1_4g_v5.sh`。
-- 完整结果:`results/v5_dp4/`、`results/v5_h1_4g/`、`results/v5_h1_2g/`。
+- 跑法:作者 `scripts/run_dp4_v5.sh`、`scripts/run_h1_4g_v5.sh`;本机剩余 seed 脚本
+  `scripts/run_h1_v2_remaining.sh`、`scripts/run_dp4_v2.sh`。
+- 对比:`scripts/compare_dp_h1.py`。
+- 结果:DP4 `results/v5_dp4/`,H1 `results/v5_h1_4g/`。
