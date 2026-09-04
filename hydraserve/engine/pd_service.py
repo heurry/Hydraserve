@@ -644,6 +644,15 @@ def _prefill_worker(
                             chunk_yield_callback=service_preemptible_short_ops,
                         )
                     finally:
+                        # The chunked transfer path extracts KV on a separate
+                        # transfer stream and process() only synchronises that
+                        # stream.  Freeing the request's KV blocks while the
+                        # compute stream still has queued kernels referencing
+                        # them lets the next request reuse (and overwrite) the
+                        # blocks before those kernels run -> intermittent CUDA
+                        # IMA / segfault under load.  Drain the device so block
+                        # reuse is strictly ordered after every async access.
+                        torch.cuda.synchronize(cache.device)
                         cache.free(request_id)
                     responses.put(
                         {
