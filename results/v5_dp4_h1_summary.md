@@ -25,9 +25,35 @@ V5 SLO:Short e2e TTFT≤1s/TPOT≤100ms;Long e2e TTFT≤10s/TPOT≤150ms/admissi
 | Short e2e TTFT p50 | 656 | **634** | H1 略优 |
 | Short e2e TTFT p95 | 10306 | 13758 | H1 尾部更差 |
 | Short e2e TTFT p99 | 11905 | 17177 | |
-| Short TPOT p50 | **87** | 91 | |
+| Short TPOT p50 | **87** | 91 | H1 略差 |
 | Long e2e TTFT p50 | **2779** | 6934 | H1 2.5x 差 |
 | Long e2e TTFT p99 | 12614 | 21680 | |
+
+## M1 TPOT 逐 seed(ms;Short SLO ≤100,Long ≤150)
+
+Short TPOT:
+
+| seed | DP p50/p95/p99 | H1 p50/p95/p99 |
+|---|---|---|
+| 42 | 87/147/156 | 91/112/132 |
+| 43 | 80/112/124 | 79/126/143 |
+| 44 | 87/118/136 | 97/130/147 |
+| 中位 | 87/118/136 | 91/126/143 |
+
+Long TPOT:
+
+| seed | DP p50/p95/p99 | H1 p50/p95/p99 |
+|---|---|---|
+| 42 | 82/114/134 | 97/126/134 |
+| 43 | 85/108/108 | 93/114/117 |
+| 44 | 83/131/143 | 95/118/131 |
+| 中位 | 83/114/134 | 95/118/131 |
+
+TPOT 都在 SLO 内,但 **H1 TPOT 全面略差于 DP**(short p50 91 vs 87、long p50 95 vs 83),
+只有 long p99 略好(131 vs 134)。三 seed 均未满足 §8.1 的"short TPOT p50 改善"。
+原因:H1 的 decode worker 需同时 decode PD long + collocated short 的 prefill+decode,
+decode 批量被 prefill 交错打断,单 token 延迟略高;DP 的 4 个 collocated worker 更均匀。
+综合 TTFT+TPOT:H1 只在 **short e2e TTFT p50** 占优(首 token 更快),后续 token(TPOT)略慢。
 
 ## M1 SLO goodput(逐 seed)
 
