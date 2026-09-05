@@ -5,11 +5,12 @@
 V5 不再用随机 Token 的 R1/R2/R3 直接支撑“真实客服 RAG、文档摘要、代码分析”结论。旧 trace
 保留为机制压力测试，V5 的正式结论只回答两个问题：
 
-1. 在真实内容、持续混合到达、Short SLO 优先的客服 RAG 负载下，修复后的 DP 与 H1 谁更好；
-2. 当 Long 密集或成对到达时，单 Hybrid 的排队、回退和适用边界是什么。
+1. 在真实内容、持续混合到达、Short SLO 优先的客服 RAG 负载下，修复后的 DP、H1 与 H2 谁更好；
+2. 当 Long 密集或成对到达时，单 Hybrid 与双 Hybrid 的排队、回退和适用边界是什么。
 
-正式最小矩阵只比较 `DP` 与 `H1`，共 8 次运行。H2、静态 PD、vLLM/SGLang、Prefix Cache、
-多档 chunk 和完整负载扫描均不进入 V5 首轮。
+正式最小矩阵比较 `DP`、`H1` 与 `H2`，共 12 次运行。静态 PD、vLLM/SGLang、Prefix Cache、
+多档 chunk 和完整负载扫描均不进入 V5 首轮。H2 用来验证 H1 结果里暴露出的单 Hybrid
+prefill 瓶颈是否可以通过增加 P 并行缓解。
 
 ## 2. 测试分层
 
@@ -29,12 +30,13 @@ Long 回退和统计口径。双卡结果只写“趋势”，不能替代四卡
 
 - `DP4`：`--dp-devices 0 1 2 3`；
 - `H1-4GPU`：`--prefill-devices 0 --decode-devices 1 2 3`。
+- `H2-4GPU`：`--prefill-devices 0 1 --decode-devices 2 3`。
 
-| 负载 | Seed | DP4 | H1-4GPU | 运行数 |
-|---|---|---:|---:|---:|
-| M1 真实混合 RAG | 42、43、44 | 3 | 3 | 6 |
-| B1 Long-heavy 边界 | 42 | 1 | 1 | 2 |
-| 合计 | - | 4 | 4 | 8 |
+| 负载 | Seed | DP4 | H1-4GPU | H2-4GPU | 运行数 |
+|---|---|---:|---:|---:|---:|
+| M1 真实混合 RAG | 42、43、44 | 3 | 3 | 3 | 9 |
+| B1 Long-heavy 边界 | 42 | 1 | 1 | 1 | 3 |
+| 合计 | - | 4 | 4 | 4 | 12 |
 
 ## 3. Trace 定义
 
@@ -87,7 +89,9 @@ Long 以四个二请求 burst 到达，例如 `10s、25s、40s、55s` 各同时�
 1. 增加从真实数据记录冻结 JSONL trace 的生成器，而不是只支持 synthetic `--trace-out`；
 2. 校验 trace 的实际重编码 Token 数、到达窗口、类别计数和 SHA256；
 3. 将 Short SLO 从硬编码 `TTFT=5s、TPOT=200ms` 改为可配置；
-4. SLO 使用端到端 TTFT，即包含 client executor queue；
+4. SLO 使用端到端 TTFT，即从 trace 计划到达时间到首 Token 事件产生时间；默认采用
+   open-loop dispatcher，避免 Long completion 占住 client worker 后人为推迟后续 Short
+   submit；如需复现实验客户端 worker 队列，可显式开启 `--closed-loop-clients`；
 5. `ignore_eos=false` 时，正常 EOS 必须算完整成功，不能因为未生成满 `max_new_tokens` 被判失败；
 6. 增加 Long SLO、最大 admission wait、Hybrid overflow/fallback 和 starvation 统计；
 7. 保证 route reason、worker owner、实际输出 Token 数及失败原因进入结果 JSON。
@@ -128,22 +132,33 @@ hybrid_long_pressure_hold_ms = 1000（仅 H1，Long 被 defer 后临时收回 Hy
 pd_transfer_quant        = int8（仅 H1；kv_quant=int8 时走 INT8 Cache 直传）
 ```
 
+H2 使用同样的 H 系列策略，但因为有两张 Hybrid/P worker，P 侧 token budget 按 worker 数翻倍：
+
+```text
+prefill_devices          = 0 1
+decode_devices           = 2 3
+pd_prefill_token_budget  = 65536
+hybrid_short_assigned_work_budget = 8192
+hybrid_long_pressure_hold_ms = 1000
+pd_transfer_quant        = int8
+```
+
 要求：
 
-- 不得为 DP 和 H1 分别选择有利的 chunk、cache、并发度或采样参数；
-- DP4 与 H1 共享同一个 ServingLoop admission priority：trace class 为 `short`
+- 不得为 DP、H1 和 H2 分别选择有利的 chunk、cache、并发度或采样参数；
+- DP4、H1 与 H2 共享同一个 ServingLoop admission priority：trace class 为 `short`
   的请求优先级为 1，其余为 0；DP4 baseline 内部按 outstanding prefill tokens、
   token-weighted assigned work、RPC pending 与真实 cache/state load 选择 worker；
 - Prefix Cache 首轮关闭，避免当前混合注意力 Prefix Cache 不完整污染主结论；
-- 同一 seed 的 DP/H1 必须使用相同 trace hash；
+- 同一 seed 的 DP/H1/H2 必须使用相同 trace hash；
 - 正式运行必须基于 clean commit，并保存模型 manifest、CLI、CUDA/Triton、GPU 和拓扑；
 - 任一请求 OOM、超时或输出不完整，该次运行不能进入性能汇总。
 
-H1 新增的 token-aware admission、Hybrid Long-pressure 动态门控和 INT8 wire 是为了减少错误回退、
+H1/H2 新增的 token-aware admission、Hybrid Long-pressure 动态门控和 INT8 wire 是为了减少错误回退、
 降低状态迁移成本并明确 Short SLO 隔离窗口。无 Long 压力时，空闲 Hybrid 仍可承接 Short；
 Long 已经在等待 P/Hybrid capacity 时，Hybrid 的 Short 入口会短暂关闭，避免刚释放的 P 机会
-被新 Short 抢走。它们不改变单 Hybrid 在 Long-heavy 负载下会成为
-prefill bottleneck 的事实，也不保证 H1 在所有 M1/B1 seed 上超过强 DP。最终结论必须以正式
+被新 Short 抢走。H2 可以缓解 H1 的单 Hybrid prefill bottleneck，但会减少 D-bound decode
+worker 数量，因此也不保证在所有 M1/B1 seed 上超过强 DP。最终结论必须以正式
 复跑结果为准。
 
 ## 6. 命令模板
@@ -176,8 +191,25 @@ python -m hydraserve benchmark MODEL DATASETS --dataset synthetic --adaptive \
   --worker-log-dir WORKERS --output OUT --seed SEED
 ```
 
+### 6.3 四卡 H2 对照
+
+```bash
+python -m hydraserve benchmark MODEL DATASETS --dataset synthetic --adaptive \
+  --trace TRACE --prefill-devices 0 1 --decode-devices 2 3 \
+  --conditional-pd-tokens 6144 --hybrid-long-overflow-ms 5000 \
+  --pd-prefill-token-budget 65536 --hybrid-short-max-assigned-work 8192 \
+  --hybrid-long-pressure-hold-ms 1000 \
+  --prefill-short-policy work-conserving --pd-schedule load-aware \
+  --concurrency 16 --warmup 8 --kv-quant int8 --cache-tokens 65536 \
+  --block-size 256 --prefix-cache-blocks 0 --prefill-chunk-size 16384 \
+  --max-step-tokens 8192 --pd-transfer-backend shm-ring --pd-transfer-quant int8 \
+  --worker-log-dir WORKERS --output OUT --seed SEED
+```
+
 四卡正式命令只把 DP 改为 `--dp-devices 0 1 2 3`，H1 改为
-`--prefill-devices 0 --decode-devices 1 2 3`，其余参数不得变化。
+`--prefill-devices 0 --decode-devices 1 2 3`，H2 改为
+`--prefill-devices 0 1 --decode-devices 2 3`；除 H2 的 P 侧 token budget 按 P worker
+数翻倍外，其余参数不得变化。
 
 ## 7. 必报指标
 

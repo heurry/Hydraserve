@@ -331,6 +331,12 @@ def main() -> int:
         help="Poisson request/s used to freeze short-request arrival offsets",
     )
     benchmark_parser.add_argument("--concurrency", type=int, default=1)
+    benchmark_parser.add_argument(
+        "--closed-loop-clients",
+        action="store_true",
+        help="use legacy closed-loop client workers where each client submits "
+        "the next request only after the previous request finishes",
+    )
     benchmark_parser.add_argument("--max-preemptions-per-request", type=int, default=2)
     benchmark_parser.add_argument("--warmup", type=int, default=0)
     benchmark_parser.add_argument("--request-rate", type=float)
@@ -1030,6 +1036,7 @@ def main() -> int:
                 arrival_pattern=args.arrival_pattern,
                 seed=args.seed,
                 slo=slo_config,
+                closed_loop_clients=args.closed_loop_clients,
             )
             summary = replace(summary, metadata=_collect_benchmark_metadata(args))
             output = json.dumps(summary.to_dict(), ensure_ascii=False, indent=2)

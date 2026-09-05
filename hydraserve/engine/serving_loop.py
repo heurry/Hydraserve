@@ -161,6 +161,7 @@ class GenerationEvent:
     # Present for decode tokens so benchmarks can distinguish sparse-batch
     # latency from transport/release overhead. Prefill seed tokens use ``None``.
     decode_batch_size: int | None = None
+    emitted_at: float = field(default_factory=monotonic)
 
 
 class GenerationBackend(Protocol):

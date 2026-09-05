@@ -192,6 +192,7 @@ def test_benchmark_reports_client_queue_and_arrival_based_ttft() -> None:
         max_new_tokens=1,
         concurrency=1,
         arrival_pattern="burst",
+        closed_loop_clients=True,
     )
     loop.close()
 
@@ -201,6 +202,37 @@ def test_benchmark_reports_client_queue_and_arrival_based_ttft() -> None:
     assert second.ttft_ms is not None
     assert second.e2e_ttft_ms > second.ttft_ms
     assert summary.client_queue_ms["p99"] >= second.client_queue_ms * 0.9
+
+
+def test_open_loop_benchmark_dispatch_does_not_queue_behind_slow_request() -> None:
+    class SlowFirstPrefillBackend(Backend):
+        def prefill(self, request):
+            if request.token_ids[-1] == ord("x"):
+                sleep(0.03)
+            return super().prefill(request)
+
+    loop = ContinuousGenerationLoop(SlowFirstPrefillBackend(), max_batch_size=1)
+    summary = run_benchmark(
+        loop,
+        Tokenizer(),
+        [
+            BenchmarkSample("toy", "first", "x"),
+            BenchmarkSample("toy", "second", "y"),
+        ],
+        max_new_tokens=1,
+        concurrency=1,
+        arrival_pattern="burst",
+    )
+    loop.close()
+
+    second = summary.results[1]
+    assert second.client_queue_ms < 20
+    assert second.e2e_ttft_ms is not None
+    assert second.ttft_ms is not None
+    assert second.e2e_ttft_ms == pytest.approx(
+        second.ttft_ms + second.client_queue_ms,
+        abs=5,
+    )
 
 
 def test_fixed_and_seeded_poisson_arrival_configuration() -> None:

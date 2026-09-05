@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
@@ -41,6 +42,51 @@ def _pd_protocol_trace(phase: str, request_id: int, **fields) -> None:
         **fields,
     }
     print(json.dumps(record, separators=(",", ":")), file=sys.stderr, flush=True)
+
+
+class _DeferredCudaCacheFree:
+    """Delay KV-block reuse until CUDA work that may touch those blocks is done."""
+
+    def __init__(self, cache, event_factory=None) -> None:
+        self.cache = cache
+        self._pending = deque()
+        self._event_factory = event_factory
+
+    def collect(self, *, blocking: bool = False) -> None:
+        if not self._pending:
+            return
+        remaining = deque()
+        while self._pending:
+            request_id, event = self._pending.popleft()
+            if blocking:
+                event.synchronize()
+                self.cache.free(request_id)
+            elif event.query():
+                self.cache.free(request_id)
+            else:
+                remaining.append((request_id, event))
+        self._pending = remaining
+
+    def free(self, request_id: int | None) -> None:
+        if request_id is None:
+            return
+        self.collect()
+        if self.cache.device.type != "cuda":
+            self.cache.free(request_id)
+            return
+        if self._event_factory is not None:
+            event = self._event_factory()
+            event.record()
+            self._pending.append((request_id, event))
+            self.collect()
+            return
+        import torch
+
+        with torch.cuda.device(self.cache.device):
+            event = torch.cuda.Event()
+            event.record(torch.cuda.current_stream(self.cache.device))
+        self._pending.append((request_id, event))
+        self.collect()
 
 
 @dataclass(frozen=True, slots=True)
@@ -330,8 +376,10 @@ def _prefill_worker(
         from threading import Lock as _ThreadLock
 
         state_lock = _ThreadLock()
+        deferred_cache_free = _DeferredCudaCacheFree(cache)
 
         def capacity_payload():
+            deferred_cache_free.collect()
             capacity = cache.block_manager.capacity()
             live = len(set(states) | reservations)
             return {
@@ -372,6 +420,7 @@ def _prefill_worker(
         def service_preemptible_short_ops() -> int:
             """Run bounded short decode work at a long-prefill chunk boundary."""
 
+            deferred_cache_free.collect()
             serviced = 0
             deferred = []
             while serviced < config.prefill_preempt_max_ops:
@@ -609,7 +658,9 @@ def _prefill_worker(
                     short_budget = 64
             operation = command["op"]
             responses.rpc_id = command.get("rpc_id")
+            deferred_cache_free.collect()
             if operation == "shutdown":
+                deferred_cache_free.collect(blocking=True)
                 with state_lock:
                     live_ids = tuple(set(states) | reservations)
                 for request_id in live_ids:
@@ -644,16 +695,12 @@ def _prefill_worker(
                             chunk_yield_callback=service_preemptible_short_ops,
                         )
                     finally:
-                        # The chunked transfer path extracts KV on a separate
-                        # transfer stream and process() only synchronises that
-                        # stream.  Freeing the request's KV blocks while the
-                        # compute stream still has queued kernels referencing
-                        # them lets the next request reuse (and overwrite) the
-                        # blocks before those kernels run -> intermittent CUDA
-                        # IMA / segfault under load.  Drain the device so block
-                        # reuse is strictly ordered after every async access.
-                        torch.cuda.synchronize(cache.device)
-                        cache.free(request_id)
+                        # The chunked-transfer path may leave compute-stream
+                        # kernels that still reference this request's temporary
+                        # P-side KV pages.  Record an event instead of draining
+                        # the whole device; blocks become allocatable again
+                        # once the stream has passed this point.
+                        deferred_cache_free.free(request_id)
                     responses.put(
                         {
                             "op": "prefill",
@@ -662,6 +709,7 @@ def _prefill_worker(
                             "token_id": result.first_token_id,
                             "sample": result.sample,
                             "chunk_preemptions": result.chunk_preemptions,
+                            **capacity_payload(),
                         }
                     )
                 elif operation == "reserve":

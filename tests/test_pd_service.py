@@ -12,6 +12,60 @@ from hydraserve.engine import (
     PDWorkerConfig,
     ServingRequest,
 )
+from hydraserve.engine.pd_service import _DeferredCudaCacheFree
+
+
+def test_deferred_cuda_cache_free_waits_for_event_before_reuse() -> None:
+    class FakeEvent:
+        def __init__(self):
+            self.ready = False
+            self.recorded = False
+            self.synchronized = False
+
+        def record(self):
+            self.recorded = True
+
+        def query(self):
+            return self.ready
+
+        def synchronize(self):
+            self.synchronized = True
+            self.ready = True
+
+    class FakeCache:
+        device = SimpleNamespace(type="cuda")
+
+        def __init__(self):
+            self.freed = []
+
+        def free(self, request_id):
+            self.freed.append(request_id)
+
+    events: list[FakeEvent] = []
+
+    def make_event():
+        event = FakeEvent()
+        events.append(event)
+        return event
+
+    cache = FakeCache()
+    freer = _DeferredCudaCacheFree(cache, event_factory=make_event)
+
+    freer.free(7)
+    assert events[0].recorded
+    assert cache.freed == []
+
+    freer.collect()
+    assert cache.freed == []
+
+    events[0].ready = True
+    freer.collect()
+    assert cache.freed == [7]
+
+    freer.free(8)
+    freer.collect(blocking=True)
+    assert events[1].synchronized
+    assert cache.freed == [7, 8]
 
 
 def test_pd_worker_config_rejects_same_device_without_spawning() -> None:

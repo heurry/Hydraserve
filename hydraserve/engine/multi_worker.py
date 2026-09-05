@@ -2086,6 +2086,7 @@ class MultiWorkerGenerationBackend:
             self._schedule_prefill_recovery(index)
             raise failure
         self._check(result, "prefill", request_id)
+        self._update_prefill_capacity(index, result)
         with self._state_lock:
             self._prefill_chunk_preemptions = getattr(
                 self, "_prefill_chunk_preemptions", 0

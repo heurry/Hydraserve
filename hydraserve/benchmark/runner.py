@@ -25,9 +25,10 @@ class RequestMetrics:
     latency_ms: float
     finish_reason: str
     error: str | None = None
-    # ``ttft_ms`` starts when the client worker actually submits to the engine.
+    # ``ttft_ms`` starts when the benchmark submits to the engine.
     # ``e2e_ttft_ms`` starts at the trace's intended arrival time and therefore
-    # includes any client-side executor queueing.
+    # includes dispatcher delay and, when --closed-loop-clients is enabled,
+    # client-side worker queueing.
     e2e_ttft_ms: float | None = None
     client_queue_ms: float = 0.0
     # Time between the last visible token and the terminal event.  Keep this
@@ -473,6 +474,7 @@ def run_benchmark(
     arrival_pattern: str = "burst",
     seed: int = 0,
     slo: SLOConfig | None = None,
+    closed_loop_clients: bool = False,
 ) -> BenchmarkSummary:
     if max_new_tokens <= 0 or concurrency <= 0:
         raise ValueError("max_new_tokens and concurrency must be positive")
@@ -537,11 +539,16 @@ def run_benchmark(
         if reset_calibration is not None:
             reset_calibration()
 
-    def run_one(item, scheduled_at: float) -> tuple[int, RequestMetrics]:
-        index, sample = item
-        token_ids = encode(sample)
-        per_sample_max = sample.max_new_tokens or max_new_tokens
-        started = perf_counter()
+    def collect_one(
+        index: int,
+        sample: BenchmarkSample,
+        token_ids,
+        per_sample_max: int,
+        scheduled_at: float,
+        started: float,
+        handle=None,
+        submit_error: Exception | None = None,
+    ) -> tuple[int, RequestMetrics]:
         client_queue_ms = max(0.0, (started - scheduled_at) * 1000)
         first_token_at = None
         last_token_at = None
@@ -549,33 +556,29 @@ def run_benchmark(
         decode_batch_sizes: list[int] = []
         completion_tokens = 0
         finish_reason = "error"
-        error = None
-        handle = None
-        try:
-            handle = generation_loop.submit(
-                token_ids,
-                per_sample_max,
-                ignore_eos=sample.ignore_eos,
-                priority=sample_priority(sample),
-            )
-            for event in handle:
-                now = perf_counter()
-                if event.token_id is not None:
-                    completion_tokens += 1
-                    if first_token_at is None:
-                        first_token_at = now
-                    if last_token_at is not None:
-                        itl_ms.append((now - last_token_at) * 1000)
-                    last_token_at = now
-                    batch_size = getattr(event, "decode_batch_size", None)
-                    if batch_size is not None:
-                        decode_batch_sizes.append(int(batch_size))
-                if event.finished:
-                    finish_reason = event.finish_reason or "unknown"
-                    error = event.error
-        except Exception as exc:
-            error = str(exc)
-        ended = perf_counter()
+        error = None if submit_error is None else str(submit_error)
+        terminal_at = None
+        if handle is not None:
+            try:
+                for event in handle:
+                    now = getattr(event, "emitted_at", None) or perf_counter()
+                    if event.token_id is not None:
+                        completion_tokens += 1
+                        if first_token_at is None:
+                            first_token_at = now
+                        if last_token_at is not None:
+                            itl_ms.append((now - last_token_at) * 1000)
+                        last_token_at = now
+                        batch_size = getattr(event, "decode_batch_size", None)
+                        if batch_size is not None:
+                            decode_batch_sizes.append(int(batch_size))
+                    if event.finished:
+                        finish_reason = event.finish_reason or "unknown"
+                        error = event.error
+                        terminal_at = now
+            except Exception as exc:
+                error = str(exc)
+        ended = terminal_at or perf_counter()
         latency_ms = (ended - started) * 1000
         ttft_ms = None if first_token_at is None else (first_token_at - started) * 1000
         e2e_ttft_ms = (
@@ -650,6 +653,38 @@ def run_benchmark(
             target_new_tokens=sample.max_new_tokens or max_new_tokens,
         )
 
+    def submit_one(item, scheduled_at: float) -> tuple[int, RequestMetrics]:
+        index, sample = item
+        token_ids = encode(sample)
+        per_sample_max = sample.max_new_tokens or max_new_tokens
+        started = perf_counter()
+        try:
+            handle = generation_loop.submit(
+                token_ids,
+                per_sample_max,
+                ignore_eos=sample.ignore_eos,
+                priority=sample_priority(sample),
+            )
+        except Exception as exc:
+            return collect_one(
+                index,
+                sample,
+                token_ids,
+                per_sample_max,
+                scheduled_at,
+                started,
+                submit_error=exc,
+            )
+        return collect_one(
+            index,
+            sample,
+            token_ids,
+            per_sample_max,
+            scheduled_at,
+            started,
+            handle=handle,
+        )
+
     offsets: list[float] = []
     if arrival_pattern == "burst":
         offsets = [0.0] * len(indexed)
@@ -665,12 +700,12 @@ def run_benchmark(
 
     wall_started = perf_counter()
     ordered_results: list[RequestMetrics | None] = [None] * len(indexed)
+    scheduled = sorted(
+        zip(indexed, offsets, strict=True),
+        key=lambda pair: pair[1] + pair[0][1].arrival_offset_ms / 1000.0,
+    )
     with ThreadPoolExecutor(max_workers=concurrency) as executor:
         futures = []
-        scheduled = sorted(
-            zip(indexed, offsets, strict=True),
-            key=lambda pair: pair[1] + pair[0][1].arrival_offset_ms / 1000.0,
-        )
         for item, offset in scheduled:
             index, sample = item
             trace_offset = sample.arrival_offset_ms / 1000.0
@@ -678,7 +713,43 @@ def run_benchmark(
             if delay > 0:
                 sleep(delay)
             scheduled_at = wall_started + offset + trace_offset
-            futures.append(executor.submit(run_one, item, scheduled_at))
+            if closed_loop_clients:
+                futures.append(executor.submit(submit_one, item, scheduled_at))
+                continue
+            token_ids = encode(sample)
+            per_sample_max = sample.max_new_tokens or max_new_tokens
+            started = perf_counter()
+            try:
+                handle = generation_loop.submit(
+                    token_ids,
+                    per_sample_max,
+                    ignore_eos=sample.ignore_eos,
+                    priority=sample_priority(sample),
+                )
+            except Exception as exc:
+                index, result = collect_one(
+                    index,
+                    sample,
+                    token_ids,
+                    per_sample_max,
+                    scheduled_at,
+                    started,
+                    submit_error=exc,
+                )
+                ordered_results[index] = result
+                continue
+            futures.append(
+                executor.submit(
+                    collect_one,
+                    index,
+                    sample,
+                    token_ids,
+                    per_sample_max,
+                    scheduled_at,
+                    started,
+                    handle,
+                )
+            )
         for future in as_completed(futures):
             index, result = future.result()
             ordered_results[index] = result
